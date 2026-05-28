@@ -508,13 +508,15 @@ ensure_container() {
             # On macOS, recreating the host workspace dir leaves Docker
             # Desktop's grpc-fuse share pointing at the gone inode; same
             # on Linux if the workspace was rm'd + recreated under the
-            # bind mount. Probe /work and silently recreate if it's
-            # stale. --workdir / so docker doesn't try to chdir into the
-            # stale /work first (that fails with an OCI "container
-            # breakout" error before `test` ever runs, and the resulting
-            # stderr noise leaks even through 2>/dev/null on some
-            # docker builds).
-            if docker exec --workdir / "$container" test -d /work >/dev/null 2>&1; then
+            # bind mount. We probe for the workspace marker file because
+            # `test -d /work` can return true even on a dangling mount
+            # (the mount point's directory entry outlives the underlying
+            # inode). The marker file can only be visible through a live
+            # mount. --workdir / so we don't get derailed by chdir into
+            # a stale /work, which fails with an OCI "container
+            # breakout" error before `test` ever runs.
+            if docker exec --workdir / "$container" \
+                    test -f /work/spangap.workspace.yaml >/dev/null 2>&1; then
                 return 0
             fi
             announce_container_setup
@@ -568,7 +570,13 @@ fetch_missing_deps() {
     local announced=0
     while :; do
         local missing
-        missing=$(docker exec --workdir "$container_cwd" "$container" spangap list-deps)
+        # set -e silently swallows `x=$(failing_cmd)` failures, so we
+        # explicitly handle list-deps failure with a useful die message.
+        # docker exec's own stderr is left alone so the user sees the
+        # actual failure (e.g. OCI "container breakout" from a stale mount)
+        # before the die line below.
+        missing=$(docker exec --workdir "$container_cwd" "$container" spangap list-deps) \
+            || die "spangap list-deps failed in container $container (see error above)"
         [ -z "$missing" ] && return 0
         for spec in $missing; do
             local bare=${spec%@*} ref=

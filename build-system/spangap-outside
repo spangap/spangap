@@ -583,7 +583,7 @@ ensure_container() {
     # ccache/npm Docker volumes from the old layout are left behind
     # (orphaned) — `docker volume ls | grep ^spangap-(ccache|npm)-`
     # surfaces them for cleanup.
-    if [ ! -d "$spangap_home" ] && [ -d "${HOME}/.claude-spangap" ]; then
+    if [ -d "${HOME}/.claude-spangap" ] && [ ! -d "$spangap_home/.claude" ]; then
         mkdir -p "$spangap_home"
         mv "${HOME}/.claude-spangap" "$spangap_home/.claude" \
             || die "couldn't migrate ${HOME}/.claude-spangap → $spangap_home/.claude"
@@ -652,7 +652,8 @@ fetch_missing_deps() {
     done
 }
 
-# reset: drop container + image. Cache volumes + ~/.claude-spangap preserved.
+# reset: drop container + image. ~/.spangap (host-side $HOME bind mount)
+# is preserved.
 case ${1:-} in
 reset)
     shift

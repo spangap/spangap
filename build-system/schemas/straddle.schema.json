@@ -27,7 +27,7 @@
       "type": "string"
     },
     "firmware": {
-      "description": "Firmware-half path relative to manifest dir. Omit for default 'idf'. Use '.' when the manifest dir IS the firmware project root (app-straddles).",
+      "description": "Firmware-half path relative to manifest dir. Omit for default 'idf'. Use '.' when the manifest dir IS the firmware project root (buildable straddles).",
       "type": "string",
       "default": "idf"
     },
@@ -52,8 +52,8 @@
       },
       "default": []
     },
-    "app": {
-      "description": "App-level globals. Present only on app-straddles (those that build a device image).",
+    "buildable": {
+      "description": "Top-level config for straddles that build a flashable device image. Its presence is the flag we key on to decide what's buildable — library / feature straddles omit this block entirely.",
       "type": "object",
       "additionalProperties": false,
       "properties": {

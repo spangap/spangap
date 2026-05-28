@@ -59,8 +59,8 @@ class Manifest:
     def requires(self) -> list[str]:
         return list(self.data.get("requires", []))
     @property
-    def is_app(self) -> bool:
-        return "app" in self.data
+    def is_buildable(self) -> bool:
+        return "buildable" in self.data
 
 
 def die(msg: str, exit_code: int = 1):
@@ -197,10 +197,10 @@ def run_idf(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> in
 
 def cmd_build(args: argparse.Namespace) -> int:
     proj = find_project()
-    if not proj.is_app:
+    if not proj.is_buildable:
         die(
-            f"{proj.name} is not an app-straddle (no `app:` block in straddle.yaml).\n"
-            "       `spangap build` only builds app-straddles. Build a consumer of this one."
+            f"{proj.name} is not a buildable straddle (no `buildable:` block in straddle.yaml).\n"
+            "       `spangap build` only builds buildable straddles. Build a consumer of this one."
         )
     if not proj.has_firmware:
         die(f"{proj.name}: firmware dir {proj.firmware_dir} has no CMakeLists.txt")
@@ -220,8 +220,8 @@ def cmd_flash(args: argparse.Namespace) -> int:
     for it to disappear (the monitor loop deletes it just before flashing).
     """
     proj = find_project()
-    if not proj.is_app:
-        die(f"{proj.name} is not an app-straddle (no `app:` block) — nothing to flash.")
+    if not proj.is_buildable:
+        die(f"{proj.name} is not a buildable straddle (no `buildable:` block) — nothing to flash.")
     flashme = proj.firmware_dir / "build" / "flashme"
     flashme.parent.mkdir(parents=True, exist_ok=True)
     flashme.touch()

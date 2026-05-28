@@ -118,41 +118,27 @@ require_straddle() {
         printf '%s\n' "$s"
         return 0
     fi
-    # No straddle at/above cwd. If we're sitting at the workspace root,
-    # try to pick the obvious project: the single app-straddle (the one
-    # with an `app:` block at the top level of straddle.yaml). After a
-    # build, fetch_missing_deps has pulled in N library straddles too,
-    # so "any single straddle" wouldn't disambiguate any more — but the
-    # app is what build/flash/monitor act on, so the app is unambiguous.
-    # Fall back to "single any-straddle" for the moment right after
-    # `init` (before build has populated deps).
+    # No straddle at/above cwd. From the workspace root, default to the
+    # project that `spangap init <project>` recorded in .spangap-project,
+    # provided it's buildable (has a `buildable:` block in straddle.yaml).
+    # If it isn't buildable, or the user wants a different straddle,
+    # they cd into it and retry — we don't guess.
     if [ "$PWD" = "$workspace" ]; then
-        local candidate apps_found="" apps_count=0 any_found="" any_count=0
-        for candidate in "$workspace"/*/straddle.yaml; do
-            [ -f "$candidate" ] || continue
-            any_found=$(dirname "$candidate")
-            any_count=$((any_count + 1))
-            if grep -qE '^app:' "$candidate"; then
-                apps_found=$(dirname "$candidate")
-                apps_count=$((apps_count + 1))
-            fi
-        done
-        if [ "$apps_count" = 1 ]; then
-            printf '%s\n' "$apps_found"
+        local proj_file="$workspace/.spangap-project"
+        if [ -f "$proj_file" ]; then
+            local init_project init_dir init_yaml
+            init_project=$(cat "$proj_file")
+            init_dir="$workspace/$init_project"
+            init_yaml="$init_dir/straddle.yaml"
+            [ -f "$init_yaml" ] \
+                || die "spangap $cmd: .spangap-project names '$init_project' but $init_yaml is missing — cd into the straddle you want to $cmd"
+            grep -qE '^buildable:' "$init_yaml" \
+                || die "spangap $cmd: $init_project is not buildable (no \`buildable:\` block) — cd into a buildable straddle and retry"
+            printf '%s\n' "$init_dir"
             return 0
-        fi
-        if [ "$apps_count" -gt 1 ]; then
-            die "spangap $cmd: $workspace has more than one app-straddle — cd into the one you want and retry"
-        fi
-        if [ "$any_count" = 1 ]; then
-            printf '%s\n' "$any_found"
-            return 0
-        fi
-        if [ "$any_count" -gt 1 ]; then
-            die "spangap $cmd: $workspace has multiple straddles but no app — cd into the one you want and retry"
         fi
     fi
-    die "spangap $cmd: not inside a straddle (no straddle.yaml at/above $PWD)"
+    die "spangap $cmd: not inside a straddle (no straddle.yaml at/above $PWD) — cd into the straddle you want to $cmd"
 }
 
 # Pick the dir that holds the IDF project's CMakeLists.txt. Same rule as the

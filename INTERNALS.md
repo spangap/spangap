@@ -51,7 +51,7 @@ The host-side entry script is `./spangap` at the platform-repo root. It
 walks up from cwd for `spangap.workspace.yaml` (only — there's no
 straddle-as-workspace fallback) and dispatches into
 `<ws>/spangap/build-system/spangap-outside`, which in turn either handles
-the command on the host (flash, monitor, cli, dev-deps, reset) or
+the command on the host (flash, monitor, cli, get-deps, reset) or
 docker-execs `spangap-inside` in the build-env container
 (`spangap-<hash7(workspace)>`). Common verbs:
 

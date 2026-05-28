@@ -19,6 +19,9 @@
 #   docker <cmd>…    docker-exec <cmd> in the build-env container, raw —
 #                    e.g. `spangap docker sh` for an unwrapped shell.
 #   reset            drop this workspace's container + the build-env image.
+#   ensure-venv      create / refresh the host-side flash/monitor venv
+#                    ($workspace/.spangap-venv). Run automatically by
+#                    `spangap init` and lazily by flash/monitor.
 #
 # Everything else docker-exec's into spangap-inside unchanged.
 #
@@ -30,7 +33,38 @@ set -euo pipefail
 IMAGE="${SPANGAP_IMAGE:-spangap-build-env:dev}"
 workspace="${SPANGAP_WORKSPACE:?spangap-outside: SPANGAP_WORKSPACE not set (invoke via the root \`spangap\` script)}"
 
+# Host-side flash/monitor venv. Lives entirely inside the workspace so
+# `spangap init` keeps its promise of touching nothing outside it. Pins
+# are exact so a working workspace stays working; ensure_venv re-runs pip
+# automatically when this string changes between spangap versions.
+VENV="$workspace/.spangap-venv"
+VENV_REQUIREMENTS="esptool==4.8.1 esp-idf-monitor==1.5.0"
+
 die() { printf 'spangap: %s\n' "$*" >&2; exit 1; }
+
+# Create the host-side flash/monitor venv if missing, or refresh pins if
+# $VENV_REQUIREMENTS changed since last setup. Idempotent + fast in the
+# steady state (one stamp-file read, no pip invocation).
+ensure_venv() {
+    local stamp="$VENV/.spangap-requirements"
+    if [ -d "$VENV" ] && [ -f "$stamp" ] \
+        && [ "$(cat "$stamp")" = "$VENV_REQUIREMENTS" ]; then
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 \
+        || die "python3 required for the host-side flash/monitor venv — install python3 (with the venv module) and retry"
+    if [ ! -d "$VENV" ]; then
+        echo "spangap: creating host-side flash/monitor venv at $VENV..." >&2
+        python3 -m venv "$VENV" \
+            || die "python3 -m venv $VENV failed (need the venv module — on Debian/Ubuntu: apt install python3-venv; on Alpine: apk add py3-virtualenv)"
+    else
+        echo "spangap: refreshing pins in $VENV..." >&2
+    fi
+    # shellcheck disable=SC2086
+    "$VENV/bin/pip" install --quiet --disable-pip-version-check --upgrade $VENV_REQUIREMENTS \
+        || die "pip install $VENV_REQUIREMENTS failed; see output above"
+    printf '%s\n' "$VENV_REQUIREMENTS" > "$stamp"
+}
 
 # Content hash of build-system/. Stamped into the image at build time via
 # --build-arg BUILDSYS_HASH and read back via the org.spangap.buildsys-hash
@@ -123,14 +157,16 @@ port_busy() {
 # ---------------------------------------------------------------------------
 
 kill_monitor() {
-    pkill -f 'tools/idf.py monitor' 2>/dev/null || true
-    pkill -f 'idf-monitor'           2>/dev/null || true
-    pkill -f 'idf_monitor'           2>/dev/null || true
+    # esp-idf-monitor has no console script — we invoke it via
+    # `python -m esp_idf_monitor`, so the module name (underscored) is
+    # what appears in /proc/*/cmdline. Pattern accepts either spelling
+    # in case a future version ships a script.
+    pkill -f 'esp[-_]idf[-_]monitor' 2>/dev/null || true
 }
 
-# run_monitor <port> <fw> <log> [extra-flags]: foreground idf.py monitor in a
-# PTY, tee-stripped to <log>. Returns when monitor exits (Ctrl-], or someone
-# kills it — the watcher below does that on flashme).
+# run_monitor <port> <fw> <log> [extra-flags]: foreground esp-idf-monitor in
+# a PTY, tee-stripped to <log>. Returns when monitor exits (Ctrl-], or
+# someone kills it — the watcher below does that on flashme).
 run_monitor() {
     local port=$1 fw=$2 log=$3 extra=${4:-}
     local fifo=/tmp/spangap-flash.$$.$RANDOM.fifo
@@ -140,10 +176,17 @@ run_monitor() {
     # every line.
     perl -pe 'BEGIN{$|=1} s/\e\[[0-9;?]*[a-zA-Z]//g' < "$fifo" > "$log" &
     local stripper=$!
+    # Find the app ELF for panic-backtrace symbolication. It's the only
+    # .elf at build/ root (bootloader/partition ELFs live in subdirs).
+    # Optional — esp-idf-monitor still runs without one.
+    local elf=""
+    for e in "$fw/build"/*.elf; do
+        [ -f "$e" ] && { elf=$e; break; }
+    done
     (
         cd "$fw"
         # shellcheck disable=SC2086
-        script -q "$fifo" idf.py -p "$port" monitor ${extra} || true
+        script -q "$fifo" "$VENV/bin/python" -m esp_idf_monitor -p "$port" ${extra} ${elf:+"$elf"} || true
     )
     wait "$stripper" 2>/dev/null || true
     rm -f "$fifo"
@@ -197,7 +240,7 @@ PY
     local rc=0
     (
         cd "$fw/build"
-        esptool.py --chip "$chip" -p "$port" -b "$baud" \
+        "$VENV/bin/esptool.py" --chip "$chip" -p "$port" -b "$baud" \
             --before "$before" --after "$after" \
             write_flash "${wf_args[@]}"
     ) 2>&1 | tee /tmp/spangap-esptool.log
@@ -219,9 +262,6 @@ monitor_loop() {
     local port=$1 fw=$2 do_initial=$3
     local flashme="$fw/build/flashme"
     local log="$fw/build/flasher.log"
-
-    command -v esptool.py >/dev/null 2>&1 || die "esptool.py not on PATH (install ESP-IDF or pip install esptool)"
-    command -v idf.py     >/dev/null 2>&1 || die "idf.py not on PATH (needs native ESP-IDF for the monitor side)"
 
     trap 'kill_monitor; exit 0' INT TERM
     # Don't drop a present flashme on startup: a pending signal from another
@@ -260,9 +300,19 @@ monitor_loop() {
         fi
         run_monitor "$port" "$fw" "$log" "$reset_flags"
 
+        # If flashme is present, the watcher killed monitor as a reflash
+        # signal — keep looping so the next iteration consumes it. If it
+        # isn't, the user (Ctrl-]) or the hardware ended the monitor;
+        # don't fight them — exit so a single Ctrl-] actually quits.
+        if [ -f "$flashme" ]; then
+            wait "$watcher" 2>/dev/null || true
+            sleep 1
+            continue
+        fi
         kill "$watcher" 2>/dev/null || true
         wait "$watcher" 2>/dev/null || true
-        sleep 1
+        echo "spangap: monitor exited — bye" >&2
+        return 0
     done
 }
 
@@ -271,6 +321,10 @@ monitor_loop() {
 # ---------------------------------------------------------------------------
 
 case ${1:-} in
+ensure-venv)
+    ensure_venv
+    exit 0
+    ;;
 flash)
     shift
     proj=$(require_straddle flash)
@@ -292,7 +346,9 @@ flash)
         done
         die "$port was busy but nobody is flashing when I signal to. Start \`spangap monitor\` on a host with the port."
     fi
+    ensure_venv
     monitor_loop "$port" "$fw" 1
+    exit 0
     ;;
 monitor)
     shift
@@ -306,7 +362,9 @@ monitor)
     fw=$(resolve_firmware_dir "$proj") \
         || die "spangap monitor: no CMakeLists.txt in $proj or its esp-idf/ subdir"
     port_busy "$port" && die "spangap monitor: $port is busy — another monitor/flasher owns it"
+    ensure_venv
     monitor_loop "$port" "$fw" 0
+    exit 0
     ;;
 cli)
     shift
@@ -539,6 +597,25 @@ build)
     command -v git >/dev/null 2>&1 || die "spangap build: git required on host PATH (for auto get-deps)"
     require_straddle build >/dev/null
     fetch_missing_deps "$container_cwd"
+    shift
+    # -s as the first arg after `build` is consumed here (not forwarded
+    # into the container) and switches the filter to quiet mode.
+    quiet_flag=""
+    case ${1:-} in
+        -s|--quiet) quiet_flag=-s; shift ;;
+    esac
+    # Sticky port is picked up by the filter to fill in the flash hint.
+    sticky_port=""
+    [ -f "$PORT_FILE" ] && sticky_port=$(cat "$PORT_FILE")
+    filter="$workspace/spangap/build-system/spangap-build-filter"
+    [ -x "$filter" ] || die "build filter $filter not found or not executable"
+    # No -t: stdout is a pipe to the filter, so don't ask docker for a tty.
+    set +e
+    docker exec -i --workdir "$container_cwd" "$container" spangap build "$@" 2>&1 \
+        | SPANGAP_PORT="$sticky_port" "$filter" $quiet_flag
+    rc=${PIPESTATUS[0]}
+    set -e
+    exit "$rc"
     ;;
 docker)
     shift

@@ -577,18 +577,6 @@ ensure_container() {
     fi
 
     announce_container_setup
-    # One-time migration from the old per-subdir layout: move
-    # ~/.claude-spangap (the only host-side dir we used to keep) into
-    # the new consolidated $spangap_home as ~/.claude. Per-workspace
-    # ccache/npm Docker volumes from the old layout are left behind
-    # (orphaned) — `docker volume ls | grep ^spangap-(ccache|npm)-`
-    # surfaces them for cleanup.
-    if [ -d "${HOME}/.claude-spangap" ] && [ ! -d "$spangap_home/.claude" ]; then
-        mkdir -p "$spangap_home"
-        mv "${HOME}/.claude-spangap" "$spangap_home/.claude" \
-            || die "couldn't migrate ${HOME}/.claude-spangap → $spangap_home/.claude"
-        echo "spangap: migrated ${HOME}/.claude-spangap → $spangap_home/.claude" >&2
-    fi
     mkdir -p "$spangap_home"
 
     docker run -d --name "$container" \

@@ -1,0 +1,521 @@
+#!/bin/bash
+# spangap-outside — host-side dispatcher. Run by the root `spangap` script
+# with $SPANGAP_WORKSPACE set to the workspace dir.
+#
+# Handles everything that has to happen on the host:
+#   flash <dev>      flash + monitor loop (re-flashes when build/flashme appears).
+#                    If <dev> is busy, just touch flashme and exit so whichever
+#                    host is running `monitor` picks the signal up.
+#   monitor <dev>    same monitor loop, but error if <dev> is busy and no
+#                    initial flash. Used on the host that owns the board.
+#   cli [-h host] [cmd...]
+#                    talk to the device's TCP CLI. -h persists hostname to
+#                    ./.spangap-host in the workspace root; subsequent calls
+#                    can omit it.
+#   get-deps         git-clone any missing transitive `requires:` siblings
+#                    (uses host github creds; container has none). Also runs
+#                    automatically as part of `build`.
+#   build            same dep-fetch, then forward to spangap-inside.
+#   docker <cmd>…    docker-exec <cmd> in the build-env container, raw —
+#                    e.g. `spangap docker sh` for an unwrapped shell.
+#   reset            drop this workspace's container + the build-env image.
+#
+# Everything else docker-exec's into spangap-inside unchanged.
+#
+# Serial-port and CLI-host stickiness: explicit args overwrite
+# $SPANGAP_WORKSPACE/.spangap-port and .spangap-host respectively, and bare
+# invocations read whichever file's there.
+set -euo pipefail
+
+IMAGE="${SPANGAP_IMAGE:-spangap-build-env:dev}"
+workspace="${SPANGAP_WORKSPACE:?spangap-outside: SPANGAP_WORKSPACE not set (invoke via the root \`spangap\` script)}"
+
+die() { printf 'spangap: %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# straddle + firmware-dir resolution.
+# ---------------------------------------------------------------------------
+
+# find_straddle [start]: walk up looking for straddle.yaml, echo its dir.
+find_straddle() {
+    local cur=${1:-$PWD}
+    cur=$(cd "$cur" && pwd)
+    while :; do
+        [ -f "$cur/straddle.yaml" ] && { printf '%s\n' "$cur"; return 0; }
+        [ "$cur" = "/" ] && return 1
+        cur=$(dirname "$cur")
+    done
+}
+
+# require_straddle: cmd-name → straddle-dir on stdout, or die.
+require_straddle() {
+    local cmd=$1
+    local s
+    s=$(find_straddle) || die "spangap $cmd: not inside a straddle (no straddle.yaml at/above $PWD)"
+    case $s in
+        "$workspace"|"$workspace"/*) ;;
+        *) die "spangap $cmd: straddle $s is not under workspace $workspace" ;;
+    esac
+    printf '%s\n' "$s"
+}
+
+# Pick the dir that holds the IDF project's CMakeLists.txt. Same rule as the
+# old shim: try esp-idf/, then ., then idf/. Parsing YAML in shell isn't worth
+# the trouble for one lookup.
+resolve_firmware_dir() {
+    local p=$1 sub
+    for sub in esp-idf "" idf; do
+        if [ -f "$p${sub:+/$sub}/CMakeLists.txt" ]; then
+            printf '%s\n' "$p${sub:+/$sub}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Sticky $SPANGAP_PORT / $SPANGAP_HOST via workspace-root state files.
+# ---------------------------------------------------------------------------
+
+PORT_FILE="$workspace/.spangap-port"
+HOST_FILE="$workspace/.spangap-host"
+
+# read_or_die <file> <env-var-name> <cmd> <thing>: explicit env wins, else
+# state file, else die.
+sticky_get() {
+    local file=$1 env=$2 cmd=$3 thing=$4
+    if [ -n "${!env:-}" ]; then printf '%s\n' "${!env}"; return; fi
+    [ -f "$file" ] && { cat "$file"; return; }
+    die "spangap $cmd: no $thing — pass one explicitly first to persist it"
+}
+
+sticky_set() {
+    printf '%s\n' "$2" > "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Port-busy probe. Lets `flash` decide between flashing locally and just
+# signalling a remote `monitor` via flashme.
+# ---------------------------------------------------------------------------
+port_busy() {
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -t "$1" >/dev/null 2>&1
+    elif command -v fuser >/dev/null 2>&1; then
+        fuser -s "$1" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Flash + monitor inner loop. Absorbs scripts/flasher's daemon mode.
+# ---------------------------------------------------------------------------
+
+kill_monitor() {
+    pkill -f 'tools/idf.py monitor' 2>/dev/null || true
+    pkill -f 'idf-monitor'           2>/dev/null || true
+    pkill -f 'idf_monitor'           2>/dev/null || true
+}
+
+# run_monitor <port> <fw> <log> [extra-flags]: foreground idf.py monitor in a
+# PTY, tee-stripped to <log>. Returns when monitor exits (Ctrl-], or someone
+# kills it — the watcher below does that on flashme).
+run_monitor() {
+    local port=$1 fw=$2 log=$3 extra=${4:-}
+    local fifo=/tmp/spangap-flash.$$.$RANDOM.fifo
+    mkfifo "$fifo"
+    # Stripped stream to file ONLY. `script` already pumps the PTY back to the
+    # terminal in colour; tee'ing the stripped stream there too duplicates
+    # every line.
+    perl -pe 'BEGIN{$|=1} s/\e\[[0-9;?]*[a-zA-Z]//g' < "$fifo" > "$log" &
+    local stripper=$!
+    (
+        cd "$fw"
+        # shellcheck disable=SC2086
+        script -q "$fifo" idf.py -p "$port" monitor ${extra} || true
+    )
+    wait "$stripper" 2>/dev/null || true
+    rm -f "$fifo"
+}
+
+# do_flash <port> <fw> <log>: read flasher_args.json, esptool, return 0/1.
+do_flash() {
+    local port=$1 fw=$2 log=$3
+    local args_json="$fw/build/flasher_args.json"
+    if [ ! -f "$args_json" ]; then
+        echo "spangap: no build artifacts at $args_json" >&2
+        echo "         run \`spangap build\` first" >&2
+        return 1
+    fi
+
+    : > "$log"
+    kill_monitor
+    sleep 0.3
+
+    local chip baud before after
+    read -r chip baud before after < <(python3 - "$args_json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+ex = d.get("extra_esptool_args", {})
+print(
+    ex.get("chip", "auto"),
+    ex.get("baud", 460800),
+    ex.get("before", "default_reset"),
+    ex.get("after", "hard_reset"),
+)
+PY
+    )
+
+    local -a wf_args=()
+    while IFS= read -r line; do wf_args+=("$line"); done < <(python3 - "$args_json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+out = list(d.get("write_flash_args", []))
+ff = d.get("flash_files") or {}
+for offset, fname in sorted(ff.items(), key=lambda kv: int(kv[0], 16)):
+    out += [offset, fname]
+for a in out: print(a)
+PY
+    )
+    if [ "${#wf_args[@]}" -eq 0 ]; then
+        echo "spangap: flasher_args.json has no flash_files" >&2
+        return 1
+    fi
+
+    echo "spangap: chip=$chip port=$port baud=$baud project=$fw" >&2
+    local rc=0
+    (
+        cd "$fw/build"
+        esptool.py --chip "$chip" -p "$port" -b "$baud" \
+            --before "$before" --after "$after" \
+            write_flash "${wf_args[@]}"
+    ) 2>&1 | tee /tmp/spangap-esptool.log
+    rc=${PIPESTATUS[0]}
+
+    if [ "$rc" -ne 0 ]; then
+        mv /tmp/spangap-esptool.log "$log"
+        echo "spangap: esptool failed (rc=$rc); see $log" >&2
+        return 1
+    fi
+    rm -f /tmp/spangap-esptool.log
+    return 0
+}
+
+# monitor_loop <port> <fw> <initial_flash:1|0>: forever — passively monitor
+# until flashme appears, then flash + re-monitor (with reset-on-connect for
+# clean boot capture). Ctrl-C / TERM bails cleanly.
+monitor_loop() {
+    local port=$1 fw=$2 do_initial=$3
+    local flashme="$fw/build/flashme"
+    local log="$fw/build/flasher.log"
+
+    command -v esptool.py >/dev/null 2>&1 || die "esptool.py not on PATH (install ESP-IDF or pip install esptool)"
+    command -v idf.py     >/dev/null 2>&1 || die "idf.py not on PATH (needs native ESP-IDF for the monitor side)"
+
+    trap 'kill_monitor; exit 0' INT TERM
+    # Don't drop a present flashme on startup: a pending signal from another
+    # host is exactly when this loop is supposed to flash.
+
+    local pending=$do_initial
+    while true; do
+        local reset_flags="--no-reset"
+        if [ "$pending" = "1" ] || [ -f "$flashme" ]; then
+            if [ -f "$flashme" ]; then
+                echo "spangap: flashme seen — holding 3s so other flashers can latch it" >&2
+                sleep 3
+                rm -f "$flashme"
+            fi
+            if do_flash "$port" "$fw" "$log"; then
+                reset_flags=""
+                sleep 2
+            else
+                sleep 2
+                pending=0
+                continue
+            fi
+            pending=0
+        fi
+
+        # Watcher: nuke the running monitor the instant flashme appears.
+        ( while [ ! -f "$flashme" ]; do sleep 1; done
+          kill_monitor
+        ) &
+        local watcher=$!
+
+        if [ -n "$reset_flags" ]; then
+            echo "spangap: passive monitor (--no-reset; Ctrl-] exits, \`spangap flash\` re-flashes)" >&2
+        else
+            echo "spangap: monitor (Ctrl-] exits, \`spangap flash\` re-flashes)" >&2
+        fi
+        run_monitor "$port" "$fw" "$log" "$reset_flags"
+
+        kill "$watcher" 2>/dev/null || true
+        wait "$watcher" 2>/dev/null || true
+        sleep 1
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Command dispatch (outside).
+# ---------------------------------------------------------------------------
+
+case ${1:-} in
+flash)
+    shift
+    proj=$(require_straddle flash)
+    if [ $# -gt 0 ]; then
+        port=$1; shift
+        sticky_set "$PORT_FILE" "$port"
+    else
+        port=$(sticky_get "$PORT_FILE" SPANGAP_PORT flash "serial port")
+    fi
+    fw=$(resolve_firmware_dir "$proj") \
+        || die "spangap flash: no CMakeLists.txt in $proj or its esp-idf/ subdir"
+    mkdir -p "$fw/build"
+    if port_busy "$port"; then
+        touch "$fw/build/flashme"
+        echo "spangap: $port busy — signaled $fw/build/flashme; waiting for a monitor to pick it up..." >&2
+        for _ in 1 2 3 4 5; do
+            sleep 1
+            [ -f "$fw/build/flashme" ] || { echo "spangap: flashing." >&2; exit 0; }
+        done
+        die "$port was busy but nobody is flashing when I signal to. Start \`spangap monitor\` on a host with the port."
+    fi
+    monitor_loop "$port" "$fw" 1
+    ;;
+monitor)
+    shift
+    proj=$(require_straddle monitor)
+    if [ $# -gt 0 ]; then
+        port=$1; shift
+        sticky_set "$PORT_FILE" "$port"
+    else
+        port=$(sticky_get "$PORT_FILE" SPANGAP_PORT monitor "serial port")
+    fi
+    fw=$(resolve_firmware_dir "$proj") \
+        || die "spangap monitor: no CMakeLists.txt in $proj or its esp-idf/ subdir"
+    port_busy "$port" && die "spangap monitor: $port is busy — another monitor/flasher owns it"
+    monitor_loop "$port" "$fw" 0
+    ;;
+cli)
+    shift
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -h) [ $# -ge 2 ] || die "spangap cli: -h needs a hostname"
+                sticky_set "$HOST_FILE" "$2"
+                shift 2 ;;
+            --) shift; break ;;
+            *)  break ;;
+        esac
+    done
+    host=$(sticky_get "$HOST_FILE" SPANGAP_HOST cli "hostname (use -h <host>)")
+    cli_port=${SPANGAP_CLI_PORT:-2323}
+    # Pure-Python TCP CLI — no docker, no IDF, just a socket. Mirrors the
+    # in-container `spangap cli` so dev experience is the same from either
+    # side.
+    exec python3 - "$host" "$cli_port" "$@" <<'PY'
+import os, socket, sys, selectors
+PROMPT = b"$ "
+host = sys.argv[1]
+port = int(sys.argv[2])
+argv = sys.argv[3:]
+try:
+    s = socket.create_connection((host, port), timeout=10)
+except OSError as e:
+    sys.exit(f"spangap cli: connect {host}:{port}: {e}")
+s.settimeout(None)
+
+def drain_until_prompt(sock):
+    buf = b""
+    while not buf.endswith(PROMPT):
+        d = sock.recv(4096)
+        if not d: break
+        buf += d
+    return buf
+
+if argv:
+    drain_until_prompt(s)
+    s.sendall((" ".join(argv) + "\n").encode())
+    out = drain_until_prompt(s)
+    if out.endswith(PROMPT): out = out[:-len(PROMPT)]
+    sys.stdout.buffer.write(out); sys.stdout.flush()
+    sys.exit(0)
+
+sel = selectors.DefaultSelector()
+sel.register(sys.stdin, selectors.EVENT_READ)
+sel.register(s, selectors.EVENT_READ)
+try:
+    while True:
+        for key, _ in sel.select():
+            if key.fileobj is sys.stdin:
+                data = sys.stdin.buffer.read1(4096)
+                if not data: sys.exit(0)
+                s.sendall(data)
+            else:
+                data = s.recv(4096)
+                if not data: sys.exit(0)
+                sys.stdout.buffer.write(data); sys.stdout.flush()
+except KeyboardInterrupt:
+    pass
+PY
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Docker daemon + container management. Everything below this point needs
+# the build-env container running.
+# ---------------------------------------------------------------------------
+
+ws_hash=$(printf '%s' "$workspace" | sha256sum | cut -c1-7)
+container="spangap-$ws_hash"
+vol_cc="spangap-ccache-$ws_hash"
+vol_npm="spangap-npm-$ws_hash"
+
+ensure_daemon() {
+    docker info >/dev/null 2>&1 && return 0
+    if ! command -v docker >/dev/null 2>&1; then
+        die "docker not on PATH. Install Docker Desktop (mac) or the docker CLI (linux) and try again."
+    fi
+    case $(uname -s 2>/dev/null) in
+        Darwin) die "docker daemon not reachable. Start Docker Desktop and retry." ;;
+        Linux)  die "docker daemon not reachable. Start it: doas service docker start  (or: sudo systemctl start docker)" ;;
+        *)      die "docker daemon not reachable. Start your docker daemon and retry." ;;
+    esac
+}
+
+ensure_container() {
+    ensure_daemon
+    local state=missing s
+    if s=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null); then
+        state=$s
+    fi
+    case $state in
+        running)
+            # On macOS, recreating the host workspace dir leaves Docker
+            # Desktop's grpc-fuse share pointing at the gone inode. Probe
+            # /work and recreate if it's stale.
+            if docker exec "$container" test -d /work 2>/dev/null; then
+                return 0
+            fi
+            echo "spangap: container $container has a stale /work mount — recreating" >&2
+            docker rm -f "$container" >/dev/null
+            ;;
+        missing) ;;
+        *) docker rm -f "$container" >/dev/null ;;
+    esac
+
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        local ctx="$workspace/spangap"
+        [ -f "$ctx/build-system/Dockerfile" ] \
+            || die "can't build $IMAGE: no Dockerfile at $ctx/build-system/Dockerfile"
+        echo "spangap: building $IMAGE (one-time, takes a few minutes)..." >&2
+        docker build -t "$IMAGE" -f "$ctx/build-system/Dockerfile" "$ctx" \
+            || die "docker build failed; see output above"
+    fi
+
+    local claude_home="${HOME}/.claude-spangap"
+    mkdir -p "$claude_home"
+
+    docker run -d --name "$container" \
+        -v "$workspace:/work" \
+        -v "$vol_cc:/home/ubuntu/.ccache" \
+        -v "$vol_npm:/home/ubuntu/.npm" \
+        -v "$claude_home:/home/ubuntu/.claude" \
+        --workdir /work \
+        --label spangap.workspace="$workspace" \
+        "$IMAGE" sleep infinity >/dev/null
+
+    docker exec -u 0 "$container" sh -c \
+        'chown -R ubuntu:ubuntu /home/ubuntu/.ccache /home/ubuntu/.npm /home/ubuntu/.claude 2>/dev/null || true'
+}
+
+# Host-side require-fetching loop. Runs `spangap list-deps` inside the
+# container to enumerate missing siblings, then git-clones each on the host
+# (so host github auth is used — the container has no creds). Loops because
+# this iteration's siblings may add their own requires:.
+fetch_missing_deps() {
+    local container_cwd=$1
+    while :; do
+        local missing
+        missing=$(docker exec --workdir "$container_cwd" "$container" spangap list-deps)
+        [ -z "$missing" ] && return 0
+        for spec in $missing; do
+            local bare=${spec%@*} ref=
+            case $spec in *@*) ref=${spec#*@} ;; esac
+            local repo=${bare#*/}
+            local target="$workspace/$repo"
+            if [ -e "$target" ]; then
+                die "$target already exists, but $bare wasn't seen as a workspace sibling — wrong 'name:' in its straddle.yaml? wrong dir layout?"
+            fi
+            echo "spangap: cloning $bare -> $target" >&2
+            git clone --quiet "https://github.com/${bare}.git" "$target" \
+                || die "git clone https://github.com/${bare}.git failed (host github auth set up?)"
+            if [ -n "$ref" ]; then
+                git -C "$target" checkout --quiet "$ref" \
+                    || die "git checkout '$ref' failed in $target"
+            fi
+        done
+    done
+}
+
+# reset: drop container + image. Cache volumes + ~/.claude-spangap preserved.
+case ${1:-} in
+reset)
+    shift
+    ensure_daemon
+    if docker inspect "$container" >/dev/null 2>&1; then
+        echo "spangap: removing container $container" >&2
+        docker rm -f "$container" >/dev/null
+    fi
+    if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        echo "spangap: removing image $IMAGE" >&2
+        docker rmi "$IMAGE" >/dev/null
+    fi
+    echo "spangap: reset complete — next invocation will rebuild." >&2
+    exit 0
+    ;;
+esac
+
+ensure_container
+
+# Container cwd = host cwd remapped through the bind mount.
+host_cwd=$(pwd)
+case $host_cwd in
+    "$workspace") rel="" ;;
+    "$workspace"/*) rel=${host_cwd#"$workspace/"} ;;
+    *) die "cwd $host_cwd is not under workspace $workspace" ;;
+esac
+container_cwd="/work${rel:+/$rel}"
+
+exec_flags="-i"
+[ -t 0 ] && [ -t 1 ] && exec_flags="-it"
+
+# Pre-fetch host-side deps before delegating commands that need a complete
+# workspace. `build` is the obvious one; `get-deps` runs the loop and exits.
+# `docker <cmd>` is the raw escape hatch: docker-exec <cmd> in the build-env
+# container, bypassing the in-container spangap wrapper.
+case ${1:-} in
+get-deps)
+    command -v git >/dev/null 2>&1 || die "spangap get-deps: git required on host PATH"
+    require_straddle get-deps >/dev/null
+    fetch_missing_deps "$container_cwd"
+    echo "spangap: get-deps done — all requires: present under $workspace" >&2
+    exit 0
+    ;;
+build)
+    command -v git >/dev/null 2>&1 || die "spangap build: git required on host PATH (for auto get-deps)"
+    require_straddle build >/dev/null
+    fetch_missing_deps "$container_cwd"
+    ;;
+docker)
+    shift
+    [ $# -gt 0 ] || die "spangap docker: missing command (e.g. \`spangap docker sh\`)"
+    # shellcheck disable=SC2086
+    exec docker exec $exec_flags --workdir "$container_cwd" "$container" "$@"
+    ;;
+esac
+
+# Anything outside doesn't understand goes through the in-container spangap
+# wrapper, which sources IDF env then dispatches via the Python CLI.
+# shellcheck disable=SC2086
+exec docker exec $exec_flags --workdir "$container_cwd" "$container" spangap "$@"

@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""spangap — in-container CLI.
+
+Runs inside the build-env container. spangap-outside docker-exec's to this.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import selectors
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import yaml
+from jsonschema import Draft202012Validator
+
+SCHEMA_PATH = Path("/usr/local/share/spangap/straddle.schema.json")
+WORKSPACE = Path("/work")
+HOST_FILE = WORKSPACE / ".spangap-host"
+
+
+class Manifest:
+    """Validated straddle.yaml plus its on-disk location."""
+
+    def __init__(self, manifest_path: Path, data: dict[str, Any]) -> None:
+        self.path = manifest_path
+        self.dir = manifest_path.parent
+        self.data = data
+
+    @property
+    def name(self) -> str: return self.data["name"]
+    @property
+    def org(self) -> str: return self.name.split("/", 1)[0]
+    @property
+    def repo(self) -> str: return self.name.split("/", 1)[1]
+    @property
+    def prefix(self) -> str: return self.data["prefix"]
+    @property
+    def version(self) -> str: return self.data["version"]
+    @property
+    def firmware_dir(self) -> Path:
+        return (self.dir / self.data.get("firmware", "idf")).resolve()
+    @property
+    def browser_dir(self) -> Path:
+        return (self.dir / self.data.get("browser", "browser")).resolve()
+    @property
+    def has_firmware(self) -> bool:
+        return self.firmware_dir.exists() and (self.firmware_dir / "CMakeLists.txt").exists()
+    @property
+    def has_browser(self) -> bool:
+        return self.browser_dir.exists() and (self.browser_dir / "package.json").exists()
+    @property
+    def requires(self) -> list[str]:
+        return list(self.data.get("requires", []))
+    @property
+    def is_app(self) -> bool:
+        return "app" in self.data
+
+
+def die(msg: str, exit_code: int = 1):
+    sys.stderr.write(f"spangap: {msg}\n")
+    sys.exit(exit_code)
+
+
+def find_project(start: Path | None = None) -> Manifest:
+    """Walk up from cwd until straddle.yaml. That's the project."""
+    cur = (start or Path.cwd()).resolve()
+    while True:
+        cand = cur / "straddle.yaml"
+        if cand.is_file():
+            return load_manifest(cand)
+        if cur == cur.parent:
+            die(
+                f"no straddle.yaml found at or above {Path.cwd()}.\n"
+                "       Run from inside a straddle (a dir with straddle.yaml at its root)."
+            )
+        cur = cur.parent
+
+
+def load_manifest(path: Path) -> Manifest:
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as e:
+        die(f"{path}: invalid YAML — {e}")
+    if not isinstance(raw, dict):
+        die(f"{path}: top-level must be a mapping")
+    schema = json.loads(SCHEMA_PATH.read_text())
+    errs = sorted(Draft202012Validator(schema).iter_errors(raw), key=lambda e: e.path)
+    if errs:
+        for e in errs:
+            loc = "/".join(str(p) for p in e.path) or "<root>"
+            sys.stderr.write(f"spangap: {path}: {loc}: {e.message}\n")
+        die(f"{path}: schema validation failed ({len(errs)} error(s))")
+    return Manifest(path, raw)
+
+
+def scan_workspace_straddles() -> dict[str, Manifest]:
+    """Every straddle.yaml under immediate children of /work, indexed by name."""
+    found: dict[str, Manifest] = {}
+    if not WORKSPACE.is_dir():
+        die(f"workspace {WORKSPACE} not mounted — is the container running with -v <ws>:/work?")
+    for child in sorted(WORKSPACE.iterdir()):
+        if not child.is_dir():
+            continue
+        m_path = child / "straddle.yaml"
+        if not m_path.is_file():
+            continue
+        m = load_manifest(m_path)
+        if m.name in found:
+            die(f"two straddles claim the same name '{m.name}':\n  {found[m.name].path}\n  {m.path}")
+        found[m.name] = m
+    return found
+
+
+def resolve_requires(
+    proj: Manifest,
+    all_straddles: dict[str, Manifest],
+    missing_ok: bool = False,
+) -> tuple[list[Manifest], list[str]]:
+    """Walk requires: transitively, topo-sorted (deps before dependents)."""
+    out: list[Manifest] = []
+    seen: set[str] = set()
+    on_stack: set[str] = set()
+    missing: dict[str, str] = {}
+
+    def visit(spec: str, requested_by: str) -> None:
+        bare = spec.split("@", 1)[0]
+        if bare in seen or bare in missing:
+            return
+        if bare in on_stack:
+            die(f"requires: cycle through {bare} (from {requested_by})")
+        if bare not in all_straddles:
+            if missing_ok:
+                missing[bare] = spec
+                return
+            die(
+                f"missing workspace sibling: {bare} (required by {requested_by}).\n"
+                "       Run `spangap get-deps` from this straddle to clone it."
+            )
+        on_stack.add(bare)
+        for dep in all_straddles[bare].requires:
+            visit(dep, bare)
+        on_stack.discard(bare)
+        seen.add(bare)
+        out.append(all_straddles[bare])
+
+    for r in proj.requires:
+        visit(r, proj.name)
+    return out, list(missing.values())
+
+
+def signal_preamble(proj: Manifest, deps: list[Manifest], missing: list[str] = ()) -> None:
+    n = len(deps)
+    dep_summary = f"{n} dep" + ("s" if n != 1 else "")
+    print(f"workspace: {WORKSPACE}", file=sys.stderr)
+    print(f"project:   {proj.name} ({proj.version})", file=sys.stderr)
+    if deps:
+        print(f"requires:  {dep_summary} — {', '.join(d.name for d in deps)}", file=sys.stderr)
+    if missing:
+        print(f"missing:   {len(missing)} not yet cloned — {', '.join(missing)}", file=sys.stderr)
+        print("           run `spangap get-deps` from this straddle to fetch them.", file=sys.stderr)
+
+
+def stage_components(proj: Manifest, deps: list[Manifest]) -> Path:
+    """Symlink each transitive dep into <fw>/staging/components/<repo>/."""
+    staging = proj.firmware_dir / "staging" / "components"
+    if staging.exists():
+        for entry in staging.iterdir():
+            if entry.is_symlink() or entry.is_file():
+                entry.unlink()
+            elif entry.is_dir():
+                shutil.rmtree(entry)
+    staging.mkdir(parents=True, exist_ok=True)
+
+    for dep in deps:
+        target = dep.firmware_dir
+        if not target.is_dir() or not (target / "CMakeLists.txt").exists():
+            die(f"{dep.name}: firmware dir {target} has no CMakeLists.txt — can't stage")
+        link = staging / dep.repo
+        link.symlink_to(target)
+        print(f"  staged: {dep.repo} -> {target}", file=sys.stderr)
+
+    return staging
+
+
+def run_idf(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> int:
+    cmd = ["idf.py", *args]
+    print(f"+ {' '.join(cmd)}  (in {cwd})", file=sys.stderr)
+    return subprocess.run(cmd, cwd=cwd, env={**os.environ, **(env or {})}).returncode
+
+
+def cmd_build(args: argparse.Namespace) -> int:
+    proj = find_project()
+    if not proj.is_app:
+        die(
+            f"{proj.name} is not an app-straddle (no `app:` block in straddle.yaml).\n"
+            "       `spangap build` only builds app-straddles. Build a consumer of this one."
+        )
+    if not proj.has_firmware:
+        die(f"{proj.name}: firmware dir {proj.firmware_dir} has no CMakeLists.txt")
+
+    all_straddles = scan_workspace_straddles()
+    deps, _ = resolve_requires(proj, all_straddles)
+    signal_preamble(proj, deps)
+    stage_components(proj, deps)
+    return run_idf(args.idf_args or ["build"], cwd=proj.firmware_dir)
+
+
+def cmd_flash(args: argparse.Namespace) -> int:
+    """In-container flash: touch <project>/build/flashme, wait for a monitor to consume it.
+
+    The container can't see a serial port — only the host running
+    `spangap monitor` can actually flash. We signal via flashme and watch
+    for it to disappear (the monitor loop deletes it just before flashing).
+    """
+    proj = find_project()
+    if not proj.is_app:
+        die(f"{proj.name} is not an app-straddle (no `app:` block) — nothing to flash.")
+    flashme = proj.firmware_dir / "build" / "flashme"
+    flashme.parent.mkdir(parents=True, exist_ok=True)
+    flashme.touch()
+    print(f"spangap: signaled {flashme} — waiting for a monitor to pick it up...", file=sys.stderr)
+    for _ in range(5):
+        time.sleep(1)
+        if not flashme.exists():
+            print("spangap: flashing.", file=sys.stderr)
+            return 0
+    print(
+        "spangap: flashme still present after 5s — nobody seems to be running\n"
+        "         `spangap monitor <dev>`. Start it on a host with the serial port.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    proj = find_project()
+    return run_idf(["fullclean"], cwd=proj.firmware_dir)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    print("spangap doctor (in-container)")
+    print(f"  python:      {sys.version.split()[0]}")
+    print(f"  workspace:   {WORKSPACE} ({'mounted' if WORKSPACE.is_dir() else 'MISSING'})")
+    try:
+        proj = find_project()
+        print(f"  project:     {proj.name} ({proj.version}) at {proj.dir}")
+    except SystemExit:
+        print("  project:     <none — cwd not under a straddle>")
+    print(f"  IDF_PATH:    {os.environ.get('IDF_PATH', '<unset>')}")
+    print(f"  IDF_TOOLS:   {os.environ.get('IDF_TOOLS_PATH', '<unset>')}")
+    print(f"  node:        {_capture(['node', '--version'])}")
+    print(f"  npm:         {_capture(['npm', '--version'])}")
+    print(f"  idf.py:      {_capture(['idf.py', '--version'])}")
+    return 0
+
+
+def _capture(cmd: list[str]) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return (r.stdout or r.stderr).strip().splitlines()[0] if (r.stdout or r.stderr) else "<no output>"
+    except FileNotFoundError:
+        return "<not installed>"
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    proj = find_project()
+    deps, _ = resolve_requires(proj, scan_workspace_straddles())
+    print(f"{proj.name} v{proj.version} — OK")
+    if deps:
+        print("requires (topo):")
+        for d in deps:
+            print(f"  - {d.name} v{d.version}")
+    return 0
+
+
+def cmd_list_deps(args: argparse.Namespace) -> int:
+    """Print transitive requires: not yet present as workspace siblings.
+
+    One spec per line; nothing else on stdout — parsed by host-side
+    `spangap get-deps` orchestrator in spangap-outside.
+    """
+    proj = find_project()
+    _, missing = resolve_requires(proj, scan_workspace_straddles(), missing_ok=True)
+    for spec in missing:
+        print(spec)
+    return 0
+
+
+def cmd_reallyclean(args: argparse.Namespace) -> int:
+    """Source-only state: drop idf build/, staging/, browser node_modules/, dist/, .quasar."""
+    proj = find_project()
+    targets = [
+        proj.firmware_dir / "build",
+        proj.firmware_dir / "staging",
+        proj.firmware_dir / "managed_components",
+        proj.browser_dir / "node_modules",
+        proj.browser_dir / "dist",
+        proj.browser_dir / ".quasar",
+    ]
+    for t in targets:
+        if t.is_symlink() or t.is_file():
+            t.unlink()
+            print(f"  rm {t}", file=sys.stderr)
+        elif t.is_dir():
+            shutil.rmtree(t)
+            print(f"  rm -r {t}", file=sys.stderr)
+    pkg_lock = proj.browser_dir / "package-lock.json"
+    if pkg_lock.is_file():
+        pkg_lock.unlink()
+        print(f"  rm {pkg_lock}", file=sys.stderr)
+    print("spangap: reallyclean done.")
+    return 0
+
+
+def cmd_claude(claude_args: list[str]) -> int:
+    """Lazy-install @anthropic-ai/claude-code (if absent) and exec `claude`."""
+    if not shutil.which("claude"):
+        print("spangap: claude not installed in container — running `npm install -g @anthropic-ai/claude-code`...", file=sys.stderr)
+        r = subprocess.run(["npm", "install", "-g", "@anthropic-ai/claude-code"], check=False)
+        if r.returncode != 0:
+            die("npm install -g @anthropic-ai/claude-code failed; see output above")
+    claude_path = shutil.which("claude")
+    if not claude_path:
+        die("claude still not on PATH after npm install — check /home/ubuntu/.npm-global/bin")
+    os.execvp(claude_path, [claude_path, *claude_args])
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# `spangap cli` — TCP CLI client. Same UX as the host-side `spangap cli`:
+# -h persists hostname to /work/.spangap-host (= $SPANGAP_WORKSPACE/.spangap-host
+# on the host through the bind mount), subsequent calls can omit it.
+# ---------------------------------------------------------------------------
+PROMPT = b"$ "
+
+
+def cmd_cli(argv: list[str]) -> int:
+    host: str | None = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "-h":
+            if i + 1 >= len(argv):
+                die("spangap cli: -h needs a hostname")
+            host = argv[i + 1]
+            HOST_FILE.write_text(host + "\n")
+            i += 2
+        elif a == "--":
+            i += 1
+            break
+        else:
+            break
+    if host is None:
+        host = os.environ.get("SPANGAP_HOST") or (HOST_FILE.read_text().strip() if HOST_FILE.is_file() else "")
+        if not host:
+            die("spangap cli: no host — pass -h <host> first to persist it")
+    port = int(os.environ.get("SPANGAP_CLI_PORT", "2323"))
+
+    try:
+        s = socket.create_connection((host, port), timeout=10)
+    except OSError as e:
+        die(f"cli: connect {host}:{port}: {e}")
+    s.settimeout(None)
+
+    def drain():
+        buf = b""
+        while not buf.endswith(PROMPT):
+            d = s.recv(4096)
+            if not d:
+                break
+            buf += d
+        return buf
+
+    rest = argv[i:]
+    if rest:
+        drain()
+        s.sendall((" ".join(rest) + "\n").encode())
+        out = drain()
+        if out.endswith(PROMPT):
+            out = out[: -len(PROMPT)]
+        sys.stdout.buffer.write(out)
+        sys.stdout.flush()
+        return 0
+
+    sel = selectors.DefaultSelector()
+    sel.register(sys.stdin, selectors.EVENT_READ)
+    sel.register(s, selectors.EVENT_READ)
+    try:
+        while True:
+            for key, _ in sel.select():
+                if key.fileobj is sys.stdin:
+                    data = sys.stdin.buffer.read1(4096)
+                    if not data:
+                        return 0
+                    s.sendall(data)
+                else:
+                    data = s.recv(4096)
+                    if not data:
+                        return 0
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.flush()
+    except KeyboardInterrupt:
+        return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw = sys.argv[1:] if argv is None else argv
+    # Pass-through subcommands whose own flag parsing would clash with argparse.
+    if raw and raw[0] == "claude":
+        return cmd_claude(raw[1:])
+    if raw and raw[0] == "cli":
+        return cmd_cli(raw[1:])
+
+    p = argparse.ArgumentParser(prog="spangap", description="spangap straddles CLI (in-container)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("doctor", help="report environment info").set_defaults(func=cmd_doctor)
+    sub.add_parser("validate", help="parse + validate manifest and dep graph").set_defaults(func=cmd_validate)
+    sub.add_parser("clean", help="run idf.py fullclean").set_defaults(func=cmd_clean)
+    sub.add_parser("reallyclean", help="strip back to source-only state").set_defaults(func=cmd_reallyclean)
+
+    p_build = sub.add_parser("build", help="build the project (default: idf.py build)")
+    p_build.add_argument("idf_args", nargs="*", help="forwarded to idf.py")
+    p_build.set_defaults(func=cmd_build)
+
+    sub.add_parser(
+        "flash",
+        help="signal a host running `spangap monitor` to reflash (touches build/flashme)",
+    ).set_defaults(func=cmd_flash)
+
+    sub.add_parser(
+        "list-deps",
+        help="print transitive requires: not yet present as workspace siblings (used by host-side `spangap get-deps`)",
+    ).set_defaults(func=cmd_list_deps)
+
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

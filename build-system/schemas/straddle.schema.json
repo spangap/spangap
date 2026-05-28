@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spangap.invalid/schemas/straddle.schema.json",
+  "title": "straddle.yaml",
+  "description": "Distributable feature/app unit that spans firmware + browser. See docs/plans/straddles.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "prefix", "version"],
+  "properties": {
+    "schema_version": {
+      "description": "Schema revision; reserved for future evolution.",
+      "type": "integer",
+      "default": 1
+    },
+    "name": {
+      "description": "Canonical <org>/<repo> identity. Matches the github path.",
+      "type": "string",
+      "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+$"
+    },
+    "prefix": {
+      "description": "Short identity used as symbol prefix, include subdir, browser import name. May be empty (only spangap-core uses the empty prefix by convention).",
+      "type": "string",
+      "pattern": "^([a-zA-Z][a-zA-Z0-9_-]*)?$"
+    },
+    "version": {
+      "description": "Semver-ish version string. Pin-only for now; no version-range solver.",
+      "type": "string"
+    },
+    "firmware": {
+      "description": "Firmware-half path relative to manifest dir. Omit for default 'idf'. Use '.' when the manifest dir IS the firmware project root (app-straddles).",
+      "type": "string",
+      "default": "idf"
+    },
+    "browser": {
+      "description": "Browser-half path relative to manifest dir. Omit for default 'browser'.",
+      "type": "string",
+      "default": "browser"
+    },
+    "platforms": {
+      "description": "Which build platforms this straddle's firmware half supports. Today: just idf.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "enum": ["idf"] },
+      "default": ["idf"]
+    },
+    "requires": {
+      "description": "Other straddles this one depends on. Each entry is '<org>/<repo>' optionally followed by '@<ref>' (tag/branch/SHA).",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+(@[A-Za-z0-9._/-]+)?$"
+      },
+      "default": []
+    },
+    "app": {
+      "description": "App-level globals. Present only on app-straddles (those that build a device image).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "partition_layout": {
+          "description": "Either a path to partitions.csv relative to firmware dir, or a named platform-provided layout.",
+          "type": "string"
+        },
+        "ota_pubkey": {
+          "description": "Path to OTA public-key PEM, relative to firmware dir.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

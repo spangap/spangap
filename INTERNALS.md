@@ -47,14 +47,21 @@ Pass `--no-web-ui` or `--no-lcd` at build time to exclude an activator.
 
 ### The build CLI
 
-Most operations route through the in-container `spangap` CLI. The host-
-side shim resolves the workspace (looking for `spangap.workspace.yaml`,
-then walking up for `straddle.yaml`), starts the build-env container if
-needed (`spangap-<hash7(workspace)>`), and execs in. Common verbs:
+The host-side entry script is `./spangap` at the platform-repo root. It
+walks up from cwd for `spangap.workspace.yaml` (only — there's no
+straddle-as-workspace fallback) and dispatches into
+`<ws>/spangap/build-system/spangap-outside`, which in turn either handles
+the command on the host (flash, monitor, cli, dev-deps, reset) or
+docker-execs `spangap-inside` in the build-env container
+(`spangap-<hash7(workspace)>`). Common verbs:
 
-- `spangap build` / `spangap flash` / `spangap monitor`
-- `spangap install <straddle>` — pull a straddle into the workspace
+- `spangap build` / `spangap flash <dev>` / `spangap monitor <dev>`
+- `spangap get-deps` — host-side `git clone` of any missing transitive
+  `requires:` (also runs implicitly as the first phase of `build`)
+- `spangap cli [-h <host>] <cmd>…` — talk to the device's TCP CLI
 - `spangap clean` / `spangap reallyclean` — incremental vs source-only
+- `spangap docker <cmd>…` — raw `docker exec` into the build-env container
+  (e.g. `spangap docker sh` to drop into a shell, `spangap docker claude`)
 
 Local sibling-checkout development uses the `--spangap` flag (or its
 moral equivalent in this CLI) so a build resolves `spangap-core` from

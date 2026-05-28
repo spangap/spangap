@@ -32,6 +32,17 @@ workspace="${SPANGAP_WORKSPACE:?spangap-outside: SPANGAP_WORKSPACE not set (invo
 
 die() { printf 'spangap: %s\n' "$*" >&2; exit 1; }
 
+# Content hash of build-system/. Stamped into the image at build time via
+# --build-arg BUILDSYS_HASH and read back via the org.spangap.buildsys-hash
+# label; ensure_container compares fresh-hash to stamp and rebuilds on
+# mismatch, so the cached image can never silently outlive its source. Modes
+# are not hashed (the Dockerfile forces them on COPY).
+buildsys_hash() {
+    local ctx=$1
+    ( cd "$ctx" && find build-system -type f | LC_ALL=C sort | xargs sha256sum ) \
+        | sha256sum | awk '{print $1}'
+}
+
 # ---------------------------------------------------------------------------
 # straddle + firmware-dir resolution.
 # ---------------------------------------------------------------------------
@@ -385,6 +396,27 @@ ensure_daemon() {
 
 ensure_container() {
     ensure_daemon
+
+    local ctx="$workspace/spangap"
+    local local_hash=""
+    [ -f "$ctx/build-system/Dockerfile" ] && local_hash=$(buildsys_hash "$ctx")
+
+    # Drop a stale image before anything else — if build-system/ has changed
+    # since the image was built, the container on top of it is stale too.
+    if [ -n "$local_hash" ] && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        local stamp
+        stamp=$(docker image inspect --format \
+            '{{ index .Config.Labels "org.spangap.buildsys-hash" }}' \
+            "$IMAGE" 2>/dev/null) || stamp=""
+        if [ "$stamp" != "$local_hash" ]; then
+            echo "spangap: $IMAGE is stale (build-system/ changed since image build) — rebuilding" >&2
+            if docker inspect "$container" >/dev/null 2>&1; then
+                docker rm -f "$container" >/dev/null
+            fi
+            docker rmi "$IMAGE" >/dev/null
+        fi
+    fi
+
     local state=missing s
     if s=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null); then
         state=$s
@@ -405,11 +437,12 @@ ensure_container() {
     esac
 
     if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-        local ctx="$workspace/spangap"
-        [ -f "$ctx/build-system/Dockerfile" ] \
+        [ -n "$local_hash" ] \
             || die "can't build $IMAGE: no Dockerfile at $ctx/build-system/Dockerfile"
         echo "spangap: building $IMAGE (one-time, takes a few minutes)..." >&2
-        docker build -t "$IMAGE" -f "$ctx/build-system/Dockerfile" "$ctx" \
+        docker build -t "$IMAGE" \
+            --build-arg "BUILDSYS_HASH=$local_hash" \
+            -f "$ctx/build-system/Dockerfile" "$ctx" \
             || die "docker build failed; see output above"
     fi
 

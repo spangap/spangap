@@ -66,6 +66,11 @@ RUN mkdir -p /usr/local/lib/spangap /usr/local/share/spangap
 # `ubuntu` user can't read the script.
 COPY --chmod=0755 build-system/spangap-inside /usr/local/lib/spangap/cli.py
 COPY --chmod=0644 build-system/schemas/straddle.schema.json /usr/local/share/spangap/straddle.schema.json
+
+# Stamp the build-system/ content hash so spangap-outside can detect a stale
+# cached image (build-system/ changed since the image was built) and rebuild.
+ARG BUILDSYS_HASH=unknown
+LABEL org.spangap.buildsys-hash=$BUILDSYS_HASH
 RUN printf '%s\n' \
         '#!/usr/bin/env bash' \
         '# spangap — in-container entry. Sources IDF env (so subprocesses see' \

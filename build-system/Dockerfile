@@ -93,9 +93,12 @@ ENV HOME=/home/ubuntu
 
 # User-owned npm prefix so `npm install -g` works without sudo. `spangap
 # claude` lazy-installs @anthropic-ai/claude-code into this prefix on first
-# use (the npm cache volume keeps reinstall fast across container rebuilds).
-RUN mkdir -p /home/ubuntu/.npm-global && \
-    npm config set prefix /home/ubuntu/.npm-global
+# use. Set via env (not `npm config set prefix`, which would write
+# ~/.npmrc — that lives at /home/ubuntu/.npmrc and gets hidden the moment
+# spangap-outside bind-mounts ~/.spangap over /home/ubuntu). ensure_container
+# creates the prefix dir post-run since the image layer's mkdir is also
+# shadowed.
+ENV NPM_CONFIG_PREFIX=/home/ubuntu/.npm-global
 ENV PATH=/home/ubuntu/.npm-global/bin:$PATH
 
 # Workspace bind-mount lands here. spangap-outside does `docker run -d -v <ws>:/work`.

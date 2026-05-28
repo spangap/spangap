@@ -474,8 +474,12 @@ esac
 
 ws_hash=$(printf '%s' "$workspace" | sha256sum | cut -c1-7)
 container="spangap-$ws_hash"
-vol_cc="spangap-ccache-$ws_hash"
-vol_npm="spangap-npm-$ws_hash"
+# Persistent per-user home: a single bind mount at /home/ubuntu inside
+# the container. `pip install --user`, `npm install -g`, ccache, the
+# Claude CLI's auth + history, shell history, dotfiles — everything that
+# would normally live in $HOME persists across container recreations and
+# is shared across workspaces. spangap_home is created on demand below.
+spangap_home="${HOME}/.spangap"
 
 # In SPANGAP_QUIET mode, ensure_container prints a single
 # "setting up Docker container" line at its first real work step
@@ -573,20 +577,34 @@ ensure_container() {
     fi
 
     announce_container_setup
-    local claude_home="${HOME}/.claude-spangap"
-    mkdir -p "$claude_home"
+    # One-time migration from the old per-subdir layout: move
+    # ~/.claude-spangap (the only host-side dir we used to keep) into
+    # the new consolidated $spangap_home as ~/.claude. Per-workspace
+    # ccache/npm Docker volumes from the old layout are left behind
+    # (orphaned) — `docker volume ls | grep ^spangap-(ccache|npm)-`
+    # surfaces them for cleanup.
+    if [ ! -d "$spangap_home" ] && [ -d "${HOME}/.claude-spangap" ]; then
+        mkdir -p "$spangap_home"
+        mv "${HOME}/.claude-spangap" "$spangap_home/.claude" \
+            || die "couldn't migrate ${HOME}/.claude-spangap → $spangap_home/.claude"
+        echo "spangap: migrated ${HOME}/.claude-spangap → $spangap_home/.claude" >&2
+    fi
+    mkdir -p "$spangap_home"
 
     docker run -d --name "$container" \
         -v "$workspace:/work" \
-        -v "$vol_cc:/home/ubuntu/.ccache" \
-        -v "$vol_npm:/home/ubuntu/.npm" \
-        -v "$claude_home:/home/ubuntu/.claude" \
+        -v "$spangap_home:/home/ubuntu" \
         --workdir /work \
         --label spangap.workspace="$workspace" \
         "$IMAGE" sleep infinity >/dev/null
 
+    # Pre-create the npm prefix dir (Dockerfile sets NPM_CONFIG_PREFIX
+    # but the bind mount hides any dirs the image baked into /home/ubuntu)
+    # and align ownership with the in-container ubuntu user. Failures are
+    # benign on Docker Desktop where the bind mount handles uid mapping
+    # for us.
     docker exec -u 0 "$container" sh -c \
-        'chown -R ubuntu:ubuntu /home/ubuntu/.ccache /home/ubuntu/.npm /home/ubuntu/.claude 2>/dev/null || true'
+        'mkdir -p /home/ubuntu/.npm-global && chown -R ubuntu:ubuntu /home/ubuntu 2>/dev/null || true'
 }
 
 # Host-side require-fetching loop. Runs `spangap list-deps` inside the

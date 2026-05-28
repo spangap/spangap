@@ -105,12 +105,34 @@ find_straddle() {
 require_straddle() {
     local cmd=$1
     local s
-    s=$(find_straddle) || die "spangap $cmd: not inside a straddle (no straddle.yaml at/above $PWD)"
-    case $s in
-        "$workspace"|"$workspace"/*) ;;
-        *) die "spangap $cmd: straddle $s is not under workspace $workspace" ;;
-    esac
-    printf '%s\n' "$s"
+    if s=$(find_straddle); then
+        case $s in
+            "$workspace"|"$workspace"/*) ;;
+            *) die "spangap $cmd: straddle $s is not under workspace $workspace" ;;
+        esac
+        printf '%s\n' "$s"
+        return 0
+    fi
+    # No straddle at/above cwd. If we're sitting at the workspace root
+    # and there's exactly one straddle directly under it, use that — the
+    # `spangap init <project> && spangap build` flow doesn't make the
+    # user cd into the cloned project just to be explicit about which
+    # one to build.
+    if [ "$PWD" = "$workspace" ]; then
+        local candidate found="" count=0
+        for candidate in "$workspace"/*/straddle.yaml; do
+            [ -f "$candidate" ] || continue
+            found=$(dirname "$candidate")
+            count=$((count + 1))
+        done
+        if [ "$count" = 1 ]; then
+            printf '%s\n' "$found"
+            return 0
+        elif [ "$count" -gt 1 ]; then
+            die "spangap $cmd: $workspace has more than one straddle — cd into the one you want and retry"
+        fi
+    fi
+    die "spangap $cmd: not inside a straddle (no straddle.yaml at/above $PWD)"
 }
 
 # Pick the dir that holds the IDF project's CMakeLists.txt. Same rule as the
@@ -645,7 +667,12 @@ exec_flags="-i"
 case ${1:-} in
 get-deps)
     command -v git >/dev/null 2>&1 || die "spangap get-deps: git required on host PATH"
-    require_straddle get-deps >/dev/null
+    proj=$(require_straddle get-deps)
+    # Re-derive container_cwd from the resolved straddle so get-deps /
+    # build also work from the workspace root with a single child
+    # straddle (the `init <project> && build` flow).
+    proj_rel=${proj#"$workspace"}; proj_rel=${proj_rel#/}
+    container_cwd="/work${proj_rel:+/$proj_rel}"
     fetch_missing_deps "$container_cwd"
     echo "spangap: get-deps done — all requires: present under $workspace" >&2
     exit 0
@@ -653,6 +680,8 @@ get-deps)
 build)
     command -v git >/dev/null 2>&1 || die "spangap build: git required on host PATH (for auto get-deps)"
     proj=$(require_straddle build)
+    proj_rel=${proj#"$workspace"}; proj_rel=${proj_rel#/}
+    container_cwd="/work${proj_rel:+/$proj_rel}"
     fetch_missing_deps "$container_cwd"
     shift
     # -s as the first arg after `build` is consumed here (not forwarded

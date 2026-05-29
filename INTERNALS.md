@@ -77,7 +77,10 @@ per-entry symlinks to the source dir's contents plus two generated files:
   ```
 
   The buildable's `main/CMakeLists.txt` reads its own generated file at
-  `${CMAKE_SOURCE_DIR}/staging/main_requires.cmake` — same convention.
+  `${CMAKE_CURRENT_LIST_DIR}/../staging/main_requires.cmake`. (Note:
+  `CMAKE_CURRENT_LIST_DIR`, not `CMAKE_SOURCE_DIR` — in IDF's component-
+  requirements pre-pass the latter resolves to the build dir, breaking
+  the include.)
 
 - One sibling staged component, **`_spangap_present`**, contains an
   auto-generated `Kconfig.projbuild` declaring one hidden

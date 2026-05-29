@@ -109,6 +109,21 @@ find_straddle() {
     done
 }
 
+# default_straddle: if the user is at the workspace root and
+# `.spangap-project` (written by `spangap init <project>`) names a real
+# straddle, echo its dir. Returns 1 silently otherwise. No buildable check
+# — caller decides whether that matters.
+default_straddle() {
+    [ -n "${workspace:-}" ] || return 1
+    [ "$PWD" = "$workspace" ] || return 1
+    local proj_file="$workspace/.spangap-project"
+    [ -f "$proj_file" ] || return 1
+    local p
+    p=$(cat "$proj_file")
+    [ -f "$workspace/$p/straddle.yaml" ] || return 1
+    printf '%s\n' "$workspace/$p"
+}
+
 # require_straddle: cmd-name → straddle-dir on stdout, or die.
 require_straddle() {
     local cmd=$1
@@ -429,12 +444,24 @@ monitor)
     # monitor stays useful outside a straddle: you lose stack decode + the
     # flashme reflash signal, but the live log is still worth attaching to.
     # Warn loudly so the user knows what they're giving up.
-    if proj=$(find_straddle 2>/dev/null) \
-        && case $proj in "$workspace"|"$workspace"/*) true ;; *) false ;; esac; then
+    #
+    # Resolution order:
+    #   1. straddle.yaml at/above cwd (must be under workspace)
+    #   2. workspace-root invocation falls back to .spangap-project
+    #      (same default flash/build use via require_straddle)
+    #   3. neither → "no straddle context" warning, monitor still attaches
+    proj=""
+    if cand=$(find_straddle 2>/dev/null) \
+        && case $cand in "$workspace"|"$workspace"/*) true ;; *) false ;; esac; then
+        proj=$cand
+    elif cand=$(default_straddle 2>/dev/null); then
+        proj=$cand
+    fi
+    if [ -n "$proj" ]; then
         fw=$(resolve_firmware_dir "$proj") \
             || die "spangap monitor: no CMakeLists.txt in $proj or its esp-idf/ subdir"
     else
-        echo "spangap: Warning: not in spangap workspace, cannot decode stack on crash, cannot be signalled to flash." >&2
+        echo "spangap: Warning: not in a straddle dir — cannot decode stack on crash, cannot be signalled to flash." >&2
         fw=""
     fi
     if [ $# -gt 0 ]; then

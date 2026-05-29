@@ -130,11 +130,15 @@ def resolve_requires(
     """Walk requires: and optional_requires: transitively, topo-sorted.
 
     Hard requires: missing → die (unless missing_ok, then collected and returned).
-    Optional requires: missing (not in workspace, or in `excluded`) → silently skipped,
-    and that branch's transitive requires are NOT pursued.
-    `excluded` is the set of bare names (org/repo) the user dropped via --exclude/--no-X.
-    A hard requires: targeting an excluded straddle is an error — the user asked for
-    something contradictory.
+    Optional requires: missing from workspace → if missing_ok, COLLECTED (so
+    `spangap get-deps` clones them too — optional means "use if present", not
+    "deliberately absent"; --exclude is the explicit "don't use this" path).
+    Optional requires: missing AND no missing_ok → silently skipped (build path).
+    Optional requires: in `excluded` → silently dropped, no recursion.
+
+    `excluded` is the set of bare names (org/repo) the user dropped via
+    --exclude/--no-X. A hard requires: targeting an excluded straddle is an
+    error — the user asked for something contradictory.
     """
     excluded = excluded or set()
     out: list[Manifest] = []
@@ -159,15 +163,19 @@ def resolve_requires(
         if bare in on_stack:
             die(f"requires: cycle through {bare} (from {requested_by})")
         if bare not in all_straddles:
+            if missing_ok:
+                # get-deps path: report so the host-side orchestrator clones it.
+                # Applies equally to hard and soft — soft means "use if present",
+                # so being absent on first checkout is exactly the case where we
+                # want it cloned. Explicit --exclude is the way to opt out.
+                missing[bare] = spec
+                return
             if hard:
-                if missing_ok:
-                    missing[bare] = spec
-                    return
                 die(
                     f"missing workspace sibling: {bare} (required by {requested_by}).\n"
                     "       Run `spangap get-deps` from this straddle to clone it."
                 )
-            return  # soft + absent → silently skip
+            return  # build path: soft + absent → silently skip
         on_stack.add(bare)
         for dep in all_straddles[bare].requires:
             visit(dep, bare, hard=True)

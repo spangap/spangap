@@ -14,6 +14,17 @@ dependencies (other straddles, by `<namespace>/<name>`), and the
 build CLI stages everything into ESP-IDF's component graph at build
 time.
 
+Two manifest keys carry deps:
+
+- **`requires:`** — hard. Missing one is a build error.
+- **`optional_requires:`** — soft. Pruned silently when the dep isn't in
+  the staged set (not cloned, not in the buildable's requires, or dropped
+  by `--exclude`/`--no-X`). Source code must gate the corresponding call
+  sites on the generated `CONFIG_STRADDLE_<UPPER_REPO>` symbol so absence
+  compiles away; `spangap-lcd` and `spangap-web` also get short-form
+  aliases (`CONFIG_SPANGAP_LCD`, `CONFIG_SPANGAP_WEB`) — code gates on
+  those.
+
 ```
 <straddle>/
 ├── straddle.yaml         schema_version, name, prefix, version, firmware, browser, requires
@@ -43,7 +54,44 @@ every other straddle into a single build product:
   folds it into that straddle's firmware component, and calls
   `<prefix>LcdInit()` from a generated dispatcher.
 
-Pass `--no-web-ui` or `--no-lcd` at build time to exclude an activator.
+Pass `--no-web` or `--no-lcd` at build time to exclude an activator.
+
+### How staging and gating fit together
+
+`spangap-inside` resolves the buildable's `requires:` ∪ `optional_requires:`
+transitively (subtracting any `--exclude` / `--no-X` entries), then stages
+each kept dep into `staging/components/<repo>/` as a real dir containing
+per-entry symlinks to the source dir's contents plus two generated files:
+
+- **`spangap_requires.cmake`** — `set(SPANGAP_REQUIRES …)` with this
+  dep's effective cross-straddle REQUIRES (hard requires plus
+  optional_requires intersected with staged). Each consumer
+  CMakeLists.txt does:
+
+  ```cmake
+  include(${CMAKE_CURRENT_LIST_DIR}/spangap_requires.cmake)
+  idf_component_register(
+      ...
+      REQUIRES ${SPANGAP_REQUIRES} <IDF/managed deps>
+  )
+  ```
+
+  The buildable's `main/CMakeLists.txt` reads its own generated file at
+  `${CMAKE_SOURCE_DIR}/staging/main_requires.cmake` — same convention.
+
+- One sibling staged component, **`_spangap_present`**, contains an
+  auto-generated `Kconfig.projbuild` declaring one hidden
+  `config STRADDLE_<UPPER_REPO>` (bool, default y) per staged straddle,
+  plus the `SPANGAP_LCD` / `SPANGAP_WEB` short-form aliases when those
+  two straddles are staged. IDF picks `Kconfig.projbuild` up
+  automatically from any component, so `CONFIG_STRADDLE_*` /
+  `CONFIG_SPANGAP_LCD` / `CONFIG_SPANGAP_WEB` are visible to every source
+  file and every CMakeLists `if(CONFIG_*)`.
+
+A staging-time **lint** rejects any `idf_component_register(REQUIRES …)`
+that hand-writes a known straddle repo name. Cross-straddle deps must
+flow through `${SPANGAP_REQUIRES}` — otherwise `--no-X` can't narrow
+them, and the gate falls out of sync with the staged set.
 
 ### The build CLI
 
@@ -67,7 +115,13 @@ without an elf or a flashme watcher. Everything else still requires
 
 Common verbs:
 
-- `spangap build` / `spangap flash <dev>` / `spangap monitor <dev>`
+- `spangap build [--no-lcd] [--no-web] [--exclude <name>...]` —
+  staged-set narrowing per build. `--no-lcd` / `--no-web` are aliases
+  for `--exclude spangap/spangap-lcd` / `--exclude spangap/spangap-web`.
+  `--exclude <name>` accepts bare repo (`spangap-lcd`) or fully-qualified
+  (`spangap/spangap-lcd`). Excluding a hard `requires:` target is an
+  error.
+- `spangap flash <dev>` / `spangap monitor <dev>`
 - `spangap get-deps` — host-side `git clone` of any missing transitive
   `requires:` (also runs implicitly as the first phase of `build`)
 - `spangap cli [-h <host>] <cmd>…` — talk to the device's TCP CLI

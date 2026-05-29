@@ -44,7 +44,16 @@
       "default": ["idf"]
     },
     "requires": {
-      "description": "Other straddles this one depends on. Each entry is '<org>/<repo>' optionally followed by '@<ref>' (tag/branch/SHA).",
+      "description": "Other straddles this one HARD-depends on — every build that pulls in this straddle must also pull in these. Each entry is '<org>/<repo>' optionally followed by '@<ref>' (tag/branch/SHA). A missing requires: target is a build error.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+(@[A-Za-z0-9._/-]+)?$"
+      },
+      "default": []
+    },
+    "optional_requires": {
+      "description": "Other straddles this one integrates with WHEN PRESENT — pruned silently from the build if absent (because they weren't cloned, because the buildable doesn't list them, or because --exclude/--no-X dropped them). Source code must gate corresponding call sites on the auto-generated CONFIG_STRADDLE_<UPPER_NAME> (or the CONFIG_SPANGAP_LCD/CONFIG_SPANGAP_WEB shortcuts) so absence compiles away cleanly.",
       "type": "array",
       "items": {
         "type": "string",

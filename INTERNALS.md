@@ -150,7 +150,9 @@ Common verbs:
   - `--flash-size <MB>` overrides `CONFIG_ESPTOOLPY_FLASHSIZE_*MB` for
     this build — useful when running a generic spangap firmware against
     differently-sized hardware. Valid: 4, 8, 16, 32, 64, 128. Probe a
-    connected chip's actual flash size with `esptool.py -p <dev> flash_id`.
+    connected chip's actual flash size with `spangap probe <dev>` (a thin
+    wrapper around `esptool.py flash_id` that also prints the matching
+    `--flash-size` invocation).
 - `spangap flash <dev>` / `spangap monitor <dev>`
 - `spangap get-deps` — host-side `git clone` of any missing transitive
   `requires:` (also runs implicitly as the first phase of `build`)

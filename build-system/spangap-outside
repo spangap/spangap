@@ -8,6 +8,9 @@
 #                    host is running `monitor` picks the signal up.
 #   monitor <dev>    same monitor loop, but error if <dev> is busy and no
 #                    initial flash. Used on the host that owns the board.
+#   probe [<dev>]    run esptool flash_id and print chip + flash size, plus
+#                    the matching `spangap build --flash-size <MB>` invocation.
+#                    Useful for generic builds against unknown hardware.
 #   cli [-h host] [cmd...]
 #                    talk to the device's TCP CLI. -h persists hostname to
 #                    ./.spangap-host in the workspace root; subsequent calls
@@ -439,6 +442,40 @@ monitor)
     port_busy "$port" && die "spangap monitor: $port is busy — another monitor/flasher owns it"
     ensure_venv
     monitor_loop "$port" "$fw" 0
+    exit 0
+    ;;
+probe)
+    # Identify the chip + flash size of a connected device. Useful for
+    # picking the right `spangap build --flash-size <MB>` for generic builds.
+    shift
+    if [ $# -gt 0 ]; then
+        port=$1; shift
+        sticky_set "$PORT_FILE" "$port"
+    else
+        port=$(sticky_get "$PORT_FILE" SPANGAP_PORT probe "serial port")
+    fi
+    port_busy "$port" && die "spangap probe: $port is busy — another monitor/flasher owns it"
+    ensure_venv
+    if ! out=$("$VENV/bin/esptool.py" -p "$port" flash_id 2>&1); then
+        printf '%s\n' "$out" >&2
+        die "spangap probe: esptool flash_id failed on $port"
+    fi
+    chip=$(printf '%s\n' "$out" | sed -n 's/^Chip is //p' | head -1)
+    crystal=$(printf '%s\n' "$out" | sed -n 's/^Crystal is //p' | head -1)
+    mac=$(printf '%s\n' "$out" | sed -n 's/^MAC: //p' | head -1)
+    flash=$(printf '%s\n' "$out" | sed -n 's/^Detected flash size: //p' | head -1)
+    flash_mb=$(printf '%s' "$flash" | sed -n 's/^\([0-9]*\)MB$/\1/p')
+    printf '\n'
+    printf 'Port:        %s\n' "$port"
+    printf 'Chip:        %s\n' "${chip:-unknown}"
+    [ -n "$crystal" ] && printf 'Crystal:     %s\n' "$crystal"
+    [ -n "$mac" ]     && printf 'MAC:         %s\n' "$mac"
+    printf 'Flash size:  %s\n' "${flash:-unknown}"
+    if [ -n "$flash_mb" ]; then
+        printf '\nBuild with:  spangap build --flash-size %s\n' "$flash_mb"
+    else
+        printf '\nspangap: could not parse flash size from esptool output\n' >&2
+    fi
     exit 0
     ;;
 cli)

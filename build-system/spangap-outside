@@ -183,8 +183,12 @@ sticky_set() {
 # signalling a remote `monitor` via flashme.
 # ---------------------------------------------------------------------------
 port_busy() {
+    # If the path doesn't exist, no one's holding it open by definition.
+    # (lsof on Linux silently treats a nonexistent path as a no-op pattern
+    # and lists ALL open files, exiting 0 — looks like "busy" but isn't.)
+    [ -e "$1" ] || return 1
     if command -v lsof >/dev/null 2>&1; then
-        lsof -t "$1" >/dev/null 2>&1
+        lsof -t -- "$1" >/dev/null 2>&1
     elif command -v fuser >/dev/null 2>&1; then
         fuser -s "$1" 2>/dev/null
     else

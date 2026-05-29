@@ -62,6 +62,9 @@ class Manifest:
     def optional_requires(self) -> list[str]:
         return list(self.data.get("optional_requires", []))
     @property
+    def extra_requires(self) -> list[str]:
+        return list(self.data.get("extra_requires", []))
+    @property
     def is_buildable(self) -> bool:
         return "buildable" in self.data
 
@@ -126,21 +129,31 @@ def resolve_requires(
     all_straddles: dict[str, Manifest],
     missing_ok: bool = False,
     excluded: set[str] | None = None,
+    included: set[str] | None = None,
+    include_all_extras: bool = False,
 ) -> tuple[list[Manifest], list[str]]:
-    """Walk requires: and optional_requires: transitively, topo-sorted.
+    """Walk requires:, optional_requires:, and extra_requires: transitively.
 
-    Hard requires: missing → die (unless missing_ok, then collected and returned).
-    Optional requires: missing from workspace → if missing_ok, COLLECTED (so
-    `spangap get-deps` clones them too — optional means "use if present", not
-    "deliberately absent"; --exclude is the explicit "don't use this" path).
-    Optional requires: missing AND no missing_ok → silently skipped (build path).
-    Optional requires: in `excluded` → silently dropped, no recursion.
+    Three tiers in the manifest:
+      requires:           hard — always pulled in, missing = error
+      optional_requires:  soft, default-on — pruned silently if absent/excluded
+      extra_requires:     soft, default-OFF — only pulled in when explicitly
+                          included via --include <name> or --include-all
 
-    `excluded` is the set of bare names (org/repo) the user dropped via
-    --exclude/--no-X. A hard requires: targeting an excluded straddle is an
-    error — the user asked for something contradictory.
+    Missing behavior:
+      Hard requires: missing → die (unless missing_ok, then collected).
+      Soft (optional or extra) missing from workspace: if missing_ok, COLLECTED
+        for cloning (a soft dep that's wanted-this-build but not yet cloned
+        should still get fetched); otherwise silently skipped.
+      Excluded: silently dropped, no recursion.
+
+    `excluded` overrides everything else: if a name is excluded *and* it's
+    listed as a hard requires:, that's contradictory and errors. extras only
+    arrive in the staged set when `include_all_extras` is true OR the name
+    is in `included`.
     """
     excluded = excluded or set()
+    included = included or set()
     out: list[Manifest] = []
     seen: set[str] = set()
     on_stack: set[str] = set()
@@ -153,9 +166,9 @@ def resolve_requires(
         if bare in excluded:
             if hard:
                 die(
-                    f"--exclude/{'--no-X'}: {bare} was dropped, but {requested_by} "
-                    f"lists it under `requires:` (hard). Either don't exclude it, or "
-                    f"move it to `optional_requires:` in {requested_by}'s straddle.yaml."
+                    f"--exclude: {bare} was dropped, but {requested_by} lists it "
+                    f"under `requires:` (hard). Either don't exclude it, or "
+                    f"reclassify it as optional in {requested_by}'s straddle.yaml."
                 )
             return  # soft drop
         if bare in missing:
@@ -164,10 +177,6 @@ def resolve_requires(
             die(f"requires: cycle through {bare} (from {requested_by})")
         if bare not in all_straddles:
             if missing_ok:
-                # get-deps path: report so the host-side orchestrator clones it.
-                # Applies equally to hard and soft — soft means "use if present",
-                # so being absent on first checkout is exactly the case where we
-                # want it cloned. Explicit --exclude is the way to opt out.
                 missing[bare] = spec
                 return
             if hard:
@@ -181,6 +190,10 @@ def resolve_requires(
             visit(dep, bare, hard=True)
         for dep in all_straddles[bare].optional_requires:
             visit(dep, bare, hard=False)
+        # extra_requires are NOT followed transitively — they're only honoured
+        # at the level where the user explicitly named them (i.e., the buildable's
+        # own manifest). This keeps "extra" meaning "you have to ask for this",
+        # not "comes along for the ride".
         on_stack.discard(bare)
         seen.add(bare)
         out.append(all_straddles[bare])
@@ -189,6 +202,15 @@ def resolve_requires(
         visit(r, proj.name, hard=True)
     for r in proj.optional_requires:
         visit(r, proj.name, hard=False)
+    for r in proj.extra_requires:
+        bare = r.split("@", 1)[0]
+        if include_all_extras or bare in included:
+            visit(r, proj.name, hard=False)
+        elif missing_ok:
+            # get-deps default: also clone extras so the user can `--include`
+            # them later without re-fetching. They're cheap to have on disk.
+            if bare not in all_straddles and bare not in missing:
+                missing[bare] = r
     return out, list(missing.values())
 
 
@@ -249,6 +271,10 @@ def write_spangap_requires(out_dir: Path, requires_list: list[str]) -> None:
 def write_presence_component(staging: Path, staged: list[Manifest]) -> None:
     """Emit staging/components/_spangap_present/ — empty IDF component that
     contributes a Kconfig.projbuild defining presence symbols for the staged set.
+
+    Short-form aliases (CONFIG_SPANGAP_<NAME>) are emitted for the well-known
+    central straddles below. Source code gates on these; they're a stable
+    spelling that survives as the straddle set evolves.
     """
     comp = staging / "_spangap_present"
     comp.mkdir(parents=True, exist_ok=True)
@@ -258,13 +284,22 @@ def write_presence_component(staging: Path, staged: list[Manifest]) -> None:
         + "idf_component_register()\n"
     )
     lines: list[str] = [_GEN_HEADER_KCONFIG]
-    shortcut_repos = {"spangap-lcd", "spangap-web"}
+    # repo → short-form Kconfig symbol (the alias used in #if statements).
+    shortcut_aliases = {
+        "spangap-lcd": "SPANGAP_LCD",
+        "spangap-web": "SPANGAP_WEB",
+        "ota":         "SPANGAP_OTA",
+        "wg":          "SPANGAP_WG",
+        "upnp":        "SPANGAP_UPNP",
+        "duckdns":     "SPANGAP_DUCKDNS",
+        "acme":        "SPANGAP_ACME",
+    }
     for m in staged:
         sym = _name_to_kconfig(m.repo)
         lines.append(f"config STRADDLE_{sym}\n    bool\n    default y\n")
-        if m.repo in shortcut_repos:
-            # Shortcut alias: code gates on these.
-            lines.append(f"config {sym}\n    bool\n    default y\n")
+        alias = shortcut_aliases.get(m.repo)
+        if alias:
+            lines.append(f"config {alias}\n    bool\n    default y\n")
     (comp / "Kconfig.projbuild").write_text("\n".join(lines))
 
 
@@ -430,6 +465,44 @@ _NO_SHORTHANDS = {  # --no-<x> maps to --exclude <bare>
     "web": "spangap/spangap-web",
 }
 
+# Flash sizes the ESP-IDF `CONFIG_ESPTOOLPY_FLASHSIZE_*MB` choice supports.
+_VALID_FLASH_MB = (4, 8, 16, 32, 64, 128)
+
+
+def _resolve_org_repo(raw: str, all_straddles: dict[str, Manifest], flag: str) -> str:
+    """--exclude/--include accept bare repo names or org/repo. Disambiguate."""
+    if "/" in raw:
+        return raw
+    matches = [n for n in all_straddles if all_straddles[n].repo == raw]
+    if not matches:
+        die(f"{flag} {raw}: no workspace straddle with that repo name")
+    if len(matches) > 1:
+        die(f"{flag} {raw}: ambiguous ({', '.join(matches)}); use org/repo form")
+    return matches[0]
+
+
+def write_sdkconfig_overrides(proj: Manifest, flash_mb: int | None) -> None:
+    """Drop staging/sdkconfig.spangap-overrides — picked up by bootstrap.cmake
+    as the highest-priority SDKCONFIG_DEFAULTS entry. Always written (even if
+    empty body) so bootstrap can rely on its presence.
+
+    Today this carries only the optional --flash-size override. The same file
+    is the natural spot to grow into for future --chip-target overrides, etc.
+    """
+    staging_dir = proj.firmware_dir / "staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    body: list[str] = []
+    if flash_mb is not None:
+        body.append(f"CONFIG_ESPTOOLPY_FLASHSIZE_{flash_mb}MB=y")
+    text = (
+        "# AUTO-GENERATED by spangap-inside. Reflects this build's CLI overrides.\n"
+        "# Highest-priority SDKCONFIG_DEFAULTS entry — bootstrap.cmake picks it up,\n"
+        "# and the staleness check regenerates sdkconfig when this file's content\n"
+        "# changes.\n"
+        + ("\n".join(body) + "\n" if body else "")
+    )
+    (staging_dir / "sdkconfig.spangap-overrides").write_text(text)
+
 
 def cmd_build(args: argparse.Namespace) -> int:
     proj = find_project()
@@ -443,28 +516,38 @@ def cmd_build(args: argparse.Namespace) -> int:
 
     all_straddles = scan_workspace_straddles()
 
-    # Build the excluded set: --exclude entries (bare or org/repo) + --no-<short>.
+    # --exclude (with --no-X shorthands) → drop from staged set.
     excluded: set[str] = set()
     for raw in (args.exclude or []):
-        bare = raw if "/" in raw else None
-        if bare is None:
-            # Bare repo name → find its org/repo in workspace.
-            matches = [n for n in all_straddles if all_straddles[n].repo == raw]
-            if not matches:
-                die(f"--exclude {raw}: no workspace straddle with that repo name")
-            if len(matches) > 1:
-                die(f"--exclude {raw}: ambiguous ({', '.join(matches)}); use org/repo form")
-            bare = matches[0]
-        excluded.add(bare)
+        excluded.add(_resolve_org_repo(raw, all_straddles, "--exclude"))
     for short, full in _NO_SHORTHANDS.items():
         if getattr(args, f"no_{short}", False):
             excluded.add(full)
 
-    deps, _ = resolve_requires(proj, all_straddles, excluded=excluded)
+    # --include (and --include-all) → opt in to extra_requires.
+    included: set[str] = set()
+    for raw in (args.include or []):
+        included.add(_resolve_org_repo(raw, all_straddles, "--include"))
+    include_all = bool(getattr(args, "include_all", False))
+
+    # --flash-size validation.
+    if args.flash_size is not None and args.flash_size not in _VALID_FLASH_MB:
+        die(f"--flash-size {args.flash_size}: choose one of {_VALID_FLASH_MB}")
+
+    deps, _ = resolve_requires(
+        proj, all_straddles,
+        excluded=excluded, included=included, include_all_extras=include_all,
+    )
     signal_preamble(proj, deps)
     if excluded:
         print(f"excluded:  {', '.join(sorted(excluded))}", file=sys.stderr)
+    if included or include_all:
+        print(f"included:  {'all extras' if include_all else ', '.join(sorted(included))}",
+              file=sys.stderr)
+    if args.flash_size is not None:
+        print(f"flash:     {args.flash_size} MB (--flash-size override)", file=sys.stderr)
     stage_components(proj, deps)
+    write_sdkconfig_overrides(proj, args.flash_size)
     lint_cmakelists(proj, deps, all_straddles)
     return run_idf(args.idf_args or ["build"], cwd=proj.firmware_dir)
 
@@ -686,9 +769,25 @@ def main(argv: list[str] | None = None) -> int:
     p_build = sub.add_parser("build", help="build the project (default: idf.py build)")
     p_build.add_argument(
         "-e", "--exclude", action="append", default=[], metavar="STRADDLE",
-        help="drop this straddle from the staged set for this build (repeatable; "
-             "name as <org>/<repo> or just <repo>). Targeted at optional_requires: "
-             "entries — excluding a hard requires: target is an error.",
+        help="drop a straddle from this build's staged set (repeatable; <org>/<repo> "
+             "or bare <repo>). Targets optional_requires: entries — excluding a hard "
+             "requires: is an error.",
+    )
+    p_build.add_argument(
+        "-i", "--include", action="append", default=[], metavar="STRADDLE",
+        help="add an extra_requires: straddle to this build (repeatable; <org>/<repo> "
+             "or bare <repo>). Without this flag, extra_requires entries are absent.",
+    )
+    p_build.add_argument(
+        "--include-all", action="store_true",
+        help="add every extra_requires: entry of the buildable.",
+    )
+    p_build.add_argument(
+        "--flash-size", type=int, default=None, metavar="MB",
+        help=f"override CONFIG_ESPTOOLPY_FLASHSIZE_*MB for this build. One of "
+             f"{', '.join(str(n) for n in _VALID_FLASH_MB)}. Useful for generic "
+             f"builds against differently-sized hardware. Probe a chip's actual "
+             f"flash size with `esptool.py -p <dev> flash_id`.",
     )
     for short, full in _NO_SHORTHANDS.items():
         p_build.add_argument(

@@ -14,16 +14,23 @@ dependencies (other straddles, by `<namespace>/<name>`), and the
 build CLI stages everything into ESP-IDF's component graph at build
 time.
 
-Two manifest keys carry deps:
+Three manifest keys carry deps:
 
-- **`requires:`** — hard. Missing one is a build error.
-- **`optional_requires:`** — soft. Pruned silently when the dep isn't in
-  the staged set (not cloned, not in the buildable's requires, or dropped
-  by `--exclude`/`--no-X`). Source code must gate the corresponding call
-  sites on the generated `CONFIG_STRADDLE_<UPPER_REPO>` symbol so absence
-  compiles away; `spangap-lcd` and `spangap-web` also get short-form
-  aliases (`CONFIG_SPANGAP_LCD`, `CONFIG_SPANGAP_WEB`) — code gates on
-  those.
+- **`requires:`** — hard. Missing one is a build error; can't be excluded.
+- **`optional_requires:`** — soft, **default-on**. Pruned silently when
+  the dep isn't in the staged set (not cloned, not in the buildable's
+  requires, or dropped by `--exclude` / `--no-X`).
+- **`extra_requires:`** — soft, **default-off**. Only included when the
+  user passes `--include <name>` (or `--include-all`). Use for components
+  that should be opt-in: experimental code, features that meaningfully
+  cost flash, anything you don't want in the default build.
+
+Source code gates corresponding call sites on the auto-generated
+`CONFIG_STRADDLE_<UPPER_REPO>` symbol (so absence compiles away cleanly).
+The following central straddles also get short-form aliases that source
+code prefers as a stable spelling: `CONFIG_SPANGAP_LCD`,
+`CONFIG_SPANGAP_WEB`, `CONFIG_SPANGAP_OTA`, `CONFIG_SPANGAP_WG`,
+`CONFIG_SPANGAP_UPNP`, `CONFIG_SPANGAP_DUCKDNS`, `CONFIG_SPANGAP_ACME`.
 
 ```
 <straddle>/
@@ -59,9 +66,10 @@ Pass `--no-web` or `--no-lcd` at build time to exclude an activator.
 ### How staging and gating fit together
 
 `spangap-inside` resolves the buildable's `requires:` ∪ `optional_requires:`
-transitively (subtracting any `--exclude` / `--no-X` entries), then stages
-each kept dep into `staging/components/<repo>/` as a real dir containing
-per-entry symlinks to the source dir's contents plus two generated files:
+∪ (`extra_requires:` filtered by `--include` / `--include-all`) transitively,
+subtracting any `--exclude` / `--no-X` entries, then stages each kept dep into
+`staging/components/<repo>/` as a real dir containing per-entry symlinks to
+the source dir's contents plus two generated files:
 
 - **`spangap_requires.cmake`** — `set(SPANGAP_REQUIRES …)` with this
   dep's effective cross-straddle REQUIRES (hard requires plus
@@ -85,11 +93,25 @@ per-entry symlinks to the source dir's contents plus two generated files:
 - One sibling staged component, **`_spangap_present`**, contains an
   auto-generated `Kconfig.projbuild` declaring one hidden
   `config STRADDLE_<UPPER_REPO>` (bool, default y) per staged straddle,
-  plus the `SPANGAP_LCD` / `SPANGAP_WEB` short-form aliases when those
-  two straddles are staged. IDF picks `Kconfig.projbuild` up
-  automatically from any component, so `CONFIG_STRADDLE_*` /
-  `CONFIG_SPANGAP_LCD` / `CONFIG_SPANGAP_WEB` are visible to every source
-  file and every CMakeLists `if(CONFIG_*)`.
+  plus a short-form alias for each well-known central straddle when staged
+  (`SPANGAP_LCD`, `SPANGAP_WEB`, `SPANGAP_OTA`, `SPANGAP_WG`, `SPANGAP_UPNP`,
+  `SPANGAP_DUCKDNS`, `SPANGAP_ACME`). IDF picks `Kconfig.projbuild` up
+  automatically from any component, so the corresponding `CONFIG_*` symbols
+  are visible to every source file and every CMakeLists `if(CONFIG_*)`.
+
+- A separate generated file, **`staging/sdkconfig.spangap-overrides`**, is
+  the highest-priority entry in `SDKCONFIG_DEFAULTS`. spangap-inside writes
+  CLI-driven Kconfig values into it (today: `--flash-size`; eventually also
+  things like `--chip-target`). The bootstrap.cmake staleness check picks
+  up content changes and regenerates sdkconfig so the new value takes
+  effect on the next configure.
+
+- Partition table: `bootstrap.cmake` calls `gen-partitions.py` with the
+  flash size from `CONFIG_ESPTOOLPY_FLASHSIZE_*MB`, the app-share percent
+  from `CONFIG_SPANGAP_APP_PERCENT`, and OTA on/off **derived from whether
+  `staging/components/ota/` exists** (not a Kconfig knob — staged set is
+  authoritative). OTA on → paired A/B app + fixed; OTA off → single,
+  bigger app + fixed.
 
 A staging-time **lint** rejects any `idf_component_register(REQUIRES …)`
 that hand-writes a known straddle repo name. Cross-straddle deps must
@@ -118,12 +140,17 @@ without an elf or a flashme watcher. Everything else still requires
 
 Common verbs:
 
-- `spangap build [--no-lcd] [--no-web] [--exclude <name>...]` —
-  staged-set narrowing per build. `--no-lcd` / `--no-web` are aliases
-  for `--exclude spangap/spangap-lcd` / `--exclude spangap/spangap-web`.
-  `--exclude <name>` accepts bare repo (`spangap-lcd`) or fully-qualified
-  (`spangap/spangap-lcd`). Excluding a hard `requires:` target is an
-  error.
+- `spangap build [flags]` — staged-set + build-config knobs per build:
+  - `--exclude <name>` (repeatable) drops an `optional_requires:` entry.
+    Bare repo (`spangap-lcd`) or fully-qualified (`spangap/spangap-lcd`).
+    Excluding a hard `requires:` target is an error. `--no-lcd` /
+    `--no-web` are aliases.
+  - `--include <name>` (repeatable) opts in to an `extra_requires:` entry.
+    Same name forms. `--include-all` opts in to every extra.
+  - `--flash-size <MB>` overrides `CONFIG_ESPTOOLPY_FLASHSIZE_*MB` for
+    this build — useful when running a generic spangap firmware against
+    differently-sized hardware. Valid: 4, 8, 16, 32, 64, 128. Probe a
+    connected chip's actual flash size with `esptool.py -p <dev> flash_id`.
 - `spangap flash <dev>` / `spangap monitor <dev>`
 - `spangap get-deps` — host-side `git clone` of any missing transitive
   `requires:` (also runs implicitly as the first phase of `build`)

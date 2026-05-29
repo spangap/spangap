@@ -208,20 +208,30 @@ run_monitor() {
     local port=$1 fw=$2 log=$3 extra=${4:-}
     local fifo=/tmp/spangap-flash.$$.$RANDOM.fifo
     mkfifo "$fifo"
-    # Stripped stream to file ONLY. `script` already pumps the PTY back to the
-    # terminal in colour; tee'ing the stripped stream there too duplicates
-    # every line.
-    perl -pe 'BEGIN{$|=1} s/\e\[[0-9;?]*[a-zA-Z]//g' < "$fifo" > "$log" &
-    local stripper=$!
+    # Stripped stream to file ONLY when we have a workspace to log into.
+    # `script` already pumps the PTY back to the terminal in colour; tee'ing
+    # the stripped stream there too duplicates every line.
+    local stripper=""
+    if [ -n "$log" ]; then
+        perl -pe 'BEGIN{$|=1} s/\e\[[0-9;?]*[a-zA-Z]//g' < "$fifo" > "$log" &
+        stripper=$!
+    else
+        # No log target — drain the fifo into /dev/null so the writer doesn't block.
+        cat "$fifo" >/dev/null &
+        stripper=$!
+    fi
     # Find the app ELF for panic-backtrace symbolication. It's the only
     # .elf at build/ root (bootloader/partition ELFs live in subdirs).
-    # Optional — esp-idf-monitor still runs without one.
+    # Optional — esp-idf-monitor still runs without one. Skipped when we
+    # have no firmware dir (warning was printed at startup).
     local elf=""
-    for e in "$fw/build"/*.elf; do
-        [ -f "$e" ] && { elf=$e; break; }
-    done
+    if [ -n "$fw" ]; then
+        for e in "$fw/build"/*.elf; do
+            [ -f "$e" ] && { elf=$e; break; }
+        done
+    fi
     (
-        cd "$fw"
+        [ -n "$fw" ] && cd "$fw"
         # shellcheck disable=SC2086
         script -q "$fifo" "$VENV/bin/python" -m esp_idf_monitor -p "$port" ${extra} ${elf:+"$elf"} || true
     )
@@ -301,8 +311,13 @@ PY
 # clean boot capture). Ctrl-C / TERM bails cleanly.
 monitor_loop() {
     local port=$1 fw=$2 do_initial=$3
-    local flashme="$fw/build/flashme"
-    local log="$fw/build/flasher.log"
+    # Without a firmware dir we can neither flash, watch for flashme, nor
+    # write a stripped-output log file. The monitor still runs.
+    local flashme="" log=""
+    if [ -n "$fw" ]; then
+        flashme="$fw/build/flashme"
+        log="$fw/build/flasher.log"
+    fi
 
     trap 'kill_monitor; exit 0' INT TERM
     # Don't drop a present flashme on startup: a pending signal from another
@@ -311,8 +326,8 @@ monitor_loop() {
     local pending=$do_initial
     while true; do
         local reset_flags="--no-reset"
-        if [ "$pending" = "1" ] || [ -f "$flashme" ]; then
-            if [ -f "$flashme" ]; then
+        if [ "$pending" = "1" ] || { [ -n "$flashme" ] && [ -f "$flashme" ]; }; then
+            if [ -n "$flashme" ] && [ -f "$flashme" ]; then
                 echo "spangap: flashme seen — holding 3s so other flashers can latch it" >&2
                 sleep 3
                 rm -f "$flashme"
@@ -329,13 +344,22 @@ monitor_loop() {
         fi
 
         # Watcher: nuke the running monitor the instant flashme appears.
-        ( while [ ! -f "$flashme" ]; do sleep 1; done
-          kill_monitor
-        ) &
-        local watcher=$!
+        # No watcher when we have no flashme path — the monitor just runs
+        # until Ctrl-].
+        local watcher=""
+        if [ -n "$flashme" ]; then
+            ( while [ ! -f "$flashme" ]; do sleep 1; done
+              kill_monitor
+            ) &
+            watcher=$!
+        fi
 
         if [ -n "$reset_flags" ]; then
-            echo "spangap: passive monitor (--no-reset; Ctrl-] exits, \`spangap flash\` re-flashes)" >&2
+            if [ -n "$fw" ]; then
+                echo "spangap: passive monitor (--no-reset; Ctrl-] exits, \`spangap flash\` re-flashes)" >&2
+            else
+                echo "spangap: passive monitor (--no-reset; Ctrl-] exits)" >&2
+            fi
         else
             echo "spangap: monitor (Ctrl-] exits, \`spangap flash\` re-flashes)" >&2
         fi
@@ -345,13 +369,15 @@ monitor_loop() {
         # signal — keep looping so the next iteration consumes it. If it
         # isn't, the user (Ctrl-]) or the hardware ended the monitor;
         # don't fight them — exit so a single Ctrl-] actually quits.
-        if [ -f "$flashme" ]; then
+        if [ -n "$flashme" ] && [ -f "$flashme" ]; then
             wait "$watcher" 2>/dev/null || true
             sleep 1
             continue
         fi
-        kill "$watcher" 2>/dev/null || true
-        wait "$watcher" 2>/dev/null || true
+        if [ -n "$watcher" ]; then
+            kill "$watcher" 2>/dev/null || true
+            wait "$watcher" 2>/dev/null || true
+        fi
         echo "spangap: monitor exited — bye" >&2
         return 0
     done
@@ -393,15 +419,23 @@ flash)
     ;;
 monitor)
     shift
-    proj=$(require_straddle monitor)
+    # monitor stays useful outside a straddle: you lose stack decode + the
+    # flashme reflash signal, but the live log is still worth attaching to.
+    # Warn loudly so the user knows what they're giving up.
+    if proj=$(find_straddle 2>/dev/null) \
+        && case $proj in "$workspace"|"$workspace"/*) true ;; *) false ;; esac; then
+        fw=$(resolve_firmware_dir "$proj") \
+            || die "spangap monitor: no CMakeLists.txt in $proj or its esp-idf/ subdir"
+    else
+        echo "spangap: Warning: not in spangap workspace, cannot decode stack on crash, cannot be signalled to flash." >&2
+        fw=""
+    fi
     if [ $# -gt 0 ]; then
         port=$1; shift
         sticky_set "$PORT_FILE" "$port"
     else
         port=$(sticky_get "$PORT_FILE" SPANGAP_PORT monitor "serial port")
     fi
-    fw=$(resolve_firmware_dir "$proj") \
-        || die "spangap monitor: no CMakeLists.txt in $proj or its esp-idf/ subdir"
     port_busy "$port" && die "spangap monitor: $port is busy — another monitor/flasher owns it"
     ensure_venv
     monitor_loop "$port" "$fw" 0

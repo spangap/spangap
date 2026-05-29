@@ -53,7 +53,19 @@ straddle-as-workspace fallback) and dispatches into
 `<ws>/spangap/build-system/spangap-outside`, which in turn either handles
 the command on the host (flash, monitor, cli, get-deps, reset) or
 docker-execs `spangap-inside` in the build-env container
-(`spangap-<hash7(workspace)>`). Common verbs:
+(`spangap-<hash7(workspace)>`).
+
+**No-workspace fallback** — `spangap monitor <dev>` and `spangap cli`
+also run with no `spangap.workspace.yaml` at/above cwd. The entry script
+resolves its own real path (chasing symlinks through `/usr/local/bin/…`)
+to find `build-system/spangap-outside`, sets `SPANGAP_WORKSPACE=$HOME`
+so the venv + sticky `.spangap-port`/`.spangap-host` files land there,
+and `spangap-outside`'s `monitor` warns *"not in spangap workspace,
+cannot decode stack on crash, cannot be signalled to flash"* and runs
+without an elf or a flashme watcher. Everything else still requires
+`spangap init`.
+
+Common verbs:
 
 - `spangap build` / `spangap flash <dev>` / `spangap monitor <dev>`
 - `spangap get-deps` — host-side `git clone` of any missing transitive

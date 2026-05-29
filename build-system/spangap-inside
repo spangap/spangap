@@ -227,7 +227,10 @@ def _repo(bare_name: str) -> str:
 def effective_requires(m: Manifest, staged_repos: set[str]) -> list[str]:
     """Cross-straddle REQUIRES list for one component, in repo-only form.
 
-    = hard requires + (optional_requires ∩ staged), order-preserved, deduped.
+    = hard requires + (optional_requires ∩ staged) + (extra_requires ∩ staged),
+    order-preserved, deduped. Anything in the staged set that this straddle
+    declared as a dep — at any tier — flows into its CMake REQUIRES so the
+    include paths line up.
     """
     out: list[str] = []
     seen: set[str] = set()
@@ -236,6 +239,10 @@ def effective_requires(m: Manifest, staged_repos: set[str]) -> list[str]:
         if r not in seen:
             seen.add(r); out.append(r)
     for spec in m.optional_requires:
+        r = _repo(_bare(spec))
+        if r in staged_repos and r not in seen:
+            seen.add(r); out.append(r)
+    for spec in m.extra_requires:
         r = _repo(_bare(spec))
         if r in staged_repos and r not in seen:
             seen.add(r); out.append(r)

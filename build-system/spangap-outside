@@ -46,14 +46,21 @@ set -euo pipefail
 IMAGE="${SPANGAP_IMAGE:-spangap-build-env:dev}"
 workspace="${SPANGAP_WORKSPACE:?spangap-outside: SPANGAP_WORKSPACE not set (invoke via the root \`spangap\` script)}"
 
-# Detect `spangap build -s` (or --quiet) very early so that every host-side
-# phase — git-clone, container/image setup, the build invocation itself —
-# can collapse its verbose output into a single status line. Off by
-# default; only the `build` form turns it on.
-SPANGAP_QUIET=
-case "${1:-} ${2:-}" in
-    "build -s"|"build --quiet") SPANGAP_QUIET=1 ;;
-esac
+# Decide SPANGAP_QUIET very early so that every host-side phase — git-clone,
+# container/image setup, the build invocation itself — can collapse its
+# verbose output into a single status line.
+#
+# Quiet by default for `build` (the noisy one — IDF compile, dep fetch,
+# image rebuild on staleness). -v|--verbose turns the noise back on.
+# Also honoured if the caller sets it in the environment (used by
+# `spangap init` to gate the docker build noise behind -v/--verbose).
+SPANGAP_QUIET=${SPANGAP_QUIET:-}
+if [ "${1:-}" = "build" ]; then
+    SPANGAP_QUIET=1
+    case "${2:-}" in
+        -v|--verbose) SPANGAP_QUIET= ;;
+    esac
+fi
 
 # Host-side flash/monitor venv. Lives entirely inside the workspace so
 # `spangap init` keeps its promise of touching nothing outside it. Pins
@@ -1134,13 +1141,16 @@ build)
     prefetch_explicit_includes "$@"
     fetch_missing_deps "$container_cwd"
     shift
-    # -s as the first arg after `build` is consumed here (not forwarded
-    # into the container) and switches the filter to quiet mode. The
-    # global SPANGAP_QUIET (set near the top of this file) tracks the
-    # same flag for the cloning + container-setup phases.
-    quiet_flag=""
+    # Quiet by default — the build output is mostly noise (per-file
+    # compiler invocations) and the filter surfaces every diagnostic
+    # the tools emit. -v|--verbose as the first arg after `build` is
+    # consumed here (not forwarded into the container) and switches
+    # the filter to pass-through. The global SPANGAP_QUIET (set near
+    # the top of this file) tracks the same flag for the cloning +
+    # container-setup phases.
+    quiet_flag=-s
     case ${1:-} in
-        -s|--quiet) quiet_flag=-s; shift ;;
+        -v|--verbose) quiet_flag=""; shift ;;
     esac
     # Sticky port is picked up by the filter to fill in the flash hint.
     sticky_port=""

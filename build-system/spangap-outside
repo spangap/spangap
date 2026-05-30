@@ -255,8 +255,13 @@ run_monitor() {
     (
         [ -n "$fw" ] && cd "$fw"
         # shellcheck disable=SC2086
-        script -q "$fifo" "$VENV/bin/python" -m esp_idf_monitor -p "$port" ${extra} ${elf:+"$elf"} || true
-    )
+        # exec so the subshell IS script — no parent bash to print
+        # "Terminated: 15" when kill_monitor SIGTERMs us on reflash. The
+        # || true is moot under exec; kept on the outer subshell. 2>/dev/null
+        # absorbs any residual job-control chatter on platforms that emit it
+        # despite the exec.
+        exec script -q "$fifo" "$VENV/bin/python" -m esp_idf_monitor -p "$port" ${extra} ${elf:+"$elf"}
+    ) 2>/dev/null || true
     # `script` puts the tty in raw mode; if it's killed by signal (see
     # kill_monitor) it doesn't always restore ONLCR etc. Re-sanitise so the
     # next log lines don't staircase down the screen.

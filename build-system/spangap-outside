@@ -50,15 +50,17 @@ set -euo pipefail
 IMAGE="${SPANGAP_IMAGE:-spangap-build-env:dev}"
 workspace="${SPANGAP_WORKSPACE:?spangap-outside: SPANGAP_WORKSPACE not set (invoke via the root \`spangap\` script)}"
 
-# Decide SPANGAP_QUIET very early so that every host-side phase — git-clone,
-# container/image setup, the build invocation itself — can collapse its
-# verbose output into a single status line.
+# Decide SPANGAP_QUIET very early so that the host-side phases — git-clone and
+# container/image setup — can collapse their verbose output into a single
+# status line. (The build's own IDF/Vite output is filtered inside the
+# container by spangap-inside, which reads the same -v/--verbose flag off the
+# forwarded argv; this var only governs the host-side noise.)
 #
-# Quiet by default for `build` and `reset` (the noisy ones — IDF compile,
-# dep fetch, image rebuild). -v|--verbose turns the noise back on. `reset`
-# rebuilds the container itself now, so it gets the same quiet treatment.
-# Also honoured if the caller sets it in the environment (used by
-# `spangap init` to gate the docker build noise behind -v/--verbose).
+# Quiet by default for `build` and `reset` (the noisy ones — dep fetch, image
+# rebuild). -v|--verbose turns the noise back on. `reset` rebuilds the
+# container itself now, so it gets the same quiet treatment. Also honoured if
+# the caller sets it in the environment (used by `spangap init` to gate the
+# docker build noise behind -v/--verbose).
 SPANGAP_QUIET=${SPANGAP_QUIET:-}
 case "${1:-}" in
     build|reset)
@@ -82,9 +84,9 @@ VENV_REQUIREMENTS="esptool==4.8.1 esp-idf-monitor==1.5.0"
 
 # Status-line prefix. Defaults to the invoked subcommand (so `flash` lines
 # read "flash:", `build` lines "build:", etc.). The spangap launcher exports
-# SPANGAP_PHASE=init around its ensure-* / link-deps / get-deps calls so the
-# whole workspace-bring-up flow reads "init:" regardless of which helper
-# subcommand is doing the work.
+# SPANGAP_PHASE=init around its ensure-* / get-deps calls so the whole
+# workspace-bring-up flow reads "init:" regardless of which helper subcommand
+# is doing the work.
 PFX="${SPANGAP_PHASE:-${1:-spangap}}"
 die() { printf '%s: %s\n' "$PFX" "$*" >&2; exit 1; }
 log() { printf '%s: %s\n' "$PFX" "$*" >&2; }
@@ -144,27 +146,28 @@ find_straddle() {
     done
 }
 
-# default_straddle: if the user is at the workspace root and
-# `.spangap-project` (written by `spangap init <project>`) names a real
-# straddle, echo its dir. Tries the `<p>.link` form first (repo_path
-# symlink) and falls back to `<p>` (git-cloned). Returns 1 silently
-# otherwise. No buildable check — caller decides whether that matters.
+# project_host_dir <name>: host dir of straddle <name>, or return 1. A
+# straddle is either git-cloned at $workspace/<name> or lives in the flat
+# repo_path checkout at <repo_path>/<name> (the latter is what gets bind-
+# mounted to /repos inside the container). Checks the clone first.
+project_host_dir() {
+    local name=$1 rp
+    [ -f "$workspace/$name/straddle.yaml" ] && { printf '%s\n' "$workspace/$name"; return 0; }
+    rp=$(read_repo_path)
+    [ -n "$rp" ] && [ -f "$rp/$name/straddle.yaml" ] && { printf '%s\n' "$rp/$name"; return 0; }
+    return 1
+}
+
+# default_straddle: if the user is at the workspace root and `.spangap-project`
+# (written by `spangap init <project>`) names a straddle, echo its host dir.
+# Returns 1 silently otherwise. No buildable check — caller decides whether
+# that matters.
 default_straddle() {
     [ -n "${workspace:-}" ] || return 1
     [ "$PWD" = "$workspace" ] || return 1
     local proj_file="$workspace/.spangap-project"
     [ -f "$proj_file" ] || return 1
-    local p
-    p=$(cat "$proj_file")
-    if [ -f "$workspace/$p.link/straddle.yaml" ]; then
-        printf '%s\n' "$workspace/$p.link"
-        return 0
-    fi
-    if [ -f "$workspace/$p/straddle.yaml" ]; then
-        printf '%s\n' "$workspace/$p"
-        return 0
-    fi
-    return 1
+    project_host_dir "$(cat "$proj_file")"
 }
 
 # require_straddle: cmd-name → straddle-dir on stdout, or die.
@@ -187,20 +190,11 @@ require_straddle() {
     if [ "$PWD" = "$workspace" ]; then
         local proj_file="$workspace/.spangap-project"
         if [ -f "$proj_file" ]; then
-            local init_project init_dir init_yaml
+            local init_project init_dir
             init_project=$(cat "$proj_file")
-            # Tries the `<p>.link` form first (repo_path symlink) and
-            # falls back to `<p>` (git-cloned). Same precedence as
-            # default_straddle.
-            if [ -f "$workspace/$init_project.link/straddle.yaml" ]; then
-                init_dir="$workspace/$init_project.link"
-            else
-                init_dir="$workspace/$init_project"
-            fi
-            init_yaml="$init_dir/straddle.yaml"
-            [ -f "$init_yaml" ] \
-                || die ".spangap-project names '$init_project' but neither $workspace/$init_project.link/straddle.yaml nor $workspace/$init_project/straddle.yaml exists — cd into the straddle you want to $cmd"
-            grep -qE '^buildable:' "$init_yaml" \
+            init_dir=$(project_host_dir "$init_project") \
+                || die ".spangap-project names '$init_project' but no straddle.yaml at $workspace/$init_project or <repo_path>/$init_project — cd into the straddle you want to $cmd"
+            grep -qE '^buildable:' "$init_dir/straddle.yaml" \
                 || die "$init_project is not buildable (no \`buildable:\` block) — cd into a buildable straddle and retry"
             printf '%s\n' "$init_dir"
             return 0
@@ -234,13 +228,12 @@ resolve_firmware_dir() {
 PORT_FILE="$workspace/.spangap-port-$(uname -s)-$(uname -m)"
 HOST_FILE="$workspace/.spangap-host"
 
-# Local-repo override: $workspace/.spangap-repo_path holds one host path
-# whose <org>/<repo>/ subdirs are symlinked into the workspace instead of
-# git-cloned. The same host path is bind-mounted at the same in-container
-# path, so the absolute symlinks resolve on both sides. Lets you debug the
-# build against a working tree without round-tripping through github.
-# Written by `spangap init --repo-path <dir>`; empty/missing file or a
-# path that no longer exists ⇒ silently disabled (fall through to git
+# Local-repo override: $workspace/.spangap-repo_path holds one host path —
+# a flat checkout whose <repo>/ children are the straddles. Instead of
+# git-cloning, the whole tree is bind-mounted to /repos inside the container,
+# so the build runs against your working tree without round-tripping through
+# github. Written by `spangap init --repo-path <dir>`; empty/missing file or
+# a path that no longer exists ⇒ silently disabled (fall through to git
 # clone as before).
 REPO_PATH_FILE="$workspace/.spangap-repo_path"
 read_repo_path() {
@@ -531,6 +524,12 @@ flash)
     # Flash once and exit. To watch the device afterwards, chain a monitor:
     #   spangap flash <port> && spangap monitor
     do_flash "$port" "$fw" "$fw/build/flasher.log" || exit 1
+    # We just flashed directly, so clear any pending flashme — otherwise a
+    # monitor that starts later would treat the stale signal as a fresh
+    # reflash request and re-flash a board that's already current. (The
+    # monitor loop consumes flashme itself on the signalled path; this covers
+    # the port-free direct flash, which never goes through it.)
+    rm -f "$fw/build/flashme"
     exit 0
     ;;
 monitor)
@@ -709,13 +708,14 @@ ensure_daemon() {
 ensure_container() {
     ensure_daemon
 
-    # Skeleton lives at $workspace/spangap.link (symlink, init makes it
-     # so) so the bind mount of spangap/spangap as /work/spangap doesn't
-     # clash with a workspace-root entry. Fall back to the legacy
-     # $workspace/spangap location for workspaces inited before the
-     # .link rename — same dir, different name.
-    local ctx="$workspace/spangap.link"
-    [ -d "$ctx" ] || ctx="$workspace/spangap"
+    # The spangap build-system straddle (Dockerfile + build-system/) is the
+    # build context. With a flat repo_path it lives at <repo_path>/spangap;
+    # without one it's git-cloned into $workspace/spangap. No symlink either
+    # way — repo_path itself is the source of truth.
+    local repo_path
+    repo_path=$(read_repo_path)
+    local ctx="$workspace/spangap"
+    [ -n "$repo_path" ] && [ -d "$repo_path/spangap" ] && ctx="$repo_path/spangap"
     local local_hash=""
     [ -f "$ctx/build-system/Dockerfile" ] && local_hash=$(buildsys_hash "$ctx")
 
@@ -741,8 +741,6 @@ ensure_container() {
     if s=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null); then
         state=$s
     fi
-    local repo_path
-    repo_path=$(read_repo_path)
     case $state in
         running)
             # On macOS, recreating the host workspace dir leaves Docker
@@ -801,53 +799,16 @@ ensure_container() {
     announce_container_setup
     mkdir -p "$spangap_home"
 
-    # Bind-mount the repo_path at the SAME in-container path so absolute
-    # symlinks dropped into $workspace resolve on both host and container.
+    # Bind-mount the flat repo_path at /repos — one whole-tree mount, so every
+    # straddle shows up at /repos/<repo> as a real, container-native dir. No
+    # symlinks and no host paths inside the container: the build navigates
+    # /repos/<repo>, and `file:../../<sibling>` resolves to /repos/<sibling>
+    # because the tree is flat. Adding/removing a straddle under <repo_path>
+    # needs no `spangap reset` — the whole-tree mount picks it up live. (No
+    # repo_path → straddles are git-cloned as real flat dirs in the workspace,
+    # covered by the /workspace mount.)
     local repo_mount=()
-    [ -n "$repo_path" ] && repo_mount=(-v "$repo_path:$repo_path")
-
-    # Bind-mount every <repo_path>/<org>/<repo>/ at /work/<repo>. The
-    # workspace itself is mounted at /workspace (separate path) so
-    # Docker's auto-created /work/<repo> mount-target directories don't
-    # pollute the host workspace dir. Each /work/<repo> is a real
-    # directory inside the container — node tooling that realpaths
-    # through symlinks (vite/rollup with `file:` deps that assume a flat
-    # sibling layout) gets a flat /work to work against even though the
-    # source-of-truth tree is org-layered. The user-facing
-    # `<workspace>/<repo>.link` symlinks (created on demand by
-    # clone_spec for required straddles, and at init for the explicit
-    # project arg) are visibility-only — they're not how the build
-    # navigates. Adding or removing anything under <repo_path> needs
-    # `spangap reset` to rebuild the container with the new mount set.
-    local straddle_mounts=()
-    local straddle_mount_hash=""
-    if [ -n "$repo_path" ]; then
-        local d name seen=" " dups=""
-        # shellcheck disable=SC2206 # word-splitting on a glob is intended
-        local entries=( "$repo_path"/*/*/ )
-        for d in "${entries[@]}"; do
-            [ -d "$d" ] || continue  # nullglob bail when no matches
-            d=${d%/}
-            name=$(basename "$d")
-            # macOS ships bash 3.2 (no associative arrays), so dedup
-            # via a space-padded string scan.
-            case $seen in
-                *" $name "*) dups+=" $name" ; continue ;;
-            esac
-            seen+="$name "
-            straddle_mounts+=(-v "$d:/work/$name")
-        done
-        [ -n "$dups" ] \
-            && die "duplicate straddle basenames under $repo_path:$dups — repo basenames must be unique across orgs"
-        # Stable hash of the mount set, stored on the container as a label
-        # so a future ensure_container can detect drift if we ever want
-        # to auto-recreate (today the user runs `spangap reset` manually
-        # after changing the contents of <repo_path>).
-        if [ ${#straddle_mounts[@]} -gt 0 ]; then
-            straddle_mount_hash=$(printf '%s\n' "${straddle_mounts[@]}" \
-                | LC_ALL=C sort | sha256sum | awk '{print $1}')
-        fi
-    fi
+    [ -n "$repo_path" ] && repo_mount=(-v "$repo_path:/repos")
 
     # macOS still ships bash 3.2 where `${empty_array[@]}` trips `set -u`
     # with "unbound variable" — only bash 4+ treats it as zero words.
@@ -857,11 +818,9 @@ ensure_container() {
         -v "$workspace:/workspace" \
         -v "$spangap_home:/home/ubuntu" \
         ${repo_mount[@]+"${repo_mount[@]}"} \
-        ${straddle_mounts[@]+"${straddle_mounts[@]}"} \
         --workdir /workspace \
         --label spangap.workspace="$workspace" \
         --label org.spangap.repo-path="$repo_path" \
-        --label org.spangap.straddle-mounts="$straddle_mount_hash" \
         "$IMAGE" sleep infinity >/dev/null
 
     # Pre-create the npm prefix dir (Dockerfile sets NPM_CONFIG_PREFIX
@@ -877,57 +836,47 @@ ensure_container() {
 # container to enumerate missing siblings, then git-clones each on the host
 # (so host github auth is used — the container has no creds). Loops because
 # this iteration's siblings may add their own requires:.
-# Shared one-spec acquire: <org>/<repo>[@<ref>] → $workspace/<repo>.
-# Skips when already present. If .spangap-repo_path is set and points at
-# a dir containing <org>/<repo>/, the local copy is exposed via a
-# $workspace/<repo>.link symlink (the .link suffix keeps the workspace
-# entry from clashing with the /work/<repo> bind mount that
-# ensure_container places — Docker Desktop on macOS resolves a symlink
-# at the mount target before binding, so an unsuffixed $workspace/<repo>
-# symlink would defeat the bind mount). Otherwise falls back to git
-# clone into $workspace/<repo> (real dir; no .link suffix because there
-# is no bind mount to clash with). Honours SPANGAP_QUIET (single rollup
-# line instead of one per repo). Used by both the explicit --include
-# pre-fetch and the list-deps loop below.
+# Shared one-spec acquire: <org>/<repo>[@<ref>] → $workspace/<repo>. Only
+# ever called for genuinely-missing deps — anything present under repo_path
+# already shows up at /repos/<repo> inside the container, so list-deps never
+# reports it.
+#
+# repo_path mode is local-only and **never clones**: a repo_path is a pinned
+# set of straddles you always build against, so reaching out to github for a
+# missing one would silently mix in a different copy. If the repo is in the
+# checkout it's already on /repos (no-op here); if it isn't, that's an error
+# telling you to add it to your checkout — we don't fall back to a clone.
+# Without a repo_path, git-clone into $workspace/<repo> (a real dir the scan
+# picks up). Honours SPANGAP_QUIET (single rollup line instead of one per
+# repo). Used by both the explicit --include pre-fetch and the list-deps loop.
 __clone_announced=0
 clone_spec() {
     local spec=$1
     local bare=${spec%@*} ref=
     case $spec in *@*) ref=${spec#*@} ;; esac
-    local org=${bare%/*}
     local repo=${bare#*/}
-    local link="$workspace/$repo.link"
-    local clonedir="$workspace/$repo"
-    # Either form already on disk → done.
-    [ -e "$link" ] && return 0
-    [ -e "$clonedir" ] && return 0
-    local rp
-    rp=$(read_repo_path)
-    if [ -n "$rp" ] && [ -d "$rp/$org/$repo" ]; then
-        ln -s "$rp/$org/$repo" "$link" \
-            || die "ln -s $rp/$org/$repo $link failed"
-        if [ -z "$SPANGAP_QUIET" ]; then
-            local note=
-            [ -n "$ref" ] && note=" (ignoring @$ref — using working tree)"
-            log "symlinked $bare from $rp$note"
-        fi
-        return 0
+    local dest="$workspace/$repo"
+    [ -e "$dest" ] && return 0
+    local rp; rp=$(read_repo_path)
+    if [ -n "$rp" ]; then
+        [ -d "$rp/$repo" ] && return 0   # already in the checkout → on /repos
+        die "$bare is not in your repo_path checkout ($rp), and repo_path mode never clones — add it to $rp and retry (or fix its straddle.yaml 'name:' if it's there under another dir name)."
     fi
     if [ -n "$SPANGAP_QUIET" ]; then
         if [ "$__clone_announced" = "0" ]; then
             log "cloning dependencies"
             __clone_announced=1
         fi
-        git clone --quiet "https://github.com/${bare}.git" "$clonedir" >/dev/null 2>&1 \
+        git clone --quiet "https://github.com/${bare}.git" "$dest" >/dev/null 2>&1 \
             || die "git clone https://github.com/${bare}.git failed (host github auth set up?)"
     else
-        log "cloning $bare -> $clonedir"
-        git clone --quiet "https://github.com/${bare}.git" "$clonedir" \
+        log "cloning $bare -> $dest"
+        git clone --quiet "https://github.com/${bare}.git" "$dest" \
             || die "git clone https://github.com/${bare}.git failed (host github auth set up?)"
     fi
     if [ -n "$ref" ]; then
-        git -C "$clonedir" checkout --quiet "$ref" \
-            || die "git checkout '$ref' failed in $clonedir"
+        git -C "$dest" checkout --quiet "$ref" \
+            || die "git checkout '$ref' failed in $dest"
     fi
 }
 
@@ -971,13 +920,9 @@ fetch_missing_deps() {
         for spec in $missing; do
             local bare=${spec%@*}
             local repo=${bare#*/}
-            local link="$workspace/$repo.link"
-            local clonedir="$workspace/$repo"
-            if [ -e "$link" ]; then
-                die "$link already exists, but $bare wasn't seen as a workspace sibling — wrong 'name:' in its straddle.yaml? wrong dir layout?"
-            fi
-            if [ -e "$clonedir" ]; then
-                die "$clonedir already exists, but $bare wasn't seen as a workspace sibling — wrong 'name:' in its straddle.yaml? wrong dir layout?"
+            local dest="$workspace/$repo"
+            if [ -e "$dest" ]; then
+                die "$dest already exists, but $bare wasn't seen as a workspace sibling — wrong 'name:' in its straddle.yaml? wrong dir layout?"
             fi
             clone_spec "$spec"
         done
@@ -995,69 +940,22 @@ ensure-container)
     ensure_container
     exit 0
     ;;
-link-deps)
-    # Materialise visibility .link symlinks for every straddle a build
-    # of .spangap-project would pull in transitively, when that
-    # straddle exists under repo_path. Used by `spangap init` so the
-    # workspace immediately shows the in-scope dep set rather than
-    # waiting for the first build to populate it on demand.
-    [ -f "$workspace/.spangap-project" ] || exit 0
-    proj_name=$(cat "$workspace/.spangap-project")
-    [ -n "$proj_name" ] || exit 0
-    rp=$(read_repo_path)
-    [ -n "$rp" ] || exit 0
-    ensure_container
-    # spangap list-requires walks requires:/optional_requires:
-    # transitively from the project, returning `<org>/<repo>` per line.
-    deps=$(docker exec --workdir "/work/$proj_name" "$container" \
-        spangap list-requires 2>/dev/null) \
-        || die "failed to resolve requires in container $container"
-    count=0
-    for spec in $deps; do
-        org=${spec%/*}
-        repo=${spec#*/}
-        # Skip the project itself (init already symlinked it) and
-        # anything already present in the workspace under either name
-        # (cloned dir or existing .link).
-        [ "$repo" = "$proj_name" ] && continue
-        [ -e "$workspace/$repo.link" ] && continue
-        [ -e "$workspace/$repo" ] && continue
-        if [ -d "$rp/$org/$repo" ]; then
-            ln -s "$rp/$org/$repo" "$workspace/$repo.link" \
-                && count=$((count + 1))
-        fi
-    done
-    [ "$count" -gt 0 ] \
-        && log "dropped $count visibility .link symlink(s) for $proj_name's transitive deps"
-    exit 0
-    ;;
 reset)
     shift
     ensure_daemon
-    # reallyclean first while the container is still alive: it walks the
-    # in-container straddle tree to drop build/, node_modules/, .quasar/,
-    # etc. Those artifacts live under <repo_path>/<org>/<repo>/ (via the
-    # straddle bind mounts), so removing the container without cleaning
-    # them first leaves source-realpath addresses baked into CMakeCache
-    # that resurface on the next build.
+    # reallyclean first while the container is still alive: it sweeps every
+    # straddle's build/, managed_components/, node_modules/, .quasar/, etc.
+    # Those artifacts live under the straddles (at /repos/<repo> or
+    # /workspace/<repo>), so removing the container without cleaning them
+    # first leaves source-realpath addresses baked into CMakeCache that
+    # resurface on the next build. reallyclean is workspace-wide and needs no
+    # project context, so any cwd works. Best-effort — if it fails we still
+    # tear down.
     if docker inspect "$container" >/dev/null 2>&1 \
         && [ "$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null)" = "running" ]; then
-        # reallyclean needs a straddle context (find_project walks up
-        # looking for straddle.yaml), so /work as cwd would die. Honour
-        # the project the user recorded via `init <project>` and target
-        # /work/<project_dir> — that's the bind mount, real dir, has
-        # straddle.yaml. Skip silently if no .spangap-project is set
-        # (workspace was inited without a project; nothing to reset).
-        # Best-effort either way — if reallyclean fails we still want
-        # to tear the container down.
-        if [ -f "$workspace/.spangap-project" ]; then
-            proj_name=$(cat "$workspace/.spangap-project")
-            if [ -n "$proj_name" ]; then
-                log "running reallyclean on $proj_name before container teardown"
-                docker exec --workdir "/work/$proj_name" "$container" \
-                    spangap reallyclean >/dev/null 2>&1 || true
-            fi
-        fi
+        log "running reallyclean across all straddles before container teardown"
+        docker exec --workdir /workspace "$container" \
+            spangap reallyclean >/dev/null 2>&1 || true
     fi
     if docker inspect "$container" >/dev/null 2>&1; then
         log "removing container $container"
@@ -1080,50 +978,31 @@ esac
 
 ensure_container
 
-# to_container_cwd <ws-relative-path>: map a workspace-relative path
-# to its in-container equivalent. Two cases:
-#
-#   1. First segment is `<name>.link` (a straddle symlink the user or
-#      clone_spec dropped for visibility/cd ergonomics) → return
-#      /work/<name>/<rest>. The /work bind mount is a real directory;
-#      the kernel can't realpath out of it, which keeps JS deps with
-#      `file:` paths (vite/rollup) resolving against the flat /work
-#      layout the package.json relative paths assume.
-#
-#   2. Anything else under the workspace → return /workspace/<rel>.
-#      Dotfiles, the spangap.workspace.yaml marker, and any
-#      git-cloned-not-in-repo_path straddles live there as real files
-#      or dirs.
-#
-# Only the first segment is checked for `.link` — nested `.link` names
-# inside a straddle are passed through unchanged.
-to_container_cwd() {
-    local r=$1
-    [ -z "$r" ] && { printf '/workspace\n'; return; }
-    local first=${r%%/*}
-    case $first in
-        *.link)
-            local name=${first%.link}
-            case $r in
-                */*) printf '/work/%s/%s\n' "$name" "${r#*/}" ;;
-                *)   printf '/work/%s\n' "$name" ;;
-            esac
-            ;;
-        *)
-            printf '/workspace/%s\n' "$r"
-            ;;
+# host_to_container <host-path>: map an absolute host path to its in-container
+# equivalent. The two bind mounts are /workspace (the workspace dir) and
+# /repos (the flat repo_path checkout, when set), so a path under the
+# workspace becomes /workspace/<rel> and one under repo_path becomes
+# /repos/<rel>. Used to turn a resolved straddle's host dir (which may live in
+# either) into the --workdir for docker exec.
+host_to_container() {
+    local h=$1 rp
+    case $h in
+        "$workspace")   printf '/workspace\n'; return ;;
+        "$workspace"/*) printf '/workspace/%s\n' "${h#"$workspace"/}"; return ;;
     esac
+    rp=$(read_repo_path)
+    if [ -n "$rp" ]; then
+        case $h in
+            "$rp")   printf '/repos\n'; return ;;
+            "$rp"/*) printf '/repos/%s\n' "${h#"$rp"/}"; return ;;
+        esac
+    fi
+    die "path $h is under neither the workspace ($workspace) nor repo_path"
 }
 
-# Container cwd = host cwd remapped to either /workspace/<rel> or
-# /work/<repo>/<rest> per to_container_cwd.
-host_cwd=$(pwd)
-case $host_cwd in
-    "$workspace") rel="" ;;
-    "$workspace"/*) rel=${host_cwd#"$workspace/"} ;;
-    *) die "cwd $host_cwd is not under workspace $workspace" ;;
-esac
-container_cwd=$(to_container_cwd "$rel")
+# Container cwd = host cwd remapped. find_workspace guarantees cwd is under the
+# workspace, so this lands at /workspace/<rel>.
+container_cwd=$(host_to_container "$(pwd)")
 
 exec_flags="-i"
 [ -t 0 ] && [ -t 1 ] && exec_flags="-it"
@@ -1139,20 +1018,15 @@ get-deps)
     # Re-derive container_cwd from the resolved straddle so get-deps /
     # build also work from the workspace root with a single child
     # straddle (the `init <project> && build` flow).
-    proj_rel=${proj#"$workspace"}; proj_rel=${proj_rel#/}
-    container_cwd=$(to_container_cwd "$proj_rel")
+    container_cwd=$(host_to_container "$proj")
     fetch_missing_deps "$container_cwd"
-    log "get-deps done — all requires: present under $workspace"
+    log "get-deps done — all requires: present"
     exit 0
     ;;
 build)
     command -v git >/dev/null 2>&1 || die "git required on host PATH (for auto get-deps)"
     proj=$(require_straddle build)
-    proj_rel=${proj#"$workspace"}; proj_rel=${proj_rel#/}
-    container_cwd=$(to_container_cwd "$proj_rel")
-    rp=$(read_repo_path)
-    [ -n "$rp" ] && \
-        log "symlinking straddles from repo_path ($rp) if available."
+    container_cwd=$(host_to_container "$proj")
     # Pre-clone any `--include <org>/<repo>` (slash-form) so the included
     # straddle is on disk before the container starts listing missing
     # deps. The list-deps loop below then picks up any transitive
@@ -1162,30 +1036,28 @@ build)
     prefetch_explicit_includes "$@"
     fetch_missing_deps "$container_cwd"
     shift
-    # Quiet by default — the build output is mostly noise (per-file
-    # compiler invocations) and the filter surfaces every diagnostic
-    # the tools emit. -v|--verbose as the first arg after `build` is
-    # consumed here (not forwarded into the container) and switches
-    # the filter to pass-through. The global SPANGAP_QUIET (set near
-    # the top of this file) tracks the same flag for the cloning +
+    # Quiet-by-default + the -v|--verbose flag now live in spangap-inside, so
+    # the in-container build behaves the same however it's reached. We just
+    # forward argv unchanged (including -v) and hand the build the host's
+    # sticky serial port via $SPANGAP_PORT so its flash hint can name it.
+    # The global SPANGAP_QUIET (set near the top of this file, off iff the
+    # first build arg is -v/--verbose) still gates the host-side cloning +
     # container-setup phases.
-    quiet_flag=-s
+    verbose=""
     case ${1:-} in
-        -v|--verbose) quiet_flag=""; shift ;;
+        -v|--verbose) verbose=1 ;;
     esac
-    # Sticky port is picked up by the filter to fill in the flash hint.
     sticky_port=""
     [ -f "$PORT_FILE" ] && sticky_port=$(cat "$PORT_FILE")
-    filter="$workspace/spangap.link/build-system/spangap-build-filter"
-    [ -x "$filter" ] || filter="$workspace/spangap/build-system/spangap-build-filter"
-    [ -x "$filter" ] || die "build filter $filter not found or not executable"
-    proj_name=$(basename "$proj"); proj_name=${proj_name%.link}
-    [ -n "$quiet_flag" ] && log "building $proj_name"
-    # No -t: stdout is a pipe to the filter, so don't ask docker for a tty.
+    proj_name=$(basename "$proj")
+    # The quiet build prints almost nothing until a diagnostic fires, so
+    # announce what's building. The verbose build narrates itself.
+    [ -z "$verbose" ] && log "building $proj_name"
+    # No -t: keep output non-interactive (matches the previous piped path).
     set +e
-    docker exec -i --workdir "$container_cwd" "$container" spangap build "$@" 2>&1 \
-        | SPANGAP_PORT="$sticky_port" "$filter" $quiet_flag
-    rc=${PIPESTATUS[0]}
+    docker exec -i -e SPANGAP_PORT="$sticky_port" \
+        --workdir "$container_cwd" "$container" spangap build "$@"
+    rc=$?
     set -e
     exit "$rc"
     ;;

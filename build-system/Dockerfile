@@ -124,12 +124,12 @@ ENV HOME=/home/ubuntu
 ENV NPM_CONFIG_PREFIX=/home/ubuntu/.npm-global
 ENV PATH=/home/ubuntu/.npm-global/bin:$PATH
 
-# Workspace bind-mount lands at /workspace; per-straddle bind mounts at
-# /work/<repo>. spangap-outside passes --workdir to every `docker exec`,
-# so this WORKDIR is mostly cosmetic (default for `docker run` only, and
-# the container is started with `sleep infinity`). Set to /workspace so
-# the default lands somewhere with workspace state, not in the middle of
-# a straddle bind mount.
+# Workspace bind-mount lands at /workspace; the flat repo_path checkout (when
+# set) is bind-mounted whole at /repos, so straddles are container-native dirs
+# at /repos/<repo> or /workspace/<repo>. spangap-outside passes --workdir to
+# every `docker exec`, so this WORKDIR is mostly cosmetic (default for `docker
+# run` only, and the container is started with `sleep infinity`). Set to
+# /workspace so the default lands somewhere with workspace state.
 WORKDIR /workspace
 
 # Default to bash so `spangap shell` lands the user in something familiar.

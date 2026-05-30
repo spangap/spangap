@@ -128,6 +128,45 @@ the command on the host (flash, monitor, cli, get-deps, reset) or
 docker-execs `spangap-inside` in the build-env container
 (`spangap-<hash7(workspace)>`).
 
+**Workspace layout.** No symlinks. Straddles reach the container through one
+of two flat, container-native roots:
+
+- `/repos/<repo>` — the **flat** local checkout (`<repo_path>/<repo>`, every
+  straddle a direct child) passed to `init --repo-path`, bind-mounted *whole*
+  to `/repos` (one mount). Adding/removing a straddle under it needs no
+  `spangap reset` — the whole-tree mount picks it up live. **repo_path mode is
+  local-only and never clones:** the checkout is a pinned set you always build
+  against, so a required straddle that isn't in it is an error (add it to the
+  checkout), never a silent github fetch of a possibly-different copy. Build a
+  workspace from scratch against it and nothing comes from github.
+- `/workspace/<repo>` — git clones, used **only without `--repo-path`**: the
+  host fetches missing transitive deps here, and they stay (pinned) until you
+  delete them. The workspace dir also holds the marker, the dotfiles, and the
+  per-host venv.
+
+`spangap-inside` scans both roots. Because each root is flat, the browser
+`file:../../<sibling>/browser` deps — which assume straddle roots are flat
+siblings — resolve directly; there's no synthetic re-mount. (An earlier
+design used a separate `/work` mount plus a `.link` symlink suffix to paper
+over an *org-layered* checkout, where those `file:` deps dangled; flattening
+the checkout removed the need for both.) The container sees three mounts:
+`/workspace`, `/repos`, and the persistent `/home/ubuntu`.
+
+**No host paths inside.** Because straddles are referenced at their container
+paths (`/repos/<repo>`, `/workspace/<repo>`) and never via a host-absolute
+symlink, the `CMAKE_HOME_DIRECTORY` baked into `build/CMakeCache.txt` is a
+container path — stable and host-independent. (Flash/monitor on the host read
+`build/` through the same inode: `/repos` *is* `<repo_path>` on the host.)
+
+**Project resolution is symmetric across the two sides.** From the workspace
+root, both `spangap-outside` (`require_straddle`) and `spangap-inside`
+(`find_project`) fall back to the `.spangap-project` default, so `build` /
+`flash` / `validate` work from the root — on the host and inside the
+container — not only from inside the straddle dir. (Targeting a *non-default*
+straddle by `cd`-ing into it isn't supported under repo_path, since those
+straddles live at `/repos`, outside the workspace tree on the host; that's a
+future `spangap build <straddle>` argument.)
+
 **No-workspace fallback** — `spangap monitor <dev>` and `spangap cli`
 also run with no `spangap.workspace.yaml` at/above cwd. The entry script
 resolves its own real path (chasing symlinks through `/usr/local/bin/…`)
@@ -141,6 +180,14 @@ without an elf or a flashme watcher. Everything else still requires
 Common verbs:
 
 - `spangap build [flags]` — staged-set + build-config knobs per build:
+  - `-v` / `--verbose` shows the full IDF / Vite output. **Quiet by
+    default** — only real compiler/build-tool diagnostics (plus a few
+    lines of trailing context) are kept, and the flash banner is rewritten
+    to `spangap flash <port>`. This filtering lives in `spangap-inside`, so
+    it applies the same whether you reach the build through the host
+    `spangap build`, `spangap docker spangap build`, or a shell inside the
+    container; `spangap-outside` just forwards the flag (and the host's
+    sticky port via `$SPANGAP_PORT`).
   - `--exclude <name>` (repeatable) drops an `optional_requires:` entry.
     Bare repo (`spangap-lcd`) or fully-qualified (`spangap/spangap-lcd`).
     Excluding a hard `requires:` target is an error. `--no-lcd` /

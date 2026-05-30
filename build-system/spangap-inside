@@ -22,8 +22,21 @@ import yaml
 from jsonschema import Draft202012Validator
 
 SCHEMA_PATH = Path("/usr/local/share/spangap/straddle.schema.json")
-WORKSPACE = Path("/workspace")  # workspace dotfiles + skeleton + .link symlinks + cloned straddles
-STRADDLE_MOUNT_ROOT = Path("/work")  # per-straddle bind mounts from <repo_path>/<org>/<repo>
+# Straddles live under one of two flat, container-native roots — no symlinks,
+# no host paths inside:
+#   /repos/<repo>      the flat repo_path checkout, bind-mounted here whole
+#                      when `init --repo-path` was used (one mount, every
+#                      straddle a direct child). Because it's flat, the browser
+#                      `file:../../<sibling>` deps resolve straight through.
+#   /workspace/<repo>  git clones (the no-repo_path case), plus any dep cloned
+#                      because it wasn't present under repo_path.
+# The workspace dir itself (/workspace) also holds the marker, the dotfiles,
+# and the per-host venv; non-straddle entries have no straddle.yaml and are
+# skipped. Builds bake the container path (e.g. /repos/<repo>) into
+# CMakeCache, so it's stable and host-independent.
+WORKSPACE = Path("/workspace")
+REPOS = Path("/repos")
+STRADDLE_ROOTS = (REPOS, WORKSPACE)
 HOST_FILE = WORKSPACE / ".spangap-host"
 
 
@@ -74,18 +87,61 @@ def die(msg: str, exit_code: int = 1):
 
 
 def find_project(start: Path | None = None) -> Manifest:
-    """Walk up from cwd until straddle.yaml. That's the project."""
-    cur = (start or Path.cwd()).resolve()
+    """Resolve the project straddle for the current invocation.
+
+    Walk up from cwd until straddle.yaml. Each straddle has one container-
+    native location (/repos/<repo> or /workspace/<repo>) — no symlinks, no
+    host paths — so the CMAKE_HOME_DIRECTORY baked into build/CMakeCache.txt is
+    stable and host-independent.
+
+    If nothing is found and we're at the workspace root, fall back to the
+    project `spangap init <project>` recorded in .spangap-project — this mirrors
+    spangap-outside's require_straddle/default_straddle so `spangap build` (and
+    friends) work from the workspace root inside the container too, not only
+    from inside the straddle dir.
+    """
+    origin = (start or Path.cwd()).resolve()
+    cur = origin
     while True:
         cand = cur / "straddle.yaml"
         if cand.is_file():
             return load_manifest(cand)
         if cur == cur.parent:
-            die(
-                f"no straddle.yaml found at or above {Path.cwd()}.\n"
-                "       Run from inside a straddle (a dir with straddle.yaml at its root)."
-            )
+            break
         cur = cur.parent
+    if origin == WORKSPACE:
+        proj = default_project()
+        if proj is not None:
+            return proj
+        die(
+            f"no straddle.yaml at or above {WORKSPACE} and no usable "
+            ".spangap-project default.\n"
+            "       Run from inside a straddle, or `spangap init <project>` "
+            "to set a workspace default."
+        )
+    die(
+        f"no straddle.yaml found at or above {Path.cwd()}.\n"
+        "       Run from inside a straddle (a dir with straddle.yaml at its root)."
+    )
+
+
+def default_project() -> Manifest | None:
+    """The straddle named by .spangap-project, or None.
+
+    The straddle is at /repos/<name> (repo_path mount) or /workspace/<name>
+    (git clone); check both roots.
+    """
+    proj_file = WORKSPACE / ".spangap-project"
+    if not proj_file.is_file():
+        return None
+    name = proj_file.read_text().strip()
+    if not name:
+        return None
+    for root in STRADDLE_ROOTS:
+        cand = root / name / "straddle.yaml"
+        if cand.is_file():
+            return load_manifest(cand)
+    return None
 
 
 def load_manifest(path: Path) -> Manifest:
@@ -108,44 +164,26 @@ def load_manifest(path: Path) -> Manifest:
 def scan_workspace_straddles() -> dict[str, Manifest]:
     """Every straddle.yaml visible to the container, indexed by name.
 
-    Two sources, walked in order:
-
-      /work/<repo>/     bind mounts the host placed for every
-                       <repo_path>/<org>/<repo>. Real directories
-                       inside the container — these are the canonical
-                       location the build navigates against. Source-of-
-                       truth content with the kernel unable to realpath
-                       out of them, which keeps node tooling (vite,
-                       rollup) happy when straddles' JS package.json
-                       files use sibling-relative `file:` paths.
-
-      /workspace/<repo>/  git-cloned straddles that aren't under
-                       <repo_path>. Same content semantics, just not
-                       part of the source-of-truth tree.
-
-    `/workspace/<repo>.link/` entries are skipped — those are
-    visibility-only symlinks the host drops so `ls <workspace>/`
-    surfaces what's pulled in and `cd <repo>.link/...` works on the
-    host; the bind mount at /work/<repo> is the same content and is
-    what we walk. If both /work/<repo> and /workspace/<repo> exist for
-    the same name (shouldn't normally happen — repo_path and
-    workspace clones are disjoint by construction), the bind mount
-    wins and the workspace clone is reported as a duplicate.
+    Walks the two flat straddle roots — /repos (the repo_path mount) and
+    /workspace (git clones) — in that order. Both are plain directories of
+    real straddle dirs; non-straddle entries (dotfiles, the per-host venv,
+    the workspace marker) have no straddle.yaml and are skipped. A name seen
+    twice is an error: repo_path and clones are disjoint by construction (a
+    dep present under repo_path is never also cloned), so this only fires on
+    a mis-set `name:` in a straddle.yaml.
     """
     found: dict[str, Manifest] = {}
-    if not STRADDLE_MOUNT_ROOT.is_dir() and not WORKSPACE.is_dir():
+    if not WORKSPACE.is_dir():
         die(
-            f"neither {STRADDLE_MOUNT_ROOT} nor {WORKSPACE} mounted — "
-            "is the container running with -v <ws>:/workspace and the "
-            "per-straddle -v <src>:/work/<name> mounts?"
+            f"{WORKSPACE} not mounted — is the container running with "
+            "-v <ws>:/workspace (and -v <repo_path>:/repos when a repo_path "
+            "is set)?"
         )
 
-    def collect(root: Path, skip_link: bool) -> None:
+    for root in STRADDLE_ROOTS:
         if not root.is_dir():
-            return
+            continue
         for child in sorted(root.iterdir()):
-            if skip_link and child.name.endswith(".link"):
-                continue
             if not child.is_dir():
                 continue
             m_path = child / "straddle.yaml"
@@ -155,9 +193,6 @@ def scan_workspace_straddles() -> dict[str, Manifest]:
             if m.name in found:
                 die(f"two straddles claim the same name '{m.name}':\n  {found[m.name].path}\n  {m.path}")
             found[m.name] = m
-
-    collect(STRADDLE_MOUNT_ROOT, skip_link=False)
-    collect(WORKSPACE, skip_link=True)
     return found
 
 
@@ -452,7 +487,7 @@ def signal_preamble(proj: Manifest, deps: list[Manifest], missing: list[str] = (
         print("           run `spangap get-deps` from this straddle to fetch them.", file=sys.stderr)
 
 
-def stage_components(proj: Manifest, deps: list[Manifest]) -> Path:
+def stage_components(proj: Manifest, deps: list[Manifest], log_staged: bool = True) -> Path:
     """Stage each transitive dep into <fw>/staging/components/<repo>/, as a
     real dir of per-entry symlinks to the dep's firmware_dir contents plus
     generated build-system files. The per-entry layout (vs. one symlink to
@@ -460,7 +495,8 @@ def stage_components(proj: Manifest, deps: list[Manifest]) -> Path:
     polluting the source tree.
 
     Also writes the synthetic _spangap_present component and the buildable's
-    main_requires.cmake.
+    main_requires.cmake. log_staged=False suppresses the per-dep `staged:`
+    lines (quiet builds).
     """
     staging = proj.firmware_dir / "staging" / "components"
     if staging.exists():
@@ -478,7 +514,8 @@ def stage_components(proj: Manifest, deps: list[Manifest]) -> Path:
         for entry in sorted(src.iterdir()):
             (dst / entry.name).symlink_to(entry)
         write_spangap_requires(dst, effective_requires(dep, staged_repos))
-        print(f"  staged: {dep.repo} -> {src}", file=sys.stderr)
+        if log_staged:
+            print(f"  staged: {dep.repo} -> {src}", file=sys.stderr)
 
     write_presence_component(staging, deps)
     write_main_requires(proj, staged_repos)
@@ -489,6 +526,99 @@ def run_idf(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> in
     cmd = ["idf.py", *args]
     print(f"+ {' '.join(cmd)}  (in {cwd})", file=sys.stderr)
     return subprocess.run(cmd, cwd=cwd, env={**os.environ, **(env or {})}).returncode
+
+
+# ---------------------------------------------------------------------------
+# `spangap build` output filtering. Quiet by default — IDF/Vite build output
+# is mostly per-file compiler noise — with -v|--verbose restoring the full
+# stream. This used to live host-side in a separate spangap-build-filter that
+# spangap-outside piped the container's stdout through; it now lives here so
+# the in-container build behaves identically however it's reached (`spangap
+# build` from the host, `spangap docker spangap build`, or a shell inside the
+# container) and there's a single copy of the filter rules. spangap-outside
+# just forwards argv (and the sticky port via $SPANGAP_PORT) now.
+# ---------------------------------------------------------------------------
+
+# idf.py's "all done" banner. Both modes rewrite it: idf.py's own multi-line
+# flash hints don't apply in a spangap workspace (you flash via `spangap
+# flash`), so we replace the banner with the spangap invocation and drop
+# whatever idf.py prints after it.
+_FLASH_MARKER = "Project build complete. To flash, run:"
+_TAIL = 3  # follow-up lines kept after each diagnostic in quiet mode
+
+# Ninja progress lines like `[44/2091] Building C object ...`. Never kept in
+# quiet mode, even when the path contains the literal "error"/"warning".
+_PROGRESS_RE = re.compile(r"^\[\d+/\d+\]\s")
+
+# What counts as a real diagnostic worth keeping in quiet mode. Each
+# alternative anchors the keyword in a context filenames can't fake (a
+# trailing colon, a line-leading meta-tool prefix, a marker glyph) so
+# `error.c.obj` / `chunkSizeWarningLimit` don't sneak through. `^spangap:`
+# keeps our own die()/status messages — without it a fast in-container die in
+# quiet mode would surface as a silent rc=1.
+_KEEP_RE = re.compile(
+    r"""
+    (?: \b (?: warning | error | fatal\s+error ) \b \s* :
+      | ^ CMake \s+ (?: Warning | Error ) \b
+      | ^ FAILED:
+      | \b note:
+      | \(!\) \s
+      | ^ spangap:
+      | \b Rollup \s+ failed \b
+      | \b App \s+ build \s+ (?: failed | successful ) \b
+      | \b Build \s+ failed \s+ in \b
+      | ^ ninja: \s* build \s+ stopped \b
+      | ^ ninja \s+ failed \b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def run_build_idf(args: list[str], cwd: Path, quiet: bool, env: dict[str, str] | None = None) -> int:
+    """Run `idf.py <args>` for a build, streaming output through the filter.
+
+    quiet=True keeps only real diagnostics (+ a few lines of trailing context,
+    with `[...]` between non-adjacent blocks); quiet=False is pass-through.
+    Both modes rewrite idf.py's flash banner to `spangap flash <port>`, where
+    <port> is $SPANGAP_PORT (the host's sticky serial port, forwarded by
+    spangap-outside) or the literal `<serial port>` placeholder.
+    """
+    cmd = ["idf.py", *args]
+    if not quiet:
+        print(f"+ {' '.join(cmd)}  (in {cwd})", file=sys.stderr)
+    port = os.environ.get("SPANGAP_PORT") or "<serial port>"
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, env={**os.environ, **(env or {})},
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    assert proc.stdout is not None
+    out = sys.stdout
+    remaining = 0
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            if _FLASH_MARKER in line:
+                out.write("build: done. To flash, run:\n")
+                out.write(f"  spangap flash {port}\n")
+                out.flush()
+                for _ in proc.stdout:  # drop idf.py's own flash instructions
+                    pass
+                break
+            if not quiet:
+                out.write(line + "\n"); out.flush(); continue
+            if _PROGRESS_RE.match(line):
+                continue
+            if _KEEP_RE.search(line):
+                out.write(line + "\n"); out.flush(); remaining = _TAIL
+            elif remaining > 0:
+                out.write(line + "\n"); out.flush(); remaining -= 1
+                if remaining == 0:
+                    out.write("[...]\n"); out.flush()
+    except BrokenPipeError:
+        pass
+    return proc.wait()
 
 
 _NO_SHORTHANDS = {  # --no-<x> maps to --exclude <bare>
@@ -594,17 +724,19 @@ def cmd_build(args: argparse.Namespace) -> int:
     deps, _ = resolve_requires(
         proj, all_straddles, excluded=excluded, included=included,
     )
-    signal_preamble(proj, deps)
-    if excluded:
-        print(f"excluded:  {', '.join(sorted(excluded))}", file=sys.stderr)
-    if included:
-        print(f"included:  {', '.join(sorted(included))}", file=sys.stderr)
-    if args.flash_size is not None:
-        print(f"flash:     {args.flash_size} MB (--flash-size override)", file=sys.stderr)
-    stage_components(proj, deps)
+    quiet = not args.verbose
+    if not quiet:
+        signal_preamble(proj, deps)
+        if excluded:
+            print(f"excluded:  {', '.join(sorted(excluded))}", file=sys.stderr)
+        if included:
+            print(f"included:  {', '.join(sorted(included))}", file=sys.stderr)
+        if args.flash_size is not None:
+            print(f"flash:     {args.flash_size} MB (--flash-size override)", file=sys.stderr)
+    stage_components(proj, deps, log_staged=not quiet)
     write_sdkconfig_overrides(proj, args.flash_size)
     lint_cmakelists(proj, deps, all_straddles)
-    return run_idf(args.idf_args or ["build"], cwd=proj.firmware_dir)
+    return run_build_idf(args.idf_args or ["build"], cwd=proj.firmware_dir, quiet=quiet)
 
 
 def cmd_flash(args: argparse.Namespace) -> int:
@@ -693,9 +825,8 @@ def cmd_list_requires(args: argparse.Namespace) -> int:
 
     One `<org>/<repo>` per line, in dependency order. Skips the project
     itself. Optional requires that aren't present are silently dropped
-    (same semantics as `build` without --no-X). Used by `spangap init`
-    to drop visibility `.link` symlinks for every straddle a build of
-    this project would touch.
+    (same semantics as `build` without --no-X). A read-only diagnostic for
+    seeing exactly what a build of this straddle would pull in.
     """
     proj = find_project()
     deps, _ = resolve_requires(proj, scan_workspace_straddles())
@@ -704,29 +835,46 @@ def cmd_list_requires(args: argparse.Namespace) -> int:
     return 0
 
 
+# Per-straddle build artifacts reallyclean strips. Firmware: idf build/,
+# generated staging/, downloaded managed_components/. Browser: node_modules/,
+# dist/, .quasar/, package-lock.json.
+_FW_ARTIFACTS = ("build", "staging", "managed_components")
+_BROWSER_ARTIFACTS = ("node_modules", "dist", ".quasar", "package-lock.json")
+
+
 def cmd_reallyclean(args: argparse.Namespace) -> int:
-    """Source-only state: drop idf build/, staging/, browser node_modules/, dist/, .quasar."""
-    proj = find_project()
-    targets = [
-        proj.firmware_dir / "build",
-        proj.firmware_dir / "staging",
-        proj.firmware_dir / "managed_components",
-        proj.browser_dir / "node_modules",
-        proj.browser_dir / "dist",
-        proj.browser_dir / ".quasar",
-    ]
-    for t in targets:
+    """Strip EVERY workspace straddle back to source-only state.
+
+    A build touches more than the buildable: staged deps accumulate build/ and
+    managed_components/ in their firmware dirs, and every browser dir that gets
+    installed grows a node_modules/. So reallyclean sweeps all straddles, not
+    just the current project — and needs no project context (runs from
+    anywhere). Only ever removes generated/gitignored artifacts, never source.
+    """
+    straddles = scan_workspace_straddles()
+    removed = 0
+
+    def rm(t: Path) -> None:
+        nonlocal removed
         if t.is_symlink() or t.is_file():
             t.unlink()
+            removed += 1
             print(f"  rm {t}", file=sys.stderr)
         elif t.is_dir():
             shutil.rmtree(t)
+            removed += 1
             print(f"  rm -r {t}", file=sys.stderr)
-    pkg_lock = proj.browser_dir / "package-lock.json"
-    if pkg_lock.is_file():
-        pkg_lock.unlink()
-        print(f"  rm {pkg_lock}", file=sys.stderr)
-    print("spangap: reallyclean done.")
+
+    for m in straddles.values():
+        for sub in _FW_ARTIFACTS:
+            rm(m.firmware_dir / sub)
+        for sub in _BROWSER_ARTIFACTS:
+            rm(m.browser_dir / sub)
+    print(
+        f"spangap: reallyclean done — removed {removed} path(s) across "
+        f"{len(straddles)} straddle(s).",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -835,9 +983,15 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("doctor", help="report environment info").set_defaults(func=cmd_doctor)
     sub.add_parser("validate", help="parse + validate manifest and dep graph").set_defaults(func=cmd_validate)
     sub.add_parser("clean", help="run idf.py fullclean").set_defaults(func=cmd_clean)
-    sub.add_parser("reallyclean", help="strip back to source-only state").set_defaults(func=cmd_reallyclean)
+    sub.add_parser("reallyclean", help="strip ALL workspace straddles back to source-only state (build/, managed_components/, node_modules/, …)").set_defaults(func=cmd_reallyclean)
 
     p_build = sub.add_parser("build", help="build the project (default: idf.py build)")
+    p_build.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="show the full IDF / Vite build output. Quiet by default — only "
+             "real compiler/build-tool diagnostics (plus a little context) are "
+             "kept.",
+    )
     p_build.add_argument(
         "-e", "--exclude", action="append", default=[], metavar="STRADDLE",
         help="drop a straddle from this build's staged set (repeatable; <org>/<repo> "
@@ -877,7 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser(
         "list-requires",
-        help="print the project's full transitive requires set (used by `spangap init` to drop visibility .link symlinks)",
+        help="print the project's full transitive requires set, in dependency order (read-only diagnostic)",
     ).set_defaults(func=cmd_list_requires)
 
     args = p.parse_args(argv)

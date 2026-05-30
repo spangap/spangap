@@ -826,11 +826,15 @@ ensure_container() {
         fi
     fi
 
+    # macOS still ships bash 3.2 where `${empty_array[@]}` trips `set -u`
+    # with "unbound variable" — only bash 4+ treats it as zero words.
+    # The `${name[@]+"${name[@]}"}` idiom expands to nothing when the
+    # array is empty and to the elements otherwise, on both versions.
     docker run -d --name "$container" \
         -v "$workspace:/workspace" \
         -v "$spangap_home:/home/ubuntu" \
-        "${repo_mount[@]}" \
-        "${straddle_mounts[@]}" \
+        ${repo_mount[@]+"${repo_mount[@]}"} \
+        ${straddle_mounts[@]+"${straddle_mounts[@]}"} \
         --workdir /workspace \
         --label spangap.workspace="$workspace" \
         --label org.spangap.repo-path="$repo_path" \

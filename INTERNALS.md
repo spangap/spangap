@@ -197,7 +197,9 @@ Common verbs:
     sibling. Fully-qualified `<org>/<repo>` (`spangap/spangap-sshd`) is
     auto-cloned from github by the host dispatcher if not yet present.
     The included straddle is treated as a soft dep root: its own
-    `requires:` / `optional_requires:` are followed transitively.
+    `requires:` / `optional_requires:` are followed transitively. Under
+    `--repo-path` nothing is cloned (see "repo_path is local-only" below) —
+    a slash-form `--include` not in the checkout is an error, not a fetch.
   - `--flash-size <MB>` overrides `CONFIG_ESPTOOLPY_FLASHSIZE_*MB` for
     this build — useful when running a generic spangap firmware against
     differently-sized hardware. Valid: 4, 8, 16, 32, 64, 128. Probe a
@@ -208,7 +210,10 @@ Common verbs:
 - `spangap get-deps` — host-side `git clone` of any missing transitive
   `requires:` (also runs implicitly as the first phase of `build`)
 - `spangap cli [-h <host>] <cmd>…` — talk to the device's TCP CLI
-- `spangap clean` / `spangap reallyclean` — incremental vs source-only
+- `spangap clean` / `spangap reallyclean` — incremental clean vs source-only
+  (reallyclean sweeps **every** straddle, not just the current project, and
+  reaches into the repo_path checkout since `/repos` *is* the checkout —
+  gitignored artifacts only)
 - `spangap docker <cmd>…` — raw `docker exec` into the build-env container
   (e.g. `spangap docker sh` to drop into a shell, `spangap docker claude`)
 
@@ -216,6 +221,154 @@ Local sibling-checkout development uses the `--spangap` flag (or its
 moral equivalent in this CLI) so a build resolves `spangap-core` from
 `../spangap-core` instead of the registry; the committed
 `idf_component.yml` stays registry-shaped.
+
+## Build-system design notes — why it's shaped this way
+
+The "what" is above; this is the "why", plus the alternatives we rejected, so
+the shape doesn't get re-litigated from scratch.
+
+### Polyrepo assembled into a workspace — not a monorepo
+
+Each straddle is its **own git repo**, versioned and cloneable independently
+(polyrepo). The build *assembles* a chosen subset — computed per buildable
+from `requires:` / `--include` / `--exclude` — into one flat working tree and
+builds across it. That tree is workspace-*shaped* but it is **not a monorepo**
+(one repo holding many packages). This distinction drives everything below:
+monorepo tooling (npm/pnpm/yarn workspaces) assumes a single owning root that
+enumerates its members, which a polyrepo doesn't have, so such tooling only
+ever *partially* fits.
+
+### Flat repo_path + `/repos` mount, and the alternatives we rejected
+
+The forcing function is the browser side: a buildable's `web-interface`
+depends on sibling browser packages via `file:../../<sibling>/browser`, which
+assumes straddle roots are **flat siblings** of each other.
+
+On Docker Desktop for macOS a **symlink resolves all the way through to its
+host landing place**, so the *layout of that landing place* is what node's
+`../../` arithmetic sees:
+
+- org-layered checkout (`<rp>/<org>/<repo>`) → `../../<sibling>` lands at
+  `<rp>/<org>/<sibling>` → **dangles** (sibling is under a different org).
+- flat checkout (`<rp>/<repo>`) → `../../<sibling>` → `<rp>/<sibling>` →
+  **resolves**.
+
+So we require a **flat** repo_path. An earlier design instead kept the
+checkout org-layered and papered over it with (a) `.link` visibility symlinks
+in the workspace and (b) per-straddle `/work/<repo>` bind mounts that
+synthesized a flat tree the kernel couldn't realpath out of. Flattening the
+checkout makes both unnecessary — there's nothing to flatten or disambiguate.
+
+Given a flat checkout, why bind-mount it at a *separate* `/repos` instead of
+straight onto `/workspace`?
+
+- `/workspace` is the workspace dir — it carries the marker, the dotfiles, the
+  per-host venv, and (without repo_path) the git clones. Mounting the checkout
+  *onto* `/workspace` would **shadow all of that**.
+- Per-straddle mounts at `/workspace/<repo>` don't help either: Docker
+  auto-creates each mount-point inside the (bind-mounted) workspace, so they
+  surface as **empty dirs in the host workspace** (the mounts exist only inside
+  the container), and the mount set is fixed at `docker run` so adding a repo
+  needs a `reset`. (Relatedly: a symlink sitting at a bind-mount target gets
+  resolved-through by Docker Desktop *before* binding — so you can't overlay a
+  mount where a symlink already is. That's the original reason `/work` + the
+  `.link` suffix existed.)
+- Making the workspace *be* the checkout (mount it whole as `/workspace`) was
+  considered and **rejected**: it kills "remove a workspace and do a whole
+  install from scratch." The separate workspace ↔ checkout split is exactly
+  what lets you `rm -rf` a workspace and re-`init --repo-path` against your
+  local source without touching — or re-cloning — the checkout.
+
+Result: one whole-tree `/repos` mount + a separate `/workspace`; `spangap-inside`
+scans both as flat roots; straddles are referenced at **container-native**
+paths so `CMAKE_HOME_DIRECTORY` (baked into `build/CMakeCache.txt`) is stable
+and host-independent — host paths never leak inside.
+
+### macOS Docker Desktop gotchas worth knowing
+
+- **Symlinks resolve through to the host target** (above) — so the host
+  layout, not the symlink, is what matters; and a symlink at a mount target
+  defeats the bind mount.
+- **`fakeowner` shows every file as mode 0755.** Git then reports a spurious
+  `100644 → 100755` on *every* tracked file (hundreds across the repos). Fix is
+  `git config core.fileMode false` per repo — set in all straddle checkouts.
+  Without it, `git status` is a sea of mode flips and "commit everything" would
+  mark every file executable in history.
+- A recreated host workspace dir leaves Docker's grpc-fuse share pointing at a
+  gone inode; `ensure_container` probes for the `spangap.workspace.yaml`
+  marker (not `test -d /workspace`, which lies on a dangling mount) and
+  recreates the container if it's missing.
+
+### repo_path is local-only and never clones
+
+A repo_path is a **pinned set** you always build against. Cloning a
+missing dep from github would silently mix in a *different* copy than your
+local set, breaking "always build the same thing." So under `--repo-path`,
+`clone_spec` never fetches: a required straddle present in the checkout is a
+no-op (it's already on `/repos`), and one that's absent is an **error** ("add
+it to your checkout"). Without a repo_path, missing deps are git-cloned into
+`/workspace/<repo>` and pinned there until deleted.
+
+### Build output, cleaning, flashing
+
+- **Quiet by default + `-v`** live in `spangap-inside` (not a host-side
+  filter), so the in-container build behaves identically however it's reached;
+  `spangap-outside` just forwards argv + the sticky port.
+- **`reallyclean` is workspace-wide**: a build drops artifacts into *every*
+  staged straddle (`build/`, `managed_components/` in firmware dirs;
+  `node_modules/` in browser dirs), so cleaning is project-independent and
+  sweeps all straddles. It reaches into the repo_path checkout (`/repos` is the
+  checkout) but only ever removes gitignored, regenerable output.
+- **A direct `spangap flash` clears `build/flashme`** on success, so a monitor
+  that starts later doesn't treat the stale signal as a fresh reflash request.
+
+### Browser dependency locking — the `package-lock.json` policy
+
+This is the subtlest call, so here's the full reasoning.
+
+**Why per-package locks churn.** `package-lock.json` is a *whole-tree*
+lockfile. When npm installs in a buildable's `web-interface`, it reads each
+`file:../../<sibling>` dep's `package.json`, resolves the entire transitive
+tree (including every registry package the siblings pull in), and writes all
+of it into *that buildable's* lock. So the lock embeds the siblings' resolved
+trees — and a dep change in any shared library dirties **every buildable's**
+lock that links it. With one buildable that's one lockfile; as "many more
+straddles become buildable with stub functionality," it **fans out** to N.
+
+**Policy (keyed on `buildable:`).** Commit `package-lock.json` in **buildable**
+straddles (it pins the full tree → reproducible-ish clean installs); **ignore**
+it in **library** straddles (there it's only standalone-dev cruft). The
+convention is documented in the buildable's `.gitignore`; when a straddle
+becomes buildable, drop its package-lock ignore and commit the lock.
+
+**Why the churn is currently cosmetic, not dangerous.** Nothing in the tree
+uses `npm ci`. The web build (`deploy.sh`, invoked by `spangap_browser_build`
+during the firmware build) runs `npm install` *only when `node_modules` is
+missing*, then `npx quasar build`. `npm install` treats the lock as a starting
+point and **self-heals** a stale one — it never hard-fails. So a stale/churny
+lock never breaks a build; the only cost is noisy diffs and merge conflicts on
+a big file. What you get is **soft reproducibility**: a clean install prefers
+the locked versions while they still satisfy `package.json`, and drifts (and
+re-dirties the lock) otherwise.
+
+**The inflection point.** The day you want *hard* reproducibility — a CI that
+guarantees byte-identical installs — you switch to `npm ci`. `npm ci` refuses
+to install when the lock is out of sync, so *then* a forgotten re-lock fails
+clean builds and the per-buildable fan-out stops being cosmetic. That's the
+signal to move the browser side off hand-rolled `file:../../` + per-package
+locks.
+
+**Why workspaces are the eventual fix, and why they don't drop in.** A
+workspace manager keeps **one** root lockfile and symlinks local packages by
+name (not `file:` whole-tree snapshots), so a shared-dep bump updates one lock
+once — reproducible *and* churn-free. But workspaces need a single owning root
+enumerating members, which the polyrepo lacks; the member set is per-build
+dynamic; and multiple independent buildables each still get their own lock
+unless you collapse everything under one root (a real monorepo for the browser
+side) — which the straddle model deliberately avoids. Realistic shapes if/when
+this bites: (a) generate an ephemeral workspace root over the staged set per
+build; (b) make the *browser* side a single monorepo (one root lock) while
+firmware stays polyrepo straddles; (c) stay as-is and accept the churn.
 
 ## ITS — inter-task streaming
 

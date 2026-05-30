@@ -37,9 +37,32 @@ RUN set -eux; \
         git \
         jq \
         less \
+        sudo \
         vim-tiny \
         python3-pip; \
     rm -rf /var/lib/apt/lists/*
+
+# Passwordless sudo for the `sudo` group. The base image's uid-1000 `ubuntu`
+# user is already a member, so this grants it root-on-demand inside the
+# container without a password. Keyed on the group (not the user) so it keeps
+# working if the runtime user ever changes. Validated at build time; a syntax
+# error in a sudoers file would otherwise lock sudo out entirely.
+RUN set -eux; \
+    echo '%sudo ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/nopasswd-sudo-group; \
+    chmod 0440 /etc/sudoers.d/nopasswd-sudo-group; \
+    visudo -cf /etc/sudoers.d/nopasswd-sudo-group
+
+# Interactive bash prompt. Appended to /etc/bash.bashrc (not ~/.bashrc) because
+# spangap-outside bind-mounts ~/.spangap over /home/ubuntu at runtime, which
+# would shadow any HOME-level dotfile baked into the image. /etc/bash.bashrc is
+# sourced by every interactive non-login bash (the `spangap shell` / `docker
+# exec ... bash` path), and /etc is not mounted over. \w renders the cwd, \$
+# becomes $ for ubuntu / # under sudo.
+RUN { \
+        echo ''; \
+        echo '# spangap interactive prompt'; \
+        echo "PS1='spangap:\\w \\\$ '"; \
+    } >> /etc/bash.bashrc
 
 # Python deps. Two targets:
 #   - System python3 (/usr/bin/python3): runs the in-container CLI; needs pyyaml+jsonschema.

@@ -14,16 +14,16 @@ dependencies (other straddles, by `<namespace>/<name>`), and the
 build CLI stages everything into ESP-IDF's component graph at build
 time.
 
-Three manifest keys carry deps:
+Two manifest keys carry deps:
 
 - **`requires:`** — hard. Missing one is a build error; can't be excluded.
 - **`optional_requires:`** — soft, **default-on**. Pruned silently when
   the dep isn't in the staged set (not cloned, not in the buildable's
   requires, or dropped by `--exclude` / `--no-X`).
-- **`extra_requires:`** — soft, **default-off**. Only included when the
-  user passes `--include <name>` (or `--include-all`). Use for components
-  that should be opt-in: experimental code, features that meaningfully
-  cost flash, anything you don't want in the default build.
+
+There's no manifest list of "extras you might also want" — anything the
+user wants beyond the curated set goes in via `--include <name>` at build
+time (see "Common verbs" below for the slash-vs-bare semantics).
 
 Source code gates corresponding call sites on the auto-generated
 `CONFIG_STRADDLE_<UPPER_REPO>` symbol (so absence compiles away cleanly).
@@ -66,8 +66,8 @@ Pass `--no-web` or `--no-lcd` at build time to exclude an activator.
 ### How staging and gating fit together
 
 `spangap-inside` resolves the buildable's `requires:` ∪ `optional_requires:`
-∪ (`extra_requires:` filtered by `--include` / `--include-all`) transitively,
-subtracting any `--exclude` / `--no-X` entries, then stages each kept dep into
+∪ (any straddles named via `--include`) transitively, subtracting any
+`--exclude` / `--no-X` entries, then stages each kept dep into
 `staging/components/<repo>/` as a real dir containing per-entry symlinks to
 the source dir's contents plus two generated files:
 
@@ -132,7 +132,7 @@ docker-execs `spangap-inside` in the build-env container
 also run with no `spangap.workspace.yaml` at/above cwd. The entry script
 resolves its own real path (chasing symlinks through `/usr/local/bin/…`)
 to find `build-system/spangap-outside`, sets `SPANGAP_WORKSPACE=$HOME`
-so the venv + sticky `.spangap-port`/`.spangap-host` files land there,
+so the venv + sticky `.spangap-port-<os>-<arch>`/`.spangap-host` files land there,
 and `spangap-outside`'s `monitor` warns *"not in spangap workspace,
 cannot decode stack on crash, cannot be signalled to flash"* and runs
 without an elf or a flashme watcher. Everything else still requires
@@ -145,8 +145,12 @@ Common verbs:
     Bare repo (`spangap-lcd`) or fully-qualified (`spangap/spangap-lcd`).
     Excluding a hard `requires:` target is an error. `--no-lcd` /
     `--no-web` are aliases.
-  - `--include <name>` (repeatable) opts in to an `extra_requires:` entry.
-    Same name forms. `--include-all` opts in to every extra.
+  - `--include <name>` (repeatable) pulls an extra straddle into this
+    build. Bare repo (`spangap-sshd`) must already be a workspace
+    sibling. Fully-qualified `<org>/<repo>` (`spangap/spangap-sshd`) is
+    auto-cloned from github by the host dispatcher if not yet present.
+    The included straddle is treated as a soft dep root: its own
+    `requires:` / `optional_requires:` are followed transitively.
   - `--flash-size <MB>` overrides `CONFIG_ESPTOOLPY_FLASHSIZE_*MB` for
     this build — useful when running a generic spangap firmware against
     differently-sized hardware. Valid: 4, 8, 16, 32, 64, 128. Probe a

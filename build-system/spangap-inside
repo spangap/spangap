@@ -22,7 +22,8 @@ import yaml
 from jsonschema import Draft202012Validator
 
 SCHEMA_PATH = Path("/usr/local/share/spangap/straddle.schema.json")
-WORKSPACE = Path("/work")
+WORKSPACE = Path("/workspace")  # workspace dotfiles + skeleton + .link symlinks + cloned straddles
+STRADDLE_MOUNT_ROOT = Path("/work")  # per-straddle bind mounts from <repo_path>/<org>/<repo>
 HOST_FILE = WORKSPACE / ".spangap-host"
 
 
@@ -62,9 +63,6 @@ class Manifest:
     @property
     def optional_requires(self) -> list[str]:
         return list(self.data.get("optional_requires", []))
-    @property
-    def extra_requires(self) -> list[str]:
-        return list(self.data.get("extra_requires", []))
     @property
     def is_buildable(self) -> bool:
         return "buildable" in self.data
@@ -108,20 +106,58 @@ def load_manifest(path: Path) -> Manifest:
 
 
 def scan_workspace_straddles() -> dict[str, Manifest]:
-    """Every straddle.yaml under immediate children of /work, indexed by name."""
+    """Every straddle.yaml visible to the container, indexed by name.
+
+    Two sources, walked in order:
+
+      /work/<repo>/     bind mounts the host placed for every
+                       <repo_path>/<org>/<repo>. Real directories
+                       inside the container — these are the canonical
+                       location the build navigates against. Source-of-
+                       truth content with the kernel unable to realpath
+                       out of them, which keeps node tooling (vite,
+                       rollup) happy when straddles' JS package.json
+                       files use sibling-relative `file:` paths.
+
+      /workspace/<repo>/  git-cloned straddles that aren't under
+                       <repo_path>. Same content semantics, just not
+                       part of the source-of-truth tree.
+
+    `/workspace/<repo>.link/` entries are skipped — those are
+    visibility-only symlinks the host drops so `ls <workspace>/`
+    surfaces what's pulled in and `cd <repo>.link/...` works on the
+    host; the bind mount at /work/<repo> is the same content and is
+    what we walk. If both /work/<repo> and /workspace/<repo> exist for
+    the same name (shouldn't normally happen — repo_path and
+    workspace clones are disjoint by construction), the bind mount
+    wins and the workspace clone is reported as a duplicate.
+    """
     found: dict[str, Manifest] = {}
-    if not WORKSPACE.is_dir():
-        die(f"workspace {WORKSPACE} not mounted — is the container running with -v <ws>:/work?")
-    for child in sorted(WORKSPACE.iterdir()):
-        if not child.is_dir():
-            continue
-        m_path = child / "straddle.yaml"
-        if not m_path.is_file():
-            continue
-        m = load_manifest(m_path)
-        if m.name in found:
-            die(f"two straddles claim the same name '{m.name}':\n  {found[m.name].path}\n  {m.path}")
-        found[m.name] = m
+    if not STRADDLE_MOUNT_ROOT.is_dir() and not WORKSPACE.is_dir():
+        die(
+            f"neither {STRADDLE_MOUNT_ROOT} nor {WORKSPACE} mounted — "
+            "is the container running with -v <ws>:/workspace and the "
+            "per-straddle -v <src>:/work/<name> mounts?"
+        )
+
+    def collect(root: Path, skip_link: bool) -> None:
+        if not root.is_dir():
+            return
+        for child in sorted(root.iterdir()):
+            if skip_link and child.name.endswith(".link"):
+                continue
+            if not child.is_dir():
+                continue
+            m_path = child / "straddle.yaml"
+            if not m_path.is_file():
+                continue
+            m = load_manifest(m_path)
+            if m.name in found:
+                die(f"two straddles claim the same name '{m.name}':\n  {found[m.name].path}\n  {m.path}")
+            found[m.name] = m
+
+    collect(STRADDLE_MOUNT_ROOT, skip_link=False)
+    collect(WORKSPACE, skip_link=True)
     return found
 
 
@@ -131,27 +167,27 @@ def resolve_requires(
     missing_ok: bool = False,
     excluded: set[str] | None = None,
     included: set[str] | None = None,
-    include_all_extras: bool = False,
 ) -> tuple[list[Manifest], list[str]]:
-    """Walk requires:, optional_requires:, and extra_requires: transitively.
+    """Walk requires: and optional_requires: transitively, plus any
+    user-named `included` straddles as extra roots.
 
-    Three tiers in the manifest:
+    Two tiers in the manifest:
       requires:           hard — always pulled in, missing = error
       optional_requires:  soft, default-on — pruned silently if absent/excluded
-      extra_requires:     soft, default-OFF — only pulled in when explicitly
-                          included via --include <name> or --include-all
+
+    `included` (from --include <name>) seeds the walk with additional roots
+    treated as soft: their own requires: / optional_requires: are followed
+    transitively just like the buildable's own. The caller is responsible
+    for ensuring every name in `included` is on disk (the host-side build
+    dispatcher pre-clones slash-form --includes; bare-form is validated
+    against the workspace).
 
     Missing behavior:
       Hard requires: missing → die (unless missing_ok, then collected).
-      Soft (optional or extra) missing from workspace: if missing_ok, COLLECTED
-        for cloning (a soft dep that's wanted-this-build but not yet cloned
-        should still get fetched); otherwise silently skipped.
-      Excluded: silently dropped, no recursion.
-
-    `excluded` overrides everything else: if a name is excluded *and* it's
-    listed as a hard requires:, that's contradictory and errors. extras only
-    arrive in the staged set when `include_all_extras` is true OR the name
-    is in `included`.
+      Soft optional missing from workspace: if missing_ok, COLLECTED for
+        cloning; otherwise silently skipped.
+      Excluded: silently dropped, no recursion. Excluding a hard
+        requires: target is contradictory and errors.
     """
     excluded = excluded or set()
     included = included or set()
@@ -191,10 +227,6 @@ def resolve_requires(
             visit(dep, bare, hard=True)
         for dep in all_straddles[bare].optional_requires:
             visit(dep, bare, hard=False)
-        # extra_requires are NOT followed transitively — they're only honoured
-        # at the level where the user explicitly named them (i.e., the buildable's
-        # own manifest). This keeps "extra" meaning "you have to ask for this",
-        # not "comes along for the ride".
         on_stack.discard(bare)
         seen.add(bare)
         out.append(all_straddles[bare])
@@ -203,15 +235,8 @@ def resolve_requires(
         visit(r, proj.name, hard=True)
     for r in proj.optional_requires:
         visit(r, proj.name, hard=False)
-    for r in proj.extra_requires:
-        bare = r.split("@", 1)[0]
-        if include_all_extras or bare in included:
-            visit(r, proj.name, hard=False)
-        elif missing_ok:
-            # get-deps default: also clone extras so the user can `--include`
-            # them later without re-fetching. They're cheap to have on disk.
-            if bare not in all_straddles and bare not in missing:
-                missing[bare] = r
+    for r in included:
+        visit(r, f"{proj.name} (--include)", hard=False)
     return out, list(missing.values())
 
 
@@ -228,10 +253,12 @@ def _repo(bare_name: str) -> str:
 def effective_requires(m: Manifest, staged_repos: set[str]) -> list[str]:
     """Cross-straddle REQUIRES list for one component, in repo-only form.
 
-    = hard requires + (optional_requires ∩ staged) + (extra_requires ∩ staged),
-    order-preserved, deduped. Anything in the staged set that this straddle
-    declared as a dep — at any tier — flows into its CMake REQUIRES so the
-    include paths line up.
+    = hard requires + (optional_requires ∩ staged), order-preserved, deduped.
+    Anything in the staged set that this straddle declared as a dep flows
+    into its CMake REQUIRES so the include paths line up. Straddles added
+    via --include don't appear here directly — they enter the staged set,
+    and any straddle that declares them in its own requires/optional_requires
+    picks them up through that path.
     """
     out: list[str] = []
     seen: set[str] = set()
@@ -240,10 +267,6 @@ def effective_requires(m: Manifest, staged_repos: set[str]) -> list[str]:
         if r not in seen:
             seen.add(r); out.append(r)
     for spec in m.optional_requires:
-        r = _repo(_bare(spec))
-        if r in staged_repos and r not in seen:
-            seen.add(r); out.append(r)
-    for spec in m.extra_requires:
         r = _repo(_bare(spec))
         if r in staged_repos and r not in seen:
             seen.add(r); out.append(r)
@@ -557,26 +580,25 @@ def cmd_build(args: argparse.Namespace) -> int:
         if getattr(args, f"no_{short}", False):
             excluded.add(full)
 
-    # --include (and --include-all) → opt in to extra_requires.
+    # --include → pull additional straddles into the build. Slash-form is
+    # trusted (the host dispatcher pre-clones missing ones); bare-form must
+    # resolve to a workspace straddle.
     included: set[str] = set()
     for raw in (args.include or []):
         included.add(_resolve_org_repo(raw, all_straddles, "--include"))
-    include_all = bool(getattr(args, "include_all", False))
 
     # --flash-size validation.
     if args.flash_size is not None and args.flash_size not in _VALID_FLASH_MB:
         die(f"--flash-size {args.flash_size}: choose one of {_VALID_FLASH_MB}")
 
     deps, _ = resolve_requires(
-        proj, all_straddles,
-        excluded=excluded, included=included, include_all_extras=include_all,
+        proj, all_straddles, excluded=excluded, included=included,
     )
     signal_preamble(proj, deps)
     if excluded:
         print(f"excluded:  {', '.join(sorted(excluded))}", file=sys.stderr)
-    if included or include_all:
-        print(f"included:  {'all extras' if include_all else ', '.join(sorted(included))}",
-              file=sys.stderr)
+    if included:
+        print(f"included:  {', '.join(sorted(included))}", file=sys.stderr)
     if args.flash_size is not None:
         print(f"flash:     {args.flash_size} MB (--flash-size override)", file=sys.stderr)
     stage_components(proj, deps)
@@ -666,6 +688,22 @@ def cmd_list_deps(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_list_requires(args: argparse.Namespace) -> int:
+    """Print the project's full transitive requires set (resolved, present).
+
+    One `<org>/<repo>` per line, in dependency order. Skips the project
+    itself. Optional requires that aren't present are silently dropped
+    (same semantics as `build` without --no-X). Used by `spangap init`
+    to drop visibility `.link` symlinks for every straddle a build of
+    this project would touch.
+    """
+    proj = find_project()
+    deps, _ = resolve_requires(proj, scan_workspace_straddles())
+    for d in deps:
+        print(d.name)
+    return 0
+
+
 def cmd_reallyclean(args: argparse.Namespace) -> int:
     """Source-only state: drop idf build/, staging/, browser node_modules/, dist/, .quasar."""
     proj = find_project()
@@ -708,7 +746,7 @@ def cmd_claude(claude_args: list[str]) -> int:
 
 # ---------------------------------------------------------------------------
 # `spangap cli` — TCP CLI client. Same UX as the host-side `spangap cli`:
-# -h persists hostname to /work/.spangap-host (= $SPANGAP_WORKSPACE/.spangap-host
+# -h persists hostname to /workspace/.spangap-host (= $SPANGAP_WORKSPACE/.spangap-host
 # on the host through the bind mount), subsequent calls can omit it.
 # ---------------------------------------------------------------------------
 PROMPT = b"$ "
@@ -808,12 +846,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_build.add_argument(
         "-i", "--include", action="append", default=[], metavar="STRADDLE",
-        help="add an extra_requires: straddle to this build (repeatable; <org>/<repo> "
-             "or bare <repo>). Without this flag, extra_requires entries are absent.",
-    )
-    p_build.add_argument(
-        "--include-all", action="store_true",
-        help="add every extra_requires: entry of the buildable.",
+        help="pull an extra straddle into this build (repeatable). Bare "
+             "<repo> must already be a workspace sibling; <org>/<repo> "
+             "form is auto-cloned from github if missing.",
     )
     p_build.add_argument(
         "--flash-size", type=int, default=None, metavar="MB",
@@ -839,6 +874,11 @@ def main(argv: list[str] | None = None) -> int:
         "list-deps",
         help="print transitive requires: not yet present as workspace siblings (used by host-side `spangap get-deps`)",
     ).set_defaults(func=cmd_list_deps)
+
+    sub.add_parser(
+        "list-requires",
+        help="print the project's full transitive requires set (used by `spangap init` to drop visibility .link symlinks)",
+    ).set_defaults(func=cmd_list_requires)
 
     args = p.parse_args(argv)
     return args.func(args)

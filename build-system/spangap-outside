@@ -220,7 +220,14 @@ kill_monitor() {
     # `python -m esp_idf_monitor`, so the module name (underscored) is
     # what appears in /proc/*/cmdline. Pattern accepts either spelling
     # in case a future version ships a script.
-    pkill -f 'esp[-_]idf[-_]monitor' 2>/dev/null || true
+    #
+    # Anchor on the leading executable so we kill ONLY the python child,
+    # not the `script -q $fifo <python> -m esp_idf_monitor ...` wrapper
+    # (whose own argv contains the python invocation as a substring).
+    # SIGTERMing `script` directly makes the parent bash print
+    # "Terminated: 15" when its subshell dies by signal; killing only the
+    # child lets script exit cleanly with the child's status, no message.
+    pkill -f '^[^ ]*python[^ ]* -m esp[-_]idf[-_]monitor' 2>/dev/null || true
 }
 
 # run_monitor <port> <fw> <log> [extra-flags]: foreground esp-idf-monitor in

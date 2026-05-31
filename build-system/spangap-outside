@@ -47,6 +47,13 @@
 # invocations read whichever file's there.
 set -euo pipefail
 
+# Silence Docker CLI's "What's next:" hint footer, which the docker CLI prints
+# after `docker run`/`docker exec` completes. We wrap every device/build verb in
+# a docker-exec, so without this the hint trails the output of innocuous
+# commands (e.g. a mistyped `spangap flsh`'s usage error). Exported once here so
+# all docker invocations below inherit it.
+export DOCKER_CLI_HINTS=false
+
 IMAGE="${SPANGAP_IMAGE:-spangap-build-env:dev}"
 workspace="${SPANGAP_WORKSPACE:?spangap-outside: SPANGAP_WORKSPACE not set (invoke via the root \`spangap\` script)}"
 

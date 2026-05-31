@@ -61,6 +61,28 @@
       },
       "default": []
     },
+    "init": {
+      "description": "Boot init hooks this straddle wants the buildable to run automatically. spangap-inside collects these across the staged set and generates staging/spangap_init_dispatch.gen.cpp — a spangapInitStraddles() that calls each in (order, dependency-topo) order. The buildable calls spangapInitStraddles() once; from then on, staging a straddle that declares init: is enough to have it initialize — no consumer main.cpp edit. Each entry's `call` must be an `extern \"C\" void <name>(void)` defined in this straddle's firmware half (the dispatcher emits its own forward declaration, so no header wiring is needed).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["call"],
+        "properties": {
+          "call": {
+            "description": "Init function symbol, e.g. 'sshdInit'. Must be `extern \"C\" void <name>(void)`.",
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "order": {
+            "description": "Sort key, ascending (earlier runs first). Ties broken by dependency-topo order (a straddle inits after the straddles it requires:). Default 100. Suggested bands: <50 network bring-up, 100 services (default), >150 app-layer.",
+            "type": "integer",
+            "default": 100
+          }
+        }
+      },
+      "default": []
+    },
     "buildable": {
       "description": "Top-level config for straddles that build a flashable device image. Its presence is the flag we key on to decide what's buildable — library / feature straddles omit this block entirely.",
       "type": "object",

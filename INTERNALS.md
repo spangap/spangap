@@ -99,6 +99,23 @@ the source dir's contents plus two generated files:
   automatically from any component, so the corresponding `CONFIG_*` symbols
   are visible to every source file and every CMakeLists `if(CONFIG_*)`.
 
+- A generated **`staging/spangap_init_dispatch.gen.cpp`** defines
+  `spangapInitStraddles()` — the auto-init dispatcher. spangap-inside collects
+  the `init:` hooks every staged straddle declares in its `straddle.yaml`
+  (`init: [{call: <fn>, order: <n>}]`) and emits a forward decl + call for
+  each, ordered by `(order, dependency-topo)` (ties fall back to the resolved
+  dep order, so a straddle inits after the ones it `requires:`). The buildable
+  adds this file to its `main` component `SRCS` (guarded on `EXISTS`) and calls
+  `spangapInitStraddles()` once from `app_main`. **This is how a straddle
+  initializes without any edit to the consumer's `main.cpp`:** declaring
+  `init:` is sufficient — `spangap build --include spangap/sshd` brings sshd
+  up, and the default-on `wg`/`upnp`/`duckdns`/`maps` are initialized the same
+  way. Decls carry default (C++) linkage to match the `void xInit()` header
+  convention; the dispatcher references each symbol directly (so static-lib
+  linker GC can't drop it) and includes no per-straddle header (an `--include`d
+  straddle's `include/` dir may be off the `main` path, but its lib is on the
+  link line). A `.c`-defined init needs an `extern "C"` wrapper to match.
+
 - A separate generated file, **`staging/sdkconfig.spangap-overrides`**, is
   the highest-priority entry in `SDKCONFIG_DEFAULTS`. spangap-inside writes
   CLI-driven Kconfig values into it (today: `--flash-size`; eventually also

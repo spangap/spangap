@@ -327,7 +327,7 @@ _GEN_HEADER_KCONFIG = (
 
 
 def _name_to_kconfig(repo: str) -> str:
-    """spangap-lcd → SPANGAP_LCD, reticulous-tdeck → RETICULOUS_TDECK."""
+    """spangap-lcd → SPANGAP_LCD, hw-tdeck → HW_TDECK."""
     return repo.upper().replace("-", "_").replace(".", "_")
 
 
@@ -997,10 +997,25 @@ def cmd_cli(argv: list[str]) -> int:
             die("spangap cli: no host — pass -h <host> first to persist it")
     port = int(os.environ.get("SPANGAP_CLI_PORT", "2323"))
 
+    # Inside the container we can't route to the device's LAN directly — reach
+    # it through the host-side relay (spangap-outside's ensure_forwarder), which
+    # forwards host.docker.internal:<port> → $SPANGAP_HOST. The resolved `host`
+    # above is still required (it's what the relay dials, persisted via -h /
+    # .spangap-host) but the actual connection target is host.docker.internal.
+    # On a native-Linux host there's no relay and host.docker.internal isn't
+    # injected; there the bridge network reaches the LAN directly, so fall back
+    # to dialing the device host itself.
+    connect_host = host
     try:
-        s = socket.create_connection((host, port), timeout=10)
+        socket.getaddrinfo("host.docker.internal", port)
+        connect_host = "host.docker.internal"
+    except OSError:
+        pass
+
+    try:
+        s = socket.create_connection((connect_host, port), timeout=10)
     except OSError as e:
-        die(f"cli: connect {host}:{port}: {e}")
+        die(f"cli: connect {connect_host}:{port} (relay → {host}): {e}")
     s.settimeout(None)
 
     def drain():
@@ -1017,8 +1032,13 @@ def cmd_cli(argv: list[str]) -> int:
         drain()
         s.sendall((" ".join(rest) + "\n").encode())
         out = drain()
-        if out.endswith(PROMPT):
-            out = out[: -len(PROMPT)]
+        # Filter the trailing prompt line. drain() returns the moment the buffer
+        # ends with the device's prompt, and that prompt is a whole line —
+        # "<name> $ " (e.g. "reticulous $ "), not a bare "$ " — so the final
+        # line is always the re-emitted prompt. Drop everything after the last
+        # newline; if there's none, the whole response was just the prompt.
+        nl = out.rfind(b"\n")
+        out = out[: nl + 1] if nl != -1 else b""
         sys.stdout.buffer.write(out)
         sys.stdout.flush()
         return 0

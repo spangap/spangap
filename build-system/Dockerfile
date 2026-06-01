@@ -29,14 +29,22 @@ RUN set -eux; \
 
 # Cairo runtime + handy tools. python3-pip because the base image installs
 # IDF's Python venv at /opt/esp/python_env but doesn't put pip3 on system PATH.
+# iproute2 (`ip`) + netcat-openbsd (`nc`, supports -z/-v) + iputils-ping
+# (`ping`) for diagnosing container→device network reach — the build container
+# uses host networking (see spangap-outside ensure_container), so these are how
+# you confirm it can actually hit a LAN device (ICMP) and its TCP CLI from
+# inside.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         libcairo2 \
         ccache \
         git \
+        iproute2 \
+        iputils-ping \
         jq \
         less \
+        netcat-openbsd \
         sudo \
         vim-tiny \
         python3-pip; \

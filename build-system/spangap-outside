@@ -69,6 +69,7 @@ workspace="${SPANGAP_WORKSPACE:?spangap-outside: SPANGAP_WORKSPACE not set (invo
 # the caller sets it in the environment (used by `spangap init` to gate the
 # docker build noise behind -v/--verbose).
 SPANGAP_QUIET=${SPANGAP_QUIET:-}
+
 case "${1:-}" in
     build|reset)
         SPANGAP_QUIET=1
@@ -246,6 +247,13 @@ resolve_firmware_dir() {
 # stays workspace-wide.
 PORT_FILE="$workspace/.spangap-port-$(uname -s)-$(uname -m)"
 HOST_FILE="$workspace/.spangap-host"
+
+# Host-side LAN relay (see ensure_forwarder). Script is workspace-wide (static
+# content); pid/log are per-host since the relay is a host-local process — a
+# workspace shared across machines would otherwise clash on one pidfile.
+FORWARD_SCRIPT="$workspace/.spangap-forward.py"
+FORWARD_PID="$workspace/.spangap-forward-$(uname -s)-$(uname -m).pid"
+FORWARD_LOG="$workspace/.spangap-forward-$(uname -s)-$(uname -m).log"
 
 # Local-repo override: $workspace/.spangap-repo_path holds one host path —
 # a flat checkout whose <repo>/ children are the straddles. Instead of
@@ -769,7 +777,13 @@ if argv:
     drain_until_prompt(s)
     s.sendall((" ".join(argv) + "\n").encode())
     out = drain_until_prompt(s)
-    if out.endswith(PROMPT): out = out[:-len(PROMPT)]
+    # Filter the trailing prompt line. drain returns the moment the buffer ends
+    # with the prompt, and that prompt is a whole line — "<name> $ " (e.g.
+    # "reticulous $ "), not a bare "$ " — so the final line is always the
+    # re-emitted prompt. Drop everything after the last newline; none ⇒ the
+    # whole response was just the prompt.
+    nl = out.rfind(b"\n")
+    out = out[:nl + 1] if nl != -1 else b""
     sys.stdout.buffer.write(out); sys.stdout.flush()
     sys.exit(0)
 
@@ -832,8 +846,115 @@ ensure_daemon() {
     esac
 }
 
+# Drop the pure-stdlib python TCP relay to disk (idempotent — content is
+# static, so an unconditional rewrite is cheaper than a compare). Listens on
+# 0.0.0.0:<port> for each forwarded port and splices each accepted connection
+# to <device>:<same-port>. Bind 0.0.0.0 (not loopback) so Docker Desktop's
+# host.docker.internal gateway can reach it; this is a dev relay to a device
+# already on the LAN, so it widens nothing. Threads, no deps.
+write_forward_script() {
+    cat > "$FORWARD_SCRIPT" <<'PY'
+import socket, sys, threading, signal
+
+def pipe(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try: dst.shutdown(socket.SHUT_WR)
+        except OSError: pass
+
+def handle(client, dhost, dport):
+    try:
+        up = socket.create_connection((dhost, dport), timeout=10)
+    except OSError as e:
+        print(f"spangap-forward: {dhost}:{dport}: {e}", flush=True)
+        client.close()
+        return
+    t = threading.Thread(target=pipe, args=(client, up), daemon=True)
+    t.start()
+    pipe(up, client)
+    client.close(); up.close()
+
+def serve(lport, dhost, dport):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("0.0.0.0", lport))
+    except OSError as e:
+        print(f"spangap-forward: bind :{lport}: {e}", flush=True)
+        return
+    srv.listen(64)
+    while True:
+        try:
+            client, _ = srv.accept()
+        except OSError:
+            return
+        threading.Thread(target=handle, args=(client, dhost, dport),
+                         daemon=True).start()
+
+host = sys.argv[1]
+ports = [int(p) for p in sys.argv[2:]]
+for p in ports:
+    threading.Thread(target=serve, args=(p, host, p), daemon=True).start()
+print(f"spangap-forward: relaying {ports} -> {host}", flush=True)
+signal.pause()
+PY
+}
+
+# Host-side LAN relay (Docker Desktop / macOS only). A container there can't
+# route to the Mac's LAN segment — "host" networking is the VM's namespace and
+# gvproxy proxies internet egress but not the host's local subnet (see the
+# docker run comment). So the in-container ssh/cli straddles reach the device by
+# connecting to host.docker.internal:<port>, where this relay — running on the
+# Mac, the one machine actually on that LAN — accepts and splices to the device.
+# Forwards $SPANGAP_HOST ports 2323 (TCP CLI) and 22 (ssh) by default; override
+# with SPANGAP_FORWARD_PORTS. Idempotent: a re-run is a liveness check and only
+# restarts when the device host or port set changed. Darwin-only — on a native
+# Linux host the bridge network reaches the LAN directly, so no relay is needed.
+ensure_forwarder() {
+    [ "$(uname -s 2>/dev/null)" = Darwin ] || return 0
+    # No device configured yet ⇒ nothing to relay. Silent: the relay only
+    # becomes meaningful once spangap is pointed at a device (-h / SPANGAP_HOST).
+    local host=${SPANGAP_HOST:-}
+    [ -z "$host" ] && [ -f "$HOST_FILE" ] && host=$(cat "$HOST_FILE")
+    [ -z "$host" ] && return 0
+
+    local ports="${SPANGAP_FORWARD_PORTS:-2323 22}"
+    ports=$(printf '%s' "$ports" | tr ',' ' ')
+    local want="$host $ports"
+
+    # pidfile is two lines: pid, then the "host ports" it was started for.
+    if [ -f "$FORWARD_PID" ]; then
+        local pid have
+        pid=$(sed -n 1p "$FORWARD_PID" 2>/dev/null)
+        have=$(sed -n 2p "$FORWARD_PID" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            [ "$have" = "$want" ] && return 0
+            kill "$pid" 2>/dev/null || true   # device/ports changed — restart
+        fi
+    fi
+
+    command -v python3 >/dev/null 2>&1 || {
+        log "skipping LAN relay: python3 not on PATH"
+        return 0
+    }
+    write_forward_script
+    # shellcheck disable=SC2086
+    nohup python3 "$FORWARD_SCRIPT" "$host" $ports >"$FORWARD_LOG" 2>&1 &
+    local pid=$!
+    printf '%s\n%s\n' "$pid" "$want" > "$FORWARD_PID"
+    log "LAN relay up (pid $pid): host.docker.internal:{$ports} → $host"
+}
+
 ensure_container() {
     ensure_daemon
+    ensure_forwarder
 
     # The spangap build-system straddle (Dockerfile + build-system/) is the
     # build context. With a flat repo_path it lives at <repo_path>/spangap;
@@ -941,6 +1062,16 @@ ensure_container() {
     # with "unbound variable" — only bash 4+ treats it as zero words.
     # The `${name[@]+"${name[@]}"}` idiom expands to nothing when the
     # array is empty and to the elements otherwise, on both versions.
+    #
+    # No --network=host. On Docker Desktop (Mac/Windows) it's a no-op for our
+    # purposes: "host" is the Linux VM's namespace, not the Mac's, so it never
+    # reaches the Mac's LAN segment (e.g. the ESP32's TCP CLI) — the VM has no
+    # route to it, and gvproxy proxies internet egress but not the host's local
+    # subnet. The container reaches a LAN device by relaying through the Mac at
+    # host.docker.internal (a host-side forwarder → device), which works on the
+    # default bridge network without host networking. On a native-Linux host
+    # --network=host *would* bridge to the LAN, but there the device is reachable
+    # directly anyway. Either way the flag buys nothing, so it's gone.
     docker run -d --name "$container" \
         -v "$workspace:/workspace" \
         -v "$spangap_home:/home/ubuntu" \

@@ -62,7 +62,7 @@
       "default": []
     },
     "init": {
-      "description": "Boot init hooks this straddle wants the buildable to run automatically. spangap-inside collects these across the staged set and generates staging/spangap_init_dispatch.gen.cpp — a spangapInitStraddles() that calls each in (order, dependency-topo) order. The buildable calls spangapInitStraddles() once; from then on, staging a straddle that declares init: is enough to have it initialize — no consumer main.cpp edit. Each entry's `call` must be an `extern \"C\" void <name>(void)` defined in this straddle's firmware half (the dispatcher emits its own forward declaration, so no header wiring is needed).",
+      "description": "Boot init hooks this straddle wants the buildable to run automatically. spangap-inside collects these across the staged set and generates staging/spangap_init_dispatch.gen.cpp — a spangapInitStraddles() that calls each in (order, dependency-topo) order. The buildable calls spangapInitStraddles() once; from then on, staging a straddle that declares init: is enough to have it initialize — no consumer main.cpp edit. Each entry's `call` is a plain global `void <name>()` defined in this straddle's firmware half (the dispatcher emits its own C++-linkage forward declaration, so no header wiring and no `extern \"C\"` is needed).",
       "type": "array",
       "items": {
         "type": "object",
@@ -70,7 +70,7 @@
         "required": ["call"],
         "properties": {
           "call": {
-            "description": "Init function symbol, e.g. 'sshdInit'. Must be `extern \"C\" void <name>(void)`.",
+            "description": "Init function symbol, e.g. 'sshdInit'. A plain global `void <name>()` (default C++ linkage) defined in this straddle's firmware half — the same convention every straddle's xInit() already follows. The dispatcher forward-declares it with C++ linkage and calls it, so no header wiring and no `extern \"C\"` wrapper is needed (a C-linkage symbol from a .c file would need one to match).",
             "type": "string",
             "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
           },

@@ -39,6 +39,29 @@ REPOS = Path("/repos")
 STRADDLE_ROOTS = (REPOS, WORKSPACE)
 HOST_FILE = WORKSPACE / ".spangap-host"
 
+# spangap-core is the implicit platform foundation. Its prefix is "" — its
+# symbols (storageGet, cliRegister, info, …) read as language primitives, so
+# every straddle links it the way C code links libc: you never declare it. The
+# build always stages it (it can't be --exclude'd) and auto-injects it into
+# every component's cross-straddle REQUIRES. No straddle.yaml lists it.
+CORE_NAME = "spangap/spangap-core"
+
+# spangap's own platform components, brought up first and in exactly this order
+# by the generated dispatcher (each only if staged), ahead of every other
+# straddle. The contract: anything the dispatcher starts after this band can
+# count on the whole spangap ecosystem — storage/cron, networking, the web
+# stack, the LCD launcher — already being up, so it never has to defer, retry,
+# or order itself against them. core leads (it's the foundation), then net
+# (services need the IP stack), then web (needs net), then lcd (its status bar
+# reads net/storage/web state). Everything not in this list is a plain straddle
+# ordered only by its declared requires: (see write_init_dispatch).
+PLATFORM_ORDER = [
+    CORE_NAME,
+    "spangap/spangap-net",
+    "spangap/spangap-web",
+    "spangap/spangap-lcd",
+]
+
 
 class Manifest:
     """Validated straddle.yaml plus its on-disk location."""
@@ -205,48 +228,59 @@ def resolve_requires(
     missing_ok: bool = False,
     excluded: set[str] | None = None,
     included: set[str] | None = None,
+    dropped_out: set[str] | None = None,
 ) -> tuple[list[Manifest], list[str]]:
-    """Walk requires: and optional_requires: transitively, plus any
-    user-named `included` straddles as extra roots.
+    """Walk requires: and optional_requires: transitively, plus the implicit
+    spangap-core foundation and any user-named `included` straddles as extra
+    roots, then apply --exclude with dependent-cascade.
 
     Two tiers in the manifest:
       requires:           hard — always pulled in, missing = error
       optional_requires:  soft, default-on — pruned silently if absent/excluded
 
-    `included` (from --include <name>) seeds the walk with additional roots
-    treated as soft: their own requires: / optional_requires: are followed
-    transitively just like the buildable's own. The caller is responsible
-    for ensuring every name in `included` is on disk (the host-side build
-    dispatcher pre-clones slash-form --includes; bare-form is validated
-    against the workspace).
+    spangap-core is always an implicit hard root (see CORE_NAME) and sorts to
+    the head of the topo order. `included` (from --include <name>) seeds the
+    walk with additional roots treated as soft. The caller ensures every
+    `included` name is on disk (the host-side build dispatcher pre-clones
+    slash-form --includes; bare-form is validated against the workspace).
+
+    Exclude semantics (the cascade):
+      Excluding X also drops every straddle that hard-`requires:` X — it can't
+      build without X — and so on transitively (reverse-dependency closure).
+      Optional dependents don't cascade: they just lose the integration.
+      Forward-orphans (straddles left reachable only through a dropped one)
+      are pruned too. The drop is rejected only when it would remove a
+      *mandatory* straddle — spangap-core or anything in the buildable's hard
+      requires: closure — which is a genuine conflict, not a droppable option.
 
     Missing behavior:
       Hard requires: missing → die (unless missing_ok, then collected).
       Soft optional missing from workspace: if missing_ok, COLLECTED for
         cloning; otherwise silently skipped.
-      Excluded: silently dropped, no recursion. Excluding a hard
-        requires: target is contradictory and errors.
+
+    If `dropped_out` is provided, it's filled with every staged-by-default
+    straddle the exclude pass removed (cascade + orphans + the named targets),
+    so the caller can report what an --exclude actually took with it.
     """
-    excluded = excluded or set()
+    excluded = set(excluded or set())
     included = included or set()
+
+    if CORE_NAME in excluded:
+        die(
+            f"{CORE_NAME} is the platform foundation (its empty-prefix symbols "
+            "read as language primitives) — it's always staged and can't be "
+            "--exclude'd."
+        )
+
     out: list[Manifest] = []
     seen: set[str] = set()
     on_stack: set[str] = set()
     missing: dict[str, str] = {}
+    hard_deps: dict[str, set[str]] = {}  # name → bare names of its hard requires:
 
     def visit(spec: str, requested_by: str, hard: bool) -> None:
-        bare = spec.split("@", 1)[0]
-        if bare in seen:
-            return
-        if bare in excluded:
-            if hard:
-                die(
-                    f"--exclude: {bare} was dropped, but {requested_by} lists it "
-                    f"under `requires:` (hard). Either don't exclude it, or "
-                    f"reclassify it as optional in {requested_by}'s straddle.yaml."
-                )
-            return  # soft drop
-        if bare in missing:
+        bare = _bare(spec)
+        if bare in seen or bare in missing:
             return
         if bare in on_stack:
             die(f"requires: cycle through {bare} (from {requested_by})")
@@ -261,21 +295,98 @@ def resolve_requires(
                 )
             return  # build path: soft + absent → silently skip
         on_stack.add(bare)
+        hd: set[str] = set()
         for dep in all_straddles[bare].requires:
+            hd.add(_bare(dep))
             visit(dep, bare, hard=True)
         for dep in all_straddles[bare].optional_requires:
             visit(dep, bare, hard=False)
         on_stack.discard(bare)
         seen.add(bare)
+        hard_deps[bare] = hd
         out.append(all_straddles[bare])
 
+    # Implicit core first, so the foundation heads the topo order; then the
+    # buildable's own roots. The full closure is built ignoring excludes —
+    # the exclude pass below prunes it, so cascade/orphan logic sees the whole
+    # graph.
+    if proj.name != CORE_NAME:
+        visit(CORE_NAME, f"{proj.name} (implicit core)", hard=True)
     for r in proj.requires:
         visit(r, proj.name, hard=True)
     for r in proj.optional_requires:
         visit(r, proj.name, hard=False)
     for r in included:
         visit(r, f"{proj.name} (--include)", hard=False)
-    return out, list(missing.values())
+
+    # Mandatory = spangap-core + the buildable's hard requires:, transitively.
+    # Never droppable; excluding one (or anything it hard-requires) is a conflict.
+    mandatory: set[str] = set()
+
+    def mark_mandatory(bare: str) -> None:
+        if bare in mandatory or bare not in hard_deps:
+            return
+        mandatory.add(bare)
+        for d in hard_deps[bare]:
+            mark_mandatory(d)
+
+    if proj.name != CORE_NAME:
+        mark_mandatory(CORE_NAME)
+    for r in proj.requires:
+        mark_mandatory(_bare(r))
+
+    # Reverse-dependency cascade: a straddle that hard-requires an excluded one
+    # can't build, so it drops too. Iterate to a fixpoint over the staged graph.
+    excl = {e for e in excluded if e in seen}  # excluding an absent straddle is a no-op
+    changed = True
+    while changed:
+        changed = False
+        for name in seen:
+            if name not in excl and hard_deps.get(name, set()) & excl:
+                excl.add(name)
+                changed = True
+
+    conflict = excl & mandatory
+    if conflict:
+        lines = []
+        for m in sorted(conflict):
+            if m in excluded:
+                why = "was --exclude'd directly"
+            else:
+                culprit = ", ".join(sorted(hard_deps.get(m, set()) & excl))
+                why = f"hard-requires excluded {culprit}"
+            lines.append(f"  - {m}: {why}")
+        die(
+            "--exclude conflict: these straddles are hard-required by "
+            f"{proj.name} and can't be dropped:\n" + "\n".join(lines) +
+            "\n       Reclassify them as optional_requires: to make them droppable."
+        )
+
+    # Forward-prune: keep only what's still reachable from the surviving roots
+    # over hard+optional edges, skipping the excluded set. Drops the named
+    # targets, their cascaded dependents, and any now-orphaned forward deps.
+    roots = ([CORE_NAME] if proj.name != CORE_NAME else [])
+    roots += [_bare(r) for r in proj.requires]
+    roots += [_bare(r) for r in proj.optional_requires]
+    roots += [_bare(r) for r in included]
+    reachable: set[str] = set()
+    stack = [r for r in roots if r in seen and r not in excl]
+    while stack:
+        n = stack.pop()
+        if n in reachable:
+            continue
+        reachable.add(n)
+        for dep in all_straddles[n].requires + all_straddles[n].optional_requires:
+            db = _bare(dep)
+            if db in seen and db not in excl and db not in reachable:
+                stack.append(db)
+
+    if dropped_out is not None:
+        dropped_out.clear()
+        dropped_out.update(m.name for m in out if m.name not in reachable)
+
+    final = [m for m in out if m.name in reachable]
+    return final, list(missing.values())
 
 
 def _bare(spec: str) -> str:
@@ -291,15 +402,22 @@ def _repo(bare_name: str) -> str:
 def effective_requires(m: Manifest, staged_repos: set[str]) -> list[str]:
     """Cross-straddle REQUIRES list for one component, in repo-only form.
 
-    = hard requires + (optional_requires ∩ staged), order-preserved, deduped.
-    Anything in the staged set that this straddle declared as a dep flows
-    into its CMake REQUIRES so the include paths line up. Straddles added
-    via --include don't appear here directly — they enter the staged set,
-    and any straddle that declares them in its own requires/optional_requires
-    picks them up through that path.
+    = implicit spangap-core + hard requires + (optional_requires ∩ staged),
+    order-preserved, deduped. Anything in the staged set that this straddle
+    declared as a dep flows into its CMake REQUIRES so the include paths line
+    up. Straddles added via --include don't appear here directly — they enter
+    the staged set, and any straddle that declares them in its own
+    requires/optional_requires picks them up through that path.
+
+    spangap-core leads the list for every component but core itself: its
+    empty-prefix API (spangap.h) is linked everywhere, so it's always in
+    REQUIRES even though no straddle.yaml declares it.
     """
     out: list[str] = []
     seen: set[str] = set()
+    if m.name != CORE_NAME:
+        core_repo = _repo(CORE_NAME)
+        seen.add(core_repo); out.append(core_repo)
     for spec in m.requires:
         r = _repo(_bare(spec))
         if r not in seen:
@@ -320,9 +438,9 @@ _GEN_HEADER_CMAKE = (
 _GEN_HEADER_KCONFIG = (
     "# AUTO-GENERATED by spangap-inside. Do not edit; regenerated each build.\n"
     "# Presence symbols for every staged straddle. The hidden STRADDLE_<NAME>\n"
-    "# generic is always emitted; SPANGAP_LCD / SPANGAP_WEB shortcuts are also\n"
-    "# emitted when those two central straddles are staged (source code gates\n"
-    "# on the shortcuts).\n"
+    "# generic is always emitted; the SPANGAP_<NAME> shortcuts (LCD / WEB / NET /\n"
+    "# OTA / WG / UPNP / DUCKDNS / ACME) are also emitted when those central\n"
+    "# straddles are staged (source code gates on the shortcuts).\n"
 )
 
 
@@ -356,6 +474,7 @@ def write_presence_component(staging: Path, staged: list[Manifest]) -> None:
     # repo → short-form Kconfig symbol (the alias used in #if statements).
     shortcut_aliases = {
         "spangap-lcd": "SPANGAP_LCD",
+        "spangap-net": "SPANGAP_NET",
         "spangap-web": "SPANGAP_WEB",
         "ota":         "SPANGAP_OTA",
         "wg":          "SPANGAP_WG",
@@ -483,16 +602,29 @@ def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
     spangapInitStraddles() dispatcher that calls every staged straddle's
     declared init: hooks.
 
-    Boot init is order-sensitive, so each hook carries an `order:` and we break
-    ties by the dependency-topo order `deps` already arrives in (a straddle
-    after the ones it requires:). We forward-declare each init symbol and call
-    it directly — referencing the symbol is what keeps it off the linker's
-    static-lib GC list (a self-registration constructor in an otherwise-
-    unreferenced TU would be dropped). No per-straddle header #include: an
-    `--include`d straddle isn't in the buildable's requires graph, so its
-    include/ dir isn't on the main component's path — but its component lib IS
-    on the link line, so a bare forward decl + call resolves at link time
-    regardless.
+    Two bands, no per-hook ordering knob:
+
+      1. Platform band — spangap's own components (PLATFORM_ORDER: core, net,
+         web, lcd), in exactly that order, each only if staged. This is the
+         fixed ecosystem bring-up; everything after it can assume it's up.
+      2. Straddle band — every other staged straddle, in the dependency-topo
+         order `deps` already arrives in (a straddle appears after the ones it
+         requires:). That's the whole ordering contract: a straddle that needs
+         another up first declares it in requires:/optional_requires: and the
+         topo walk handles it. No manual `order:` tuning — the platform band
+         removed the cross-cutting reason for it (e.g. "after lcdInit" / "after
+         the net foundation"), and genuine peer dependencies are expressed as
+         requires:.
+
+    Within one straddle, hooks fire in the order they're listed in its init:.
+
+    We forward-declare each init symbol and call it directly — referencing the
+    symbol is what keeps it off the linker's static-lib GC list (a self-
+    registration constructor in an otherwise-unreferenced TU would be dropped).
+    No per-straddle header #include: an `--include`d straddle isn't in the
+    buildable's requires graph, so its include/ dir isn't on the main
+    component's path — but its component lib IS on the link line, so a bare
+    forward decl + call resolves at link time regardless.
 
     Linkage: the decls are emitted with default (C++) linkage to match the
     convention every straddle follows today — a global `void xInit()` /
@@ -508,31 +640,43 @@ def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
     """
     if not proj.is_buildable:
         return
-    # (order, topo_index, call) — topo_index is the position in the resolved
-    # dep list, so ties within the same `order:` keep dependency order.
-    entries: list[tuple[int, int, str]] = []
+
+    calls: list[str] = []
     seen_calls: set[str] = set()
-    for idx, dep in enumerate(deps):
+
+    def emit(dep: Manifest) -> None:
         for hook in dep.init:
             call = hook["call"]
             if call in seen_calls:
                 continue
             seen_calls.add(call)
-            entries.append((int(hook.get("order", 100)), idx, call))
-    entries.sort(key=lambda e: (e[0], e[1]))
+            calls.append(call)
+
+    # Band 1: platform components, fixed order, only the staged ones.
+    by_name = {d.name: d for d in deps}
+    for pname in PLATFORM_ORDER:
+        dep = by_name.get(pname)
+        if dep is not None:
+            emit(dep)
+    # Band 2: every other straddle, in dependency-topo order.
+    for dep in deps:
+        if dep.name in PLATFORM_ORDER:
+            continue
+        emit(dep)
 
     # Forward decls carry default (C++) linkage to match the straddle init
     # convention (global `void xInit()` in a header, no extern "C"). The
     # dispatcher itself is extern "C" to match its spangap.h prototype — an
     # extern "C" function may freely call C++-linkage functions.
-    externs = "".join(f"void {c}(void);\n" for _, _, c in entries)
-    calls = "".join(f"    {c}();\n" for _, _, c in entries)
+    externs = "".join(f"void {c}(void);\n" for c in calls)
+    body_calls = "".join(f"    {c}();\n" for c in calls)
     body = (
         "/* AUTO-GENERATED by spangap-inside. Do not edit; regenerated each build.\n"
         " * spangapInitStraddles() calls every staged straddle's declared init:\n"
-        " * hooks, ordered by (order, dependency-topo). The buildable calls this\n"
-        " * once from app_main; adding a straddle that declares init: is then\n"
-        " * enough to have it initialize — no consumer edit.\n"
+        " * hooks: first spangap's own platform components (core, net, web, lcd)\n"
+        " * in that fixed order, then every other straddle in dependency-topo\n"
+        " * order. The buildable calls this once from app_main; adding a straddle\n"
+        " * that declares init: is then enough to have it initialize — no edit.\n"
         " *\n"
         " * Forward decls use default (C++) linkage — the init convention is a\n"
         " * global `void xInit()` with no extern \"C\". No header is included: an\n"
@@ -541,7 +685,7 @@ def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
         f"{externs}"
         "\n"
         'extern "C" void spangapInitStraddles(void) {\n'
-        f"{calls}"
+        f"{body_calls}"
         "}\n"
     )
     staging_dir = proj.firmware_dir / "staging"
@@ -699,6 +843,7 @@ def run_build_idf(args: list[str], cwd: Path, quiet: bool, env: dict[str, str] |
 _NO_SHORTHANDS = {  # --no-<x> maps to --exclude <bare>
     "lcd": "spangap/spangap-lcd",
     "web": "spangap/spangap-web",
+    "net": "spangap/spangap-net",
 }
 
 # Flash sizes the ESP-IDF `CONFIG_ESPTOOLPY_FLASHSIZE_*MB` choice supports.
@@ -723,10 +868,17 @@ _FLASH_LINE_RE = re.compile(
 )
 
 
-def write_sdkconfig_overrides(proj: Manifest, flash_mb: int | None) -> None:
+def write_sdkconfig_overrides(
+    proj: Manifest, flash_mb: int | None, extra_lines: list[str] | None = None
+) -> None:
     """Drop staging/sdkconfig.spangap-overrides — picked up by bootstrap.cmake
     as the highest-priority SDKCONFIG_DEFAULTS entry (first build / regen path).
     Always written (even if empty body) so bootstrap can rely on its presence.
+
+    `extra_lines` are raw `CONFIG_*=...` lines (e.g. the --lora* pin/type
+    switches) appended verbatim. Like all SDKCONFIG_DEFAULTS they seed a fresh
+    build / regen only; changing them against an existing sdkconfig needs a
+    `spangap clean` (or edit via `spangap menuconfig`).
 
     Also edits an existing sdkconfig in-place when --flash-size is given. IDF's
     SDKCONFIG_DEFAULTS only seeds on first build; once sdkconfig exists,
@@ -740,6 +892,7 @@ def write_sdkconfig_overrides(proj: Manifest, flash_mb: int | None) -> None:
     body: list[str] = []
     if flash_mb is not None:
         body.append(f"CONFIG_ESPTOOLPY_FLASHSIZE_{flash_mb}MB=y")
+    body.extend(extra_lines or [])
     text = (
         "# AUTO-GENERATED by spangap-inside. Reflects this build's CLI overrides.\n"
         "# Highest-priority SDKCONFIG_DEFAULTS entry — bootstrap.cmake picks it up\n"
@@ -763,6 +916,110 @@ def write_sdkconfig_overrides(proj: Manifest, flash_mb: int | None) -> None:
     kept = [ln for ln in existing.splitlines() if not _FLASH_LINE_RE.match(ln)]
     kept.append(target)
     sdkconfig.write_text("\n".join(kept) + "\n")
+
+
+# --lora* switches → CONFIG_LORA* override lines. tr-lora's Kconfig owns the
+# schema (4 radio slots on one shared SPI bus); these let a generic build set
+# pins/type without editing sdkconfig.defaults. Seed a fresh build (or after
+# `spangap clean`); for steady-state edits use `spangap menuconfig`.
+_LORA_RADIO_KINDS = (  # any RadioLib LoRa chip; → CONFIG_LORAn_RADIO_<UPPER>
+    "sx1261", "sx1262", "sx1268", "llcc68",          # SX126x
+    "sx1272", "sx1276", "sx1277", "sx1278",          # SX127x / RFM9x
+    "sx1280", "sx1281", "sx1282",                    # SX128x (2.4 GHz)
+    "lr1110", "lr1120", "lr1121", "lr2021",          # LR11x0 / LR2021
+)
+
+
+def _add_lora_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--lora-count", type=int, default=None, metavar="N",
+                   help="number of LoRa radios (0-4) → CONFIG_LORA_COUNT")
+    p.add_argument("--lora-spi", type=int, default=None, metavar="HOST",
+                   help="shared SPI host (1/2/3) → CONFIG_LORA_SPI_HOST")
+    p.add_argument("--lora-sck", type=int, default=None, metavar="PIN",
+                   help="shared SPI SCK pin → CONFIG_LORA_SCK_PIN")
+    p.add_argument("--lora-mosi", type=int, default=None, metavar="PIN",
+                   help="shared SPI MOSI pin → CONFIG_LORA_MOSI_PIN")
+    p.add_argument("--lora-miso", type=int, default=None, metavar="PIN",
+                   help="shared SPI MISO pin → CONFIG_LORA_MISO_PIN")
+    for i in range(4):
+        g = f"radio {i}"
+        p.add_argument(f"--lora{i}-cs", type=int, default=None, metavar="PIN",
+                       help=f"{g} CS/NSS pin")
+        p.add_argument(f"--lora{i}-dio1", type=int, default=None, metavar="PIN",
+                       help=f"{g} IRQ pin (DIO1/DIO0/IRQ per chip)")
+        p.add_argument(f"--lora{i}-busy", type=int, default=None, metavar="PIN",
+                       help=f"{g} BUSY pin (-1 for SX127x)")
+        p.add_argument(f"--lora{i}-rst", type=int, default=None, metavar="PIN",
+                       help=f"{g} RST pin (-1 if none)")
+        p.add_argument(f"--lora{i}-tcxo", type=int, default=None, metavar="MV",
+                       help=f"{g} TCXO control voltage in mV (0 = XTAL)")
+        p.add_argument(f"--lora{i}-dio2", action="store_true",
+                       help=f"{g} drives DIO2 as the RF switch (SX126x)")
+        p.add_argument(f"--lora{i}-rfsw-rx", type=int, default=None, metavar="PIN",
+                       help=f"{g} external RF-switch RX-enable GPIO")
+        p.add_argument(f"--lora{i}-rfsw-tx", type=int, default=None, metavar="PIN",
+                       help=f"{g} external RF-switch TX-enable GPIO")
+        p.add_argument(f"--lora{i}-radio", choices=_LORA_RADIO_KINDS, default=None,
+                       help=f"{g} chip (any RadioLib LoRa part)")
+
+
+def _lora_overrides(args: argparse.Namespace) -> list[str]:
+    lines: list[str] = []
+
+    def put(attr: str, conf: str) -> None:
+        v = getattr(args, attr, None)
+        if v is not None:
+            lines.append(f"{conf}={v}")
+
+    put("lora_count", "CONFIG_LORA_COUNT")
+    put("lora_spi", "CONFIG_LORA_SPI_HOST")
+    put("lora_sck", "CONFIG_LORA_SCK_PIN")
+    put("lora_mosi", "CONFIG_LORA_MOSI_PIN")
+    put("lora_miso", "CONFIG_LORA_MISO_PIN")
+    for i in range(4):
+        put(f"lora{i}_cs", f"CONFIG_LORA{i}_CS_PIN")
+        put(f"lora{i}_dio1", f"CONFIG_LORA{i}_DIO1_PIN")
+        put(f"lora{i}_busy", f"CONFIG_LORA{i}_BUSY_PIN")
+        put(f"lora{i}_rst", f"CONFIG_LORA{i}_RST_PIN")
+        put(f"lora{i}_tcxo", f"CONFIG_LORA{i}_TCXO_MV")
+        put(f"lora{i}_rfsw_rx", f"CONFIG_LORA{i}_RFSW_RX_PIN")
+        put(f"lora{i}_rfsw_tx", f"CONFIG_LORA{i}_RFSW_TX_PIN")
+        if getattr(args, f"lora{i}_dio2", False):
+            lines.append(f"CONFIG_LORA{i}_DIO2_RF_SWITCH=y")
+        kind = getattr(args, f"lora{i}_radio", None)
+        if kind is not None:
+            lines.append(f"CONFIG_LORA{i}_RADIO_{kind.upper()}=y")
+    return lines
+
+
+def cmd_menuconfig(args: argparse.Namespace) -> int:
+    """Stage the buildable's components, then run idf.py menuconfig on it
+    interactively. With --save, persist the result into the straddle's
+    sdkconfig.defaults via idf.py save-defconfig (the 'save as hw-whatever'
+    step)."""
+    proj = find_project()
+    if not proj.is_buildable:
+        die(
+            f"{proj.name} is not a buildable straddle (no `buildable:` block in straddle.yaml).\n"
+            "       `spangap menuconfig` configures a buildable straddle."
+        )
+    if not proj.has_firmware:
+        die(f"{proj.name}: firmware dir {proj.firmware_dir} has no CMakeLists.txt")
+
+    all_straddles = scan_workspace_straddles()
+    dropped: set[str] = set()
+    deps, _ = resolve_requires(
+        proj, all_straddles, excluded=set(), included=set(), dropped_out=dropped,
+    )
+    stage_components(proj, deps, log_staged=False)
+    write_sdkconfig_overrides(proj, None)
+
+    rc = run_idf(["menuconfig"], cwd=proj.firmware_dir)
+    if rc != 0 or not args.save:
+        return rc
+    print("spangap: writing minimal sdkconfig.defaults (idf.py save-defconfig)",
+          file=sys.stderr)
+    return run_idf(["save-defconfig"], cwd=proj.firmware_dir)
 
 
 def cmd_build(args: argparse.Namespace) -> int:
@@ -796,20 +1053,28 @@ def cmd_build(args: argparse.Namespace) -> int:
     if args.flash_size is not None and args.flash_size not in _VALID_FLASH_MB:
         die(f"--flash-size {args.flash_size}: choose one of {_VALID_FLASH_MB}")
 
+    dropped: set[str] = set()
     deps, _ = resolve_requires(
         proj, all_straddles, excluded=excluded, included=included,
+        dropped_out=dropped,
     )
     quiet = not args.verbose
     if not quiet:
         signal_preamble(proj, deps)
         if excluded:
             print(f"excluded:  {', '.join(sorted(excluded))}", file=sys.stderr)
+            cascaded = dropped - excluded
+            if cascaded:
+                print(f"cascade-dropped: {', '.join(sorted(cascaded))}", file=sys.stderr)
         if included:
             print(f"included:  {', '.join(sorted(included))}", file=sys.stderr)
         if args.flash_size is not None:
             print(f"flash:     {args.flash_size} MB (--flash-size override)", file=sys.stderr)
     stage_components(proj, deps, log_staged=not quiet)
-    write_sdkconfig_overrides(proj, args.flash_size)
+    lora_lines = _lora_overrides(args)
+    if not quiet and lora_lines:
+        print(f"lora:      {', '.join(lora_lines)}", file=sys.stderr)
+    write_sdkconfig_overrides(proj, args.flash_size, lora_lines)
     lint_cmakelists(proj, deps, all_straddles)
     return run_build_idf(args.idf_args or ["build"], cwd=proj.firmware_dir, quiet=quiet)
 
@@ -1090,8 +1355,9 @@ def main(argv: list[str] | None = None) -> int:
     p_build.add_argument(
         "-e", "--exclude", action="append", default=[], metavar="STRADDLE",
         help="drop a straddle from this build's staged set (repeatable; <org>/<repo> "
-             "or bare <repo>). Targets optional_requires: entries — excluding a hard "
-             "requires: is an error.",
+             "or bare <repo>). Cascades: every straddle that hard-requires the "
+             "target drops with it. Refused only if it would remove spangap-core "
+             "or a straddle the buildable hard-requires.",
     )
     p_build.add_argument(
         "-i", "--include", action="append", default=[], metavar="STRADDLE",
@@ -1111,8 +1377,21 @@ def main(argv: list[str] | None = None) -> int:
             f"--no-{short}", dest=f"no_{short}", action="store_true",
             help=f"shorthand for --exclude {full}",
         )
+    _add_lora_args(p_build)
     p_build.add_argument("idf_args", nargs="*", help="forwarded to idf.py")
     p_build.set_defaults(func=cmd_build)
+
+    p_mc = sub.add_parser(
+        "menuconfig",
+        help="interactive Kconfig editor (idf.py menuconfig) over the staged project",
+    )
+    p_mc.add_argument(
+        "--save", action="store_true",
+        help="after editing, write the minimal sdkconfig.defaults via "
+             "idf.py save-defconfig — persists the config into this straddle "
+             "(the 'clone hw-generic, configure, save as hw-whatever' step).",
+    )
+    p_mc.set_defaults(func=cmd_menuconfig)
 
     sub.add_parser(
         "flash",

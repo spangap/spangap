@@ -62,7 +62,7 @@
       "default": []
     },
     "init": {
-      "description": "Boot init hooks this straddle wants the buildable to run automatically. spangap-inside collects these across the staged set and generates staging/spangap_init_dispatch.gen.cpp — a spangapInitStraddles() that calls each in (order, dependency-topo) order. The buildable calls spangapInitStraddles() once; from then on, staging a straddle that declares init: is enough to have it initialize — no consumer main.cpp edit. Each entry's `call` is a plain global `void <name>()` defined in this straddle's firmware half (the dispatcher emits its own C++-linkage forward declaration, so no header wiring and no `extern \"C\"` is needed).",
+      "description": "Boot init hooks this straddle wants the buildable to run automatically. spangap-inside collects these across the staged set and generates staging/spangap_init_dispatch.gen.cpp — a spangapInitStraddles() that calls them in two bands: first spangap's own platform components (core, net, web, lcd) in that fixed order, then every other straddle in dependency-topo order (a straddle inits after the straddles it requires:). There is no per-hook order knob — a straddle that must come up after another declares it in requires:/optional_requires: and the topo walk handles it; everything in the straddle band can already assume the platform band is up. Within one straddle, hooks fire in listed order. The buildable calls spangapInitStraddles() once; from then on, staging a straddle that declares init: is enough to have it initialize — no consumer main.cpp edit. Each entry's `call` is a plain global `void <name>()` defined in this straddle's firmware half (the dispatcher emits its own C++-linkage forward declaration, so no header wiring and no `extern \"C\"` is needed).",
       "type": "array",
       "items": {
         "type": "object",
@@ -73,11 +73,6 @@
             "description": "Init function symbol, e.g. 'sshdInit'. A plain global `void <name>()` (default C++ linkage) defined in this straddle's firmware half — the same convention every straddle's xInit() already follows. The dispatcher forward-declares it with C++ linkage and calls it, so no header wiring and no `extern \"C\"` wrapper is needed (a C-linkage symbol from a .c file would need one to match).",
             "type": "string",
             "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
-          },
-          "order": {
-            "description": "Sort key, ascending (earlier runs first). Ties broken by dependency-topo order (a straddle inits after the straddles it requires:). Default 100. Suggested bands: <50 network bring-up, 100 services (default), >150 app-layer.",
-            "type": "integer",
-            "default": 100
           }
         }
       },

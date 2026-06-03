@@ -14,9 +14,15 @@ dependencies (other straddles, by `<namespace>/<name>`), and the
 build CLI stages everything into ESP-IDF's component graph at build
 time.
 
-Two manifest keys carry deps:
+`spangap-core` is the implicit foundation — its empty-prefix symbols read
+as language primitives, so it's always staged (and auto-added to every
+component's CMake REQUIRES) and never declared by anyone. Two manifest keys
+carry the rest of the deps:
 
-- **`requires:`** — hard. Missing one is a build error; can't be excluded.
+- **`requires:`** — hard. Missing one is a build error. Excluding one
+  cascades the drop to every straddle that hard-requires it (transitively);
+  the exclude is refused only when it would remove spangap-core or a
+  straddle the buildable itself hard-requires.
 - **`optional_requires:`** — soft, **default-on**. Pruned silently when
   the dep isn't in the staged set (not cloned, not in the buildable's
   requires, or dropped by `--exclude` / `--no-X`).
@@ -65,9 +71,10 @@ Pass `--no-web` or `--no-lcd` at build time to exclude an activator.
 
 ### How staging and gating fit together
 
-`spangap-inside` resolves the buildable's `requires:` ∪ `optional_requires:`
-∪ (any straddles named via `--include`) transitively, subtracting any
-`--exclude` / `--no-X` entries, then stages each kept dep into
+`spangap-inside` resolves the implicit `spangap-core` ∪ the buildable's
+`requires:` ∪ `optional_requires:` ∪ (any straddles named via `--include`)
+transitively, subtracting any `--exclude` / `--no-X` entries and the
+straddles that hard-require them (the cascade), then stages each kept dep into
 `staging/components/<repo>/` as a real dir containing per-entry symlinks to
 the source dir's contents plus two generated files:
 
@@ -205,10 +212,14 @@ Common verbs:
     `spangap build`, `spangap docker spangap build`, or a shell inside the
     container; `spangap-outside` just forwards the flag (and the host's
     sticky port via `$SPANGAP_PORT`).
-  - `--exclude <name>` (repeatable) drops an `optional_requires:` entry.
-    Bare repo (`spangap-lcd`) or fully-qualified (`spangap/spangap-lcd`).
-    Excluding a hard `requires:` target is an error. `--no-lcd` /
-    `--no-web` are aliases.
+  - `--exclude <name>` (repeatable) drops a straddle and everything that
+    hard-requires it (the cascade). Bare repo (`spangap-lcd`) or
+    fully-qualified (`spangap/spangap-lcd`). Refused only when it would
+    remove spangap-core or a straddle the buildable hard-requires; the
+    cascaded-away set is printed under `cascade-dropped:`. `--no-lcd` /
+    `--no-web` / `--no-net` are aliases (e.g. `--no-net` yields an
+    IP-stack-free image — web/sshd/upnp/wg/duckdns/acme and the IP
+    transports all cascade out).
   - `--include <name>` (repeatable) pulls an extra straddle into this
     build. Bare repo (`spangap-sshd`) must already be a workspace
     sibling. Fully-qualified `<org>/<repo>` (`spangap/spangap-sshd`) is

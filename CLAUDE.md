@@ -212,8 +212,10 @@ Docker Desktop a symlink resolves through to its host target, so the browser
 `straddle.yaml` keys (contract: `build-system/schemas/straddle.schema.json` — the
 **authoritative** list; the schema is local, read it before hand-writing a manifest):
 `name` (`<org>/<repo>`), `prefix` (symbol/import prefix; empty reserved for
-spangap-core), `version` (`X.Y.Z`); `requires` (hard — missing = error, can't
-`--exclude`), `optional_requires` (soft, **default-on**, pruned silently when absent —
+spangap-core), `version` (`X.Y.Z`); `requires` (hard — missing = error;
+`--exclude`ing one cascades the drop to whatever hard-requires it, and is
+refused only when it would take out spangap-core or a buildable hard-require),
+`optional_requires` (soft, **default-on**, pruned silently when absent —
 call sites **must** gate on `CONFIG_*`); `firmware:` / `browser:` (paths to the two
 halves, e.g. `esp-idf` / `browser`); **`init:`** (bring-up function name — see the
 auto-init note below); `buildable:` (an **object**, not a bare flag: presence marks a
@@ -244,7 +246,8 @@ enumerate `/repos`.
 
 ## What `spangap build` does under the hood
 
-1. resolve `requires ∪ optional_requires ∪ --include`, transitively, minus `--exclude`/`--no-X`.
+1. resolve `spangap-core (implicit) ∪ requires ∪ optional_requires ∪ --include`, transitively,
+   minus `--exclude`/`--no-X` and the reverse-dependency cascade they trigger.
 2. stage each kept dep into `staging/components/<repo>/`: symlinks to source + a generated
    `spangap_requires.cmake` (`set(SPANGAP_REQUIRES …)`), plus a synthetic `_spangap_present`
    component whose `Kconfig.projbuild` declares `CONFIG_STRADDLE_<UPPER_REPO>` (default y)

@@ -1,6 +1,6 @@
 # Inside the spangap build-env container
 
-You are running as **`ubuntu` inside the spangap build-env container** (you most
+You are running as **`spangap` inside the spangap build-env container** (you most
 likely got here via `spangap docker claude` on the host). This file tells you what
 that means: what's mounted, what `spangap` does *from in here*, what you can and
 can't do without the host, and how to help with the real job — **writing and
@@ -12,16 +12,16 @@ the container-side map.
 
 ## Where you are
 
-You're `ubuntu`, cwd **`/workspace`**, `HOME=/home/ubuntu`. The container is started
+You're `spangap`, cwd **`/workspace`**, `HOME=/home/spangap`. The container is started
 with `sleep infinity` and you reach it by `docker exec`; it always carries at least two
-host bind mounts — **`/workspace`** (the spangap workspace dir) and **`/home/ubuntu`**
+host bind mounts — **`/workspace`** (the spangap workspace dir) and **`/home/spangap`**
 (persistent home) — plus optionally **`/repos`** (only when this workspace was init'd
 with `--repo-path`; see below). On macOS Docker Desktop these mounts are `fakeowner`
 type, which drives a couple of gotchas at the end of this file.
 
-Don't assume the rest of your situation — **discover it.** `spangap doctor` reports the
-resolved project + toolchain; `ls /workspace` and `ls /repos 2>/dev/null` show what's
-mounted; the workspace dotfiles tell you the mode:
+Don't assume the rest of your situation — **discover it.** `spangap show` reports the
+resolved project + its deps + the toolchain/environment; `ls /workspace` and `ls /repos
+2>/dev/null` show what's mounted; the workspace dotfiles tell you the mode:
 
 - `/workspace/spangap.workspace.yaml` — the workspace marker (always present).
 - `/workspace/.spangap-repo_path` — **present ⟺ `--repo-path` mode** (its contents are
@@ -86,9 +86,9 @@ container these verbs work directly, with the IDF env already set up:
 | `spangap validate` | parse + jsonschema-check the manifest and dep graph (fast, read-only) |
 | `spangap list-requires` / `list-deps` | full transitive set / missing siblings (read-only diagnostics) |
 | `spangap clean` / `reallyclean` | `idf.py fullclean` / strip **every** straddle in the active root back to source (gitignored artifacts only) |
-| `spangap doctor` | env report: python, IDF_PATH, node/npm/idf.py versions, resolved project |
+| `spangap show` | project straddle + deps in init order, the env report (python, IDF_PATH, node/npm/idf.py versions), and whether a host `spangap monitor` is ready to flash |
 | `spangap cli [-h host] <cmd>` | talk to a running device over the network (TCP CLI) |
-| `spangap flash` | **signal only** — touches `build/flashme` and waits ≤5s for a host monitor to consume it (see below) |
+| `spangap flash` | **signal only** — touches `.spangap-flashme` (workspace root) and waits ≤5s for a host monitor to consume it (see below) |
 
 **`spangap flash` / `spangap cli` from in here don't touch hardware directly** — the
 container has no USB. `flash` only signals a host monitor; `cli` reaches the device
@@ -96,7 +96,8 @@ over the network. The full device loop is its own section below
 ([Working with a real device](#working-with-a-real-device--the-you--user--board-loop)).
 
 **Host-only verbs you can't run from this container:** `monitor`, `probe`, real
-`flash`, `init`, `reset`, `get-deps` (the cloning side), and `docker <cmd>` — those
+`flash`, `init`, `reset`, `reset-workspace`, `get-deps` (the cloning side), and
+`docker <cmd>` — those
 live in **`spangap-outside`** on the host and need the serial port / docker / the
 container lifecycle. There is **no `docker` and no `esptool.py`** in here by design
 (no docker-in-docker; esptool is host-side in the per-host venv).
@@ -127,23 +128,23 @@ spangap monitor <port>      # <port> is sticky after the first time
 ```
 
 It's a passive serial monitor (`--no-reset`, so it won't reboot the board while idle)
-that also **watches `<fw>/build/flashme`**. Your flash loop then is:
+that also **watches `.spangap-flashme`** at the workspace root. Your flash loop then is:
 
 1. `spangap build`  *(in here)*
-2. `spangap flash`  *(in here — just touches `build/flashme`)*
-3. the host monitor sees `flashme`, flashes the board over USB, and re-attaches with a
-   reset for a clean boot.
+2. `spangap flash`  *(in here — just touches `.spangap-flashme`)*
+3. the host monitor sees `.spangap-flashme`, flashes the board over USB, and re-attaches
+   with a reset for a clean boot.
 
-The monitor **must** be started from the project dir / workspace root — run outside a
-straddle it warns *"cannot be signalled to flash"* and the handshake won't work. If
+The monitor only runs in/under a workspace, and is best started from the project dir /
+workspace root — run outside a straddle it warns *"cannot be signalled to flash"* and the
+handshake won't work. If
 your `spangap flash` reports *"nobody seems to be running `spangap monitor`"* after 5s,
 it isn't up (or isn't in the project dir) — ask the user to (re)start it there.
 
 **2. See what the board is doing.** The monitor writes a live, ANSI-stripped copy of
-the serial output to **`<project>/esp-idf/build/flasher.log`** (the firmware half lives
-in the `esp-idf/` subdir — that's the `firmware:` value in every straddle.yaml) — it's
-on the bind mount, so you can `tail -f` / read it from in here. **This is your only
-window into the device — use it.**
+the serial output to **`.spangap-log` at the workspace root** — it's on the bind mount
+(`/workspace/.spangap-log` in here), so you can `tail -f` / read it from in here. **This
+is your only window into the device — use it.**
 In particular it's where you check:
 
 - **whether networking came up and the device's IP address** — watch for the net
@@ -165,7 +166,7 @@ That opens the device's TCP CLI on port **2323** (the `s.` prefix persists it to
 From then on, from inside this container:
 
 ```sh
-spangap cli -h <device-ip> get s.net      # IP from flasher.log; -h is sticky, omit it afterwards
+spangap cli -h <device-ip> get s.net      # IP from .spangap-log; -h is sticky, omit it afterwards
 spangap cli set s.some.key value          # subsequent calls reuse the sticky host
 ```
 
@@ -178,15 +179,15 @@ worked, not that it hung.
 - **Sticky state:** the serial port (`.spangap-port-<os>-<arch>`) and CLI host
   (`.spangap-host`) are remembered — set each once, omit thereafter.
 - **One terminal, both jobs:** the single host `spangap monitor` gives the *user* the
-  live console *and* gives *you* the flash signal + the `flasher.log` to read. Once it's
+  live console *and* gives *you* the flash signal + the `.spangap-log` to read. Once it's
   running, a normal cycle needs no user action: you build, you `spangap flash`, you read
-  `flasher.log`.
+  `.spangap-log`.
 - **Config you change sticks:** `s.*` keys persist to flash and sync to the browser;
   `secrets.*` persist but never leave the device; no-prefix keys are ephemeral (gone on
   reboot). So `spangap cli set s.…` survives a reboot; setting a bare key doesn't.
   (Details: `spangap-core/docs/storage.md`.)
 - **Stack decode** needs the build's ELF, which the monitor finds in `esp-idf/build/` —
-  so flash a build you actually built here and panics in `flasher.log` resolve to source.
+  so flash a build you actually built here and panics in `.spangap-log` resolve to source.
 
 ## The straddle tree (`/workspace` or `/repos`)
 
@@ -332,8 +333,9 @@ then `spangap list-requires`; a real `spangap build` confirms staging + linking.
 ## Container gotchas
 
 - **No serial, no docker, no esptool in here** — flashing/monitoring is host-side; from
-  here `spangap flash` only signals via `build/flashme`, and you read the device through
-  the host monitor's `esp-idf/build/flasher.log` (see "Working with a real device").
+  here `spangap flash` only signals via `.spangap-flashme`, and you read the device through
+  the host monitor's `.spangap-log` (both at the workspace root; see "Working with a real
+  device").
 - **On macOS Docker Desktop, `fakeowner` shows every file mode 0755**, which makes git
   report spurious `100644→100755` flips. Straddle checkouts set `core.fileMode false` —
   leave it; don't "fix" the mode noise or chmod to silence it.

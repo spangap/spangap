@@ -61,15 +61,19 @@ RUN set -eux; \
     visudo -cf /etc/sudoers.d/nopasswd-sudo-group
 
 # Interactive bash prompt. Appended to /etc/bash.bashrc (not ~/.bashrc) because
-# spangap-outside bind-mounts ~/.spangap over /home/ubuntu at runtime, which
+# spangap-outside bind-mounts ~/.spangap over /home/spangap at runtime, which
 # would shadow any HOME-level dotfile baked into the image. /etc/bash.bashrc is
 # sourced by every interactive non-login bash (the `spangap shell` / `docker
 # exec ... bash` path), and /etc is not mounted over. \w renders the cwd, \$
-# becomes $ for ubuntu / # under sudo.
+# becomes $ for spangap / # under sudo.
 RUN { \
         echo ''; \
         echo '# spangap interactive prompt'; \
         echo "PS1='spangap:\\w \\\$ '"; \
+        echo '# Route bare `claude` through `spangap claude` so the first-run setup'; \
+        echo '# (permissions default + workspace CLAUDE.md seeding) always happens,'; \
+        echo '# even when a user just opens a shell and types `claude`.'; \
+        echo "alias claude='spangap claude'"; \
     } >> /etc/bash.bashrc
 
 # Python deps. Two targets:
@@ -94,9 +98,14 @@ RUN mkdir -p /usr/local/lib/spangap /usr/local/share/spangap
 # Force modes on COPY so the in-image permissions don't depend on whatever the
 # build context happens to expose. macOS SMB clients see host files as mode
 # 0700 (no group/other); without --chmod that carries into the image and the
-# `ubuntu` user can't read the script.
+# `spangap` user can't read the script.
 COPY --chmod=0755 build-system/spangap-inside /usr/local/lib/spangap/cli.py
 COPY --chmod=0644 build-system/schemas/straddle.schema.json /usr/local/share/spangap/straddle.schema.json
+# Container assistant instructions. Normally seeded into a workspace as README.md
+# at `spangap init`; baked in here too so `spangap claude` can re-seed it (and the
+# CLAUDE.md pointer it writes) in a workspace predating that flow. Version-matched
+# to the CLI and present regardless of clone vs --repo-path mode.
+COPY --chmod=0644 build-system/README.md /usr/local/share/spangap/README.md
 
 # Stamp the build-system/ content hash so spangap-outside can detect a stale
 # cached image (build-system/ changed since the image was built) and rebuild.
@@ -116,21 +125,30 @@ RUN printf '%s\n' \
         > /usr/local/bin/spangap && \
     chmod +x /usr/local/bin/spangap
 
-# Run as the base image's UID-1000 `ubuntu` user. Matching UID/GID with the
-# conventional host user means files written to the bind-mounted workspace
-# land as the host user, not root.
-USER ubuntu
-ENV HOME=/home/ubuntu
+# Rename the base image's uid-1000 `ubuntu` user (and its group + home dir) to
+# `spangap`. UID/GID stay 1000, so files written to the bind-mounted workspace
+# still land as the conventional host user, not root — only the names change.
+# Group memberships (including `sudo`) survive usermod, so passwordless sudo
+# keeps working. usermod -m moves /home/ubuntu → /home/spangap.
+RUN set -eux; \
+    usermod -l spangap -d /home/spangap -m ubuntu; \
+    if getent group ubuntu >/dev/null; then groupmod -n spangap ubuntu; fi
+
+# Run as that uid-1000 `spangap` user. Matching UID/GID with the conventional
+# host user means files written to the bind-mounted workspace land as the host
+# user, not root.
+USER spangap
+ENV HOME=/home/spangap
 
 # User-owned npm prefix so `npm install -g` works without sudo. `spangap
 # claude` lazy-installs @anthropic-ai/claude-code into this prefix on first
 # use. Set via env (not `npm config set prefix`, which would write
-# ~/.npmrc — that lives at /home/ubuntu/.npmrc and gets hidden the moment
-# spangap-outside bind-mounts ~/.spangap over /home/ubuntu). ensure_container
+# ~/.npmrc — that lives at /home/spangap/.npmrc and gets hidden the moment
+# spangap-outside bind-mounts ~/.spangap over /home/spangap). ensure_container
 # creates the prefix dir post-run since the image layer's mkdir is also
 # shadowed.
-ENV NPM_CONFIG_PREFIX=/home/ubuntu/.npm-global
-ENV PATH=/home/ubuntu/.npm-global/bin:$PATH
+ENV NPM_CONFIG_PREFIX=/home/spangap/.npm-global
+ENV PATH=/home/spangap/.npm-global/bin:$PATH
 
 # Workspace bind-mount lands at /workspace; the flat repo_path checkout (when
 # set) is bind-mounted whole at /repos, so straddles are container-native dirs

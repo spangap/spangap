@@ -51,13 +51,17 @@ Commands (run inside a workspace):
   flash [<port>]                 Flash the built firmware once and exit. Port
                                  is sticky. Chain `&& spangap monitor` to watch
                                  the board after flashing.
-  monitor [<port>]               Attach the serial monitor. Works outside
-                                 a workspace too (no stack decode).
+  monitor [<port>]               Attach the serial monitor (must be in/under
+                                 a workspace).
   probe [<port>]                 Print chip + flash size of a connected
                                  board. Works outside a workspace.
   cli [-h <host>] [args...]      Talk to a running device over the network.
                                  Host is sticky like port.
-  reset                          Wipe the build state and start fresh.
+  show                           List the project straddle and its deps in
+                                 initialization order.
+  reset                          Signal a running monitor to reset the device.
+  reset-workspace                Wipe the build state (container + image) and
+                                 start fresh.
   docker <cmd> [args...]         Drop into a shell on the build container,
                                  e.g. `spangap docker sh`.
 
@@ -195,6 +199,14 @@ init)
         git clone --quiet "$INIT_URL" spangap
         skel_target="$PWD/spangap"
     fi
+    # Seed the workspace with the container assistant-instructions doc as
+    # README.md. An in-container `spangap claude` writes a CLAUDE.md that just
+    # points here, so this is the substantive file. Copied from the skeleton the
+    # workspace was init'd with, so it tracks that build system's version.
+    if [ -f "$skel_target/build-system/README.md" ]; then
+        cp "$skel_target/build-system/README.md" README.md
+        echo "init: wrote README.md (container assistant instructions)" >&2
+    fi
     # Delegate venv setup to spangap-outside so the recipe lives in exactly
     # one place (it's also called lazily on flash/monitor for robustness).
     SPANGAP_WORKSPACE="$PWD" "$skel_target/build-system/spangap-outside" ensure-venv \
@@ -248,7 +260,7 @@ init)
 esac
 
 # Resolve this script's real location so we can find spangap-outside when
-# the user runs `spangap monitor` outside any workspace.
+# the user runs `spangap cli` / `spangap probe` outside any workspace.
 self=$0
 while [ -L "$self" ]; do
     link=$(readlink "$self")
@@ -277,13 +289,13 @@ if ws=$(find_workspace); then
     exec "$outside" "$@"
 fi
 
-# No workspace at/above cwd. A small set of commands (`monitor`, `cli`,
-# `probe`) is still useful — they only need the host venv + a serial port or
-# a host:port, not a built tree. spangap-outside handles the no-workspace
-# case by warning instead of dying. Everything else still requires
-# `spangap init`.
+# No workspace at/above cwd. A small set of commands (`cli`, `probe`) is still
+# useful — they only need the host venv + a serial port or a host:port, not a
+# built tree. `monitor` is deliberately NOT here: it logs and watches signal
+# files in the workspace, so it only runs in/under one. Everything else still
+# requires `spangap init`.
 case ${1:-} in
-    monitor|cli|probe)
+    cli|probe)
         [ -x "$self_outside" ] \
             || die "spangap-outside not found at $self_outside — \`spangap $1\` outside a workspace needs the installed repo to remain intact"
         # SPANGAP_WORKSPACE points at $HOME so .spangap-port and friends have

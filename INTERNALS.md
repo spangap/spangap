@@ -148,8 +148,8 @@ The host-side entry script is `./spangap` at the platform-repo root. It
 walks up from cwd for `spangap.workspace.yaml` (only — there's no
 straddle-as-workspace fallback) and dispatches into
 `<ws>/spangap/build-system/spangap-outside`, which in turn either handles
-the command on the host (flash, monitor, cli, get-deps, reset) or
-docker-execs `spangap-inside` in the build-env container
+the command on the host (flash, monitor, cli, get-deps, reset,
+reset-workspace) or docker-execs `spangap-inside` in the build-env container
 (`spangap-<hash7(workspace)>`).
 
 **Workspace layout.** No symlinks. Straddles reach the container through one
@@ -158,7 +158,7 @@ of two flat, container-native roots:
 - `/repos/<repo>` — the **flat** local checkout (`<repo_path>/<repo>`, every
   straddle a direct child) passed to `init --repo-path`, bind-mounted *whole*
   to `/repos` (one mount). Adding/removing a straddle under it needs no
-  `spangap reset` — the whole-tree mount picks it up live. **repo_path mode is
+  `spangap reset-workspace` — the whole-tree mount picks it up live. **repo_path mode is
   local-only and never clones:** the checkout is a pinned set you always build
   against, so a required straddle that isn't in it is an error (add it to the
   checkout), never a silent github fetch of a possibly-different copy. Build a
@@ -191,15 +191,14 @@ straddle by `cd`-ing into it isn't supported under repo_path, since those
 straddles live at `/repos`, outside the workspace tree on the host; that's a
 future `spangap build <straddle>` argument.)
 
-**No-workspace fallback** — `spangap monitor <dev>` and `spangap cli`
-also run with no `spangap.workspace.yaml` at/above cwd. The entry script
-resolves its own real path (chasing symlinks through `/usr/local/bin/…`)
-to find `build-system/spangap-outside`, sets `SPANGAP_WORKSPACE=$HOME`
-so the venv + sticky `.spangap-port-<os>-<arch>`/`.spangap-host` files land there,
-and `spangap-outside`'s `monitor` warns *"not in spangap workspace,
-cannot decode stack on crash, cannot be signalled to flash"* and runs
-without an elf or a flashme watcher. Everything else still requires
-`spangap init`.
+**No-workspace fallback** — `spangap cli` and `spangap probe` also run with no
+`spangap.workspace.yaml` at/above cwd. The entry script resolves its own real
+path (chasing symlinks through `/usr/local/bin/…`) to find
+`build-system/spangap-outside`, sets `SPANGAP_WORKSPACE=$HOME` so the venv +
+sticky `.spangap-port-<os>-<arch>`/`.spangap-host` files land there. `monitor`
+is **not** in this set: it logs to `.spangap-log` and watches the
+`.spangap-flashme`/`.spangap-resetme` signal files at the workspace root, so it
+only runs in/under a workspace. Everything else still requires `spangap init`.
 
 Common verbs:
 
@@ -234,7 +233,12 @@ Common verbs:
     connected chip's actual flash size with `spangap probe <dev>` (a thin
     wrapper around `esptool.py flash_id` that also prints the matching
     `--flash-size` invocation).
-- `spangap flash <dev>` / `spangap monitor <dev>`
+- `spangap flash <dev>` / `spangap monitor <dev>` — the monitor (workspace-only)
+  logs to `.spangap-log` and watches `.spangap-flashme` (reflash) and
+  `.spangap-resetme` (restart + reset the device), all at the workspace root
+- `spangap show` — list the project straddle + its deps in init order
+- `spangap reset` — touch `.spangap-resetme` so a running monitor resets the device
+- `spangap reset-workspace` — tear down the container + image and rebuild fresh
 - `spangap get-deps` — host-side `git clone` of any missing transitive
   `requires:` (also runs implicitly as the first phase of `build`)
 - `spangap cli [-h <host>] <cmd>…` — talk to the device's TCP CLI
@@ -297,7 +301,7 @@ straight onto `/workspace`?
   auto-creates each mount-point inside the (bind-mounted) workspace, so they
   surface as **empty dirs in the host workspace** (the mounts exist only inside
   the container), and the mount set is fixed at `docker run` so adding a repo
-  needs a `reset`. (Relatedly: a symlink sitting at a bind-mount target gets
+  needs a `reset-workspace`. (Relatedly: a symlink sitting at a bind-mount target gets
   resolved-through by Docker Desktop *before* binding — so you can't overlay a
   mount where a symlink already is. That's the original reason `/work` + the
   `.link` suffix existed.)
@@ -347,7 +351,7 @@ it to your checkout"). Without a repo_path, missing deps are git-cloned into
   `node_modules/` in browser dirs), so cleaning is project-independent and
   sweeps all straddles. It reaches into the repo_path checkout (`/repos` is the
   checkout) but only ever removes gitignored, regenerable output.
-- **A direct `spangap flash` clears `build/flashme`** on success, so a monitor
+- **A direct `spangap flash` clears `.spangap-flashme`** on success, so a monitor
   that starts later doesn't treat the stale signal as a fresh reflash request.
 
 ### Browser dependency locking — the `package-lock.json` policy

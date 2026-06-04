@@ -10,6 +10,7 @@ import json
 import os
 import re
 import selectors
+import shlex
 import shutil
 import socket
 import subprocess
@@ -38,6 +39,24 @@ WORKSPACE = Path("/workspace")
 REPOS = Path("/repos")
 STRADDLE_ROOTS = (REPOS, WORKSPACE)
 HOST_FILE = WORKSPACE / ".spangap-host"
+# Canonical assistant-instructions file, baked into the image (Dockerfile) and
+# seeded into the workspace as CLAUDE.md on first `spangap claude`.
+README_PATH = Path("/usr/local/share/spangap/README.md")
+WORKSPACE_README_MD = WORKSPACE / "README.md"
+WORKSPACE_CLAUDE_MD = WORKSPACE / "CLAUDE.md"
+# Readiness-probe marker: `spangap show` drops this and a host-side `spangap
+# monitor` deletes it on sight, so its disappearance proves a monitor is up and
+# able to flash. Lives at the workspace root (the bind mount) like the other
+# .spangap-* signal files.
+PING_FILE = WORKSPACE / ".spangap-ping"
+
+# Body of the workspace CLAUDE.md `spangap claude` writes: a thin pointer to the
+# real instructions in README.md (seeded at init), not a copy — so the two never
+# drift.
+CLAUDE_MD_POINTER = (
+    "Read README.md in this directory as if it is CLAUDE.md, information in "
+    "there only to be overridden by explicit user directives.\n"
+)
 
 # spangap-core is the implicit platform foundation. Its prefix is "" — its
 # symbols (storageGet, cliRegister, info, …) read as language primitives, so
@@ -597,6 +616,34 @@ def write_main_requires(proj: Manifest, staged_repos: set[str]) -> None:
     (staging_dir / "main_requires.cmake").write_text(text)
 
 
+def init_order(deps: list[Manifest]) -> list[Manifest]:
+    """The canonical straddle initialization order for an already-resolved
+    dependency list.
+
+    Two bands, no per-straddle ordering knob:
+      1. Platform band — spangap's own components (PLATFORM_ORDER: core, net,
+         web, lcd), in exactly that order, each only if staged.
+      2. Straddle band — every other staged straddle, in the dependency-topo
+         order `deps` already arrives in (a straddle appears after the ones it
+         requires:).
+
+    This is the single source of truth for "what order do straddles come up
+    in": the generated spangapInitStraddles() dispatcher (write_init_dispatch)
+    and `spangap show` both order through here, so the boot order and the
+    reported order can never drift apart.
+    """
+    by_name = {d.name: d for d in deps}
+    ordered: list[Manifest] = []
+    for pname in PLATFORM_ORDER:
+        dep = by_name.get(pname)
+        if dep is not None:
+            ordered.append(dep)
+    for dep in deps:
+        if dep.name not in PLATFORM_ORDER:
+            ordered.append(dep)
+    return ordered
+
+
 def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
     """For a buildable, generate staging/spangap_init_dispatch.gen.cpp — the
     spangapInitStraddles() dispatcher that calls every staged straddle's
@@ -652,16 +699,9 @@ def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
             seen_calls.add(call)
             calls.append(call)
 
-    # Band 1: platform components, fixed order, only the staged ones.
-    by_name = {d.name: d for d in deps}
-    for pname in PLATFORM_ORDER:
-        dep = by_name.get(pname)
-        if dep is not None:
-            emit(dep)
-    # Band 2: every other straddle, in dependency-topo order.
-    for dep in deps:
-        if dep.name in PLATFORM_ORDER:
-            continue
+    # Platform band then topo band — the shared init order (see init_order),
+    # so the boot dispatcher and `spangap show` can't disagree.
+    for dep in init_order(deps):
         emit(dep)
 
     # Forward decls carry default (C++) linkage to match the straddle init
@@ -1076,21 +1116,32 @@ def cmd_build(args: argparse.Namespace) -> int:
         print(f"lora:      {', '.join(lora_lines)}", file=sys.stderr)
     write_sdkconfig_overrides(proj, args.flash_size, lora_lines)
     lint_cmakelists(proj, deps, all_straddles)
-    return run_build_idf(args.idf_args or ["build"], cwd=proj.firmware_dir, quiet=quiet)
+    # Bake the build invocation identity into the image: spangap-core's
+    # write-build-info.py (run by CMake during this build) reads these and
+    # emits app_build_{straddle,version,args}, which spangapInit() logs on boot.
+    build_env = {
+        "SPANGAP_BUILD_STRADDLE": proj.name,
+        "SPANGAP_BUILD_VERSION": proj.version,
+        "SPANGAP_BUILD_ARGS": getattr(args, "spangap_invocation", "") or "spangap build",
+    }
+    return run_build_idf(
+        args.idf_args or ["build"], cwd=proj.firmware_dir, quiet=quiet, env=build_env
+    )
 
 
 def cmd_flash(args: argparse.Namespace) -> int:
-    """In-container flash: touch <project>/build/flashme, wait for a monitor to consume it.
+    """In-container flash: touch .spangap-flashme, wait for a monitor to consume it.
 
     The container can't see a serial port — only the host running
-    `spangap monitor` can actually flash. We signal via flashme and watch
-    for it to disappear (the monitor loop deletes it just before flashing).
+    `spangap monitor` can actually flash. We signal via the workspace-root
+    .spangap-flashme (visible to the host at $workspace/.spangap-flashme) and
+    watch for it to disappear (the monitor loop deletes it on a short delay
+    just after it starts flashing).
     """
     proj = find_project()
     if not proj.is_buildable:
         die(f"{proj.name} is not a buildable straddle (no `buildable:` block) — nothing to flash.")
-    flashme = proj.firmware_dir / "build" / "flashme"
-    flashme.parent.mkdir(parents=True, exist_ok=True)
+    flashme = WORKSPACE / ".spangap-flashme"
     flashme.touch()
     print(f"spangap: signaled {flashme} — waiting for a monitor to pick it up...", file=sys.stderr)
     for _ in range(5):
@@ -1109,23 +1160,6 @@ def cmd_flash(args: argparse.Namespace) -> int:
 def cmd_clean(args: argparse.Namespace) -> int:
     proj = find_project()
     return run_idf(["fullclean"], cwd=proj.firmware_dir)
-
-
-def cmd_doctor(args: argparse.Namespace) -> int:
-    print("spangap doctor (in-container)")
-    print(f"  python:      {sys.version.split()[0]}")
-    print(f"  workspace:   {WORKSPACE} ({'mounted' if WORKSPACE.is_dir() else 'MISSING'})")
-    try:
-        proj = find_project()
-        print(f"  project:     {proj.name} ({proj.version}) at {proj.dir}")
-    except SystemExit:
-        print("  project:     <none — cwd not under a straddle>")
-    print(f"  IDF_PATH:    {os.environ.get('IDF_PATH', '<unset>')}")
-    print(f"  IDF_TOOLS:   {os.environ.get('IDF_TOOLS_PATH', '<unset>')}")
-    print(f"  node:        {_capture(['node', '--version'])}")
-    print(f"  npm:         {_capture(['npm', '--version'])}")
-    print(f"  idf.py:      {_capture(['idf.py', '--version'])}")
-    return 0
 
 
 def _capture(cmd: list[str]) -> str:
@@ -1175,6 +1209,87 @@ def cmd_list_requires(args: argparse.Namespace) -> int:
     return 0
 
 
+def _monitor_ready(timeout: float = 4.0) -> bool:
+    """Probe for a host-side `spangap monitor` via the .spangap-ping handshake.
+
+    Drop the marker and wait up to `timeout`s for the monitor to delete it (it
+    watches the workspace root and removes any ping on sight). Vanished ⟹ a
+    monitor is up and can flash. On timeout, remove our own stale probe so it
+    doesn't confuse a monitor that starts later, and report not-ready.
+    """
+    try:
+        PING_FILE.touch()
+    except OSError:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not PING_FILE.exists():
+            return True
+        time.sleep(0.1)
+    PING_FILE.unlink(missing_ok=True)
+    return False
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    """List the project straddle and its dependencies in initialization order.
+
+    The dependency order is THE init order (init_order()) — the same order the
+    generated spangapInitStraddles() dispatcher fires the straddles in, derived
+    from the same resolve_requires() walk that get-deps and the build use.
+    Paths are the container-native straddle dirs (/repos/<repo> for a repo_path
+    checkout, /workspace/<repo> for a git clone).
+    """
+    proj = find_project()
+    deps, _ = resolve_requires(proj, scan_workspace_straddles())
+
+    rp_file = WORKSPACE / ".spangap-repo_path"
+    repo_path = rp_file.read_text().strip() if rp_file.is_file() else ""
+    if repo_path:
+        print(
+            f"NOTE: This workspace was initialized with --repo-path: {repo_path}, "
+            "mounted as /repos in container"
+        )
+        print()
+
+    print("Project straddle:")
+    print(f"  {proj.name} ({proj.version}) - {proj.dir}")
+    print()
+
+    ordered = init_order(deps)
+    print("Dependencies (in order of initialization):")
+    if ordered:
+        for d in ordered:
+            print(f"  {d.name} - {d.dir}")
+    else:
+        print("  (none)")
+    print()
+
+    print("Environment:")
+    print(f"  python:     {sys.version.split()[0]}")
+    print(f"  workspace:  {WORKSPACE} ({'mounted' if WORKSPACE.is_dir() else 'MISSING'})")
+    print(f"  IDF_PATH:   {os.environ.get('IDF_PATH', '<unset>')}")
+    print(f"  IDF_TOOLS:  {os.environ.get('IDF_TOOLS_PATH', '<unset>')}")
+    print(f"  node:       {_capture(['node', '--version'])}")
+    print(f"  npm:        {_capture(['npm', '--version'])}")
+    print(f"  idf.py:     {_capture(['idf.py', '--version'])}")
+    print()
+
+    print("Tooling:")
+    if _monitor_ready():
+        print(
+            "  spangap flash: spangap monitor outside the container is ready "
+            "and waiting to do the actual flashing"
+        )
+    else:
+        print(
+            "  spangap flash: no monitor started outside container, run "
+            "'spangap monitor [<serial port>]' outside the container if you "
+            "want to be able to flash from inside. (It remembers the port, so "
+            "you only have to type that once.)"
+        )
+    return 0
+
+
 # Per-straddle build artifacts reallyclean strips. Firmware: idf build/,
 # generated staging/, downloaded managed_components/. Browser: node_modules/,
 # dist/, .quasar/, package-lock.json.
@@ -1218,8 +1333,79 @@ def cmd_reallyclean(args: argparse.Namespace) -> int:
     return 0
 
 
+def _offer_bypass_permissions() -> None:
+    """First-run only: offer to default this container's claude to bypassPermissions.
+
+    Inside the build-env container the inside/outside boundary is what guards the
+    host, so running claude unsandboxed here is a reasonable default — but it's the
+    user's call, and only worth asking once. Keyed on the *absence* of
+    ~/.claude/settings.json: present (even empty) ⟹ already chosen, stay silent.
+    """
+    settings = Path.home() / ".claude" / "settings.json"
+    if settings.exists():
+        return
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return  # non-interactive (cron/pipe) — never write a security default unasked
+    print(
+        "\nSince this claude will run inside a docker container, would you like "
+        "claude to run in 'bypassPermissions' mode?\n\n"
+        "( NOTE: While we believe this container is properly configured, and some "
+        "care went into the scripts that govern the inside/outside boundary, there "
+        "are no 100% guarantees. Especially on Linux systems, where the container "
+        "would potentially share a kernel with your OS, it may be even safer to run "
+        "docker (and thus spangap) inside a VM. )\n",
+        file=sys.stderr,
+    )
+    try:
+        ans = input("bypassPermissions? [y/N] ").strip().lower()
+    except EOFError:
+        ans = ""
+    if ans not in ("y", "yes"):
+        print("spangap: leaving claude on default (prompting) permissions.", file=sys.stderr)
+        return
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(
+        json.dumps(
+            {
+                "permissions": {"defaultMode": "bypassPermissions"},
+                "skipDangerousModePermissionPrompt": True,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    print(f"spangap: wrote {settings} (bypassPermissions).", file=sys.stderr)
+
+
+def _present(p: Path) -> bool:
+    """True if anything is already at p — a file, a valid symlink, or a dangling
+    one. .exists() covers file / valid-symlink; .is_symlink() catches a broken
+    symlink .exists() would miss. Used to never clobber a deliberate choice."""
+    return p.exists() or p.is_symlink()
+
+
+def _ensure_workspace_docs() -> None:
+    """Ensure /workspace has README.md (the instructions) + CLAUDE.md (a pointer).
+
+    README.md is normally seeded host-side at `spangap init`; this re-seeds it
+    from the image-baked copy if absent, so `spangap claude` still works in a
+    workspace created before that flow (and so the CLAUDE.md pointer below never
+    dangles). CLAUDE.md is written as a thin pointer to README.md rather than a
+    copy, so the substantive instructions live in exactly one place. Either file
+    already present (file or symlink) is left untouched.
+    """
+    if not _present(WORKSPACE_README_MD) and README_PATH.is_file():
+        shutil.copyfile(README_PATH, WORKSPACE_README_MD)
+        print(f"spangap: seeded {WORKSPACE_README_MD}.", file=sys.stderr)
+    if not _present(WORKSPACE_CLAUDE_MD):
+        WORKSPACE_CLAUDE_MD.write_text(CLAUDE_MD_POINTER)
+        print(f"spangap: wrote {WORKSPACE_CLAUDE_MD} (→ README.md).", file=sys.stderr)
+
+
 def cmd_claude(claude_args: list[str]) -> int:
-    """Lazy-install @anthropic-ai/claude-code (if absent) and exec `claude`."""
+    """First-run setup (permissions default + workspace docs), install, exec."""
+    _offer_bypass_permissions()
+    _ensure_workspace_docs()
     if not shutil.which("claude"):
         print("spangap: claude not installed in container — running `npm install -g @anthropic-ai/claude-code`...", file=sys.stderr)
         r = subprocess.run(["npm", "install", "-g", "@anthropic-ai/claude-code"], check=False)
@@ -1227,7 +1413,7 @@ def cmd_claude(claude_args: list[str]) -> int:
             die("npm install -g @anthropic-ai/claude-code failed; see output above")
     claude_path = shutil.which("claude")
     if not claude_path:
-        die("claude still not on PATH after npm install — check /home/ubuntu/.npm-global/bin")
+        die(f"claude still not on PATH after npm install — check {Path.home() / '.npm-global' / 'bin'}")
     os.execvp(claude_path, [claude_path, *claude_args])
     return 1
 
@@ -1340,7 +1526,6 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="spangap", description="spangap straddles CLI (in-container)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("doctor", help="report environment info").set_defaults(func=cmd_doctor)
     sub.add_parser("validate", help="parse + validate manifest and dep graph").set_defaults(func=cmd_validate)
     sub.add_parser("clean", help="run idf.py fullclean").set_defaults(func=cmd_clean)
     sub.add_parser("reallyclean", help="strip ALL workspace straddles back to source-only state (build/, managed_components/, node_modules/, …)").set_defaults(func=cmd_reallyclean)
@@ -1395,8 +1580,13 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser(
         "flash",
-        help="signal a host running `spangap monitor` to reflash (touches build/flashme)",
+        help="signal a host running `spangap monitor` to reflash (touches .spangap-flashme)",
     ).set_defaults(func=cmd_flash)
+
+    sub.add_parser(
+        "show",
+        help="list the project straddle and its dependencies in initialization order",
+    ).set_defaults(func=cmd_show)
 
     sub.add_parser(
         "list-deps",
@@ -1409,6 +1599,9 @@ def main(argv: list[str] | None = None) -> int:
     ).set_defaults(func=cmd_list_requires)
 
     args = p.parse_args(argv)
+    # Faithful `spangap build ...` command line, baked into the image by
+    # cmd_build (via SPANGAP_BUILD_ARGS) and logged on boot.
+    args.spangap_invocation = "spangap " + shlex.join(raw)
     return args.func(args)
 
 

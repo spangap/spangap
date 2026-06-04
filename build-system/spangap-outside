@@ -4,12 +4,15 @@
 #
 # Handles everything that has to happen on the host:
 #   flash <dev>      flash once and exit. Chain `&& spangap monitor` to watch
-#                    the board afterwards. If <dev> is busy, just touch flashme
-#                    and exit so whichever host is running `monitor` picks the
-#                    signal up.
-#   monitor <dev>    passive monitor loop; re-flashes when build/flashme
-#                    appears. Errors if <dev> is busy. Used on the host that
-#                    owns the board.
+#                    the board afterwards. If <dev> is busy, just touch
+#                    .spangap-flashme and exit so whichever host is running
+#                    `monitor` picks the signal up.
+#   monitor <dev>    passive monitor loop; re-flashes when .spangap-flashme
+#                    appears and restarts (with a device reset) when
+#                    .spangap-resetme appears. Also deletes any .spangap-ping
+#                    on sight, so an in-container `spangap show` can detect a
+#                    running monitor. Errors if <dev> is busy. Only runs in/under
+#                    a workspace. Used on the host owning the board.
 #   probe [<dev>]    run esptool flash_id and print chip + flash size, plus
 #                    the matching `spangap build --flash-size <MB>` invocation.
 #                    Useful for generic builds against unknown hardware.
@@ -25,10 +28,14 @@
 #                    e.g. `spangap docker sh` for an unwrapped shell.
 #   shell            synonym for `spangap docker bash`: an interactive bash
 #                    in the build-env container. Extra args pass to bash.
-#   reset            drop this workspace's container + the build-env image
+#   reset            touch .spangap-resetme so a running `spangap monitor`
+#                    restarts and resets the device (clean boot capture). No
+#                    container teardown — see reset-workspace for that.
+#   reset-workspace  drop this workspace's container + the build-env image
 #                    (runs reallyclean inside first so the next build
 #                    doesn't inherit a stale CMakeCache that baked in
 #                    pre-reset paths).
+#   show             list the project straddle + its deps in init order.
 #   ensure-container build the image (if missing) and start a fresh
 #                    container with all the bind mounts. Called by
 #                    `spangap init` so first-run latency lands at init
@@ -63,15 +70,15 @@ workspace="${SPANGAP_WORKSPACE:?spangap-outside: SPANGAP_WORKSPACE not set (invo
 # container by spangap-inside, which reads the same -v/--verbose flag off the
 # forwarded argv; this var only governs the host-side noise.)
 #
-# Quiet by default for `build` and `reset` (the noisy ones — dep fetch, image
-# rebuild). -v|--verbose turns the noise back on. `reset` rebuilds the
-# container itself now, so it gets the same quiet treatment. Also honoured if
-# the caller sets it in the environment (used by `spangap init` to gate the
-# docker build noise behind -v/--verbose).
+# Quiet by default for `build` and `reset-workspace` (the noisy ones — dep
+# fetch, image rebuild). -v|--verbose turns the noise back on. `reset-workspace`
+# rebuilds the container itself, so it gets the same quiet treatment. Also
+# honoured if the caller sets it in the environment (used by `spangap init` to
+# gate the docker build noise behind -v/--verbose).
 SPANGAP_QUIET=${SPANGAP_QUIET:-}
 
 case "${1:-}" in
-    build|reset)
+    build|reset-workspace)
         SPANGAP_QUIET=1
         case "${2:-}" in
             -v|--verbose) SPANGAP_QUIET= ;;
@@ -373,7 +380,7 @@ ensure_addr2line_shim() {
     # current .spangap-repo_path. The /repos bind mount is fixed when the
     # container is created and recorded in its org.spangap.repo-path label;
     # the .spangap-repo_path file can drift from it (toggling repo_path on/off,
-    # or comparing both modes, without `spangap reset`). Translating against the
+    # or comparing both modes, without `spangap reset-workspace`). Translating against the
     # file instead of the live mount would hand the container a path that isn't
     # mounted there → addr2line can't open the ELF → silent no-decode. The label
     # is the source of truth.
@@ -535,22 +542,27 @@ PY
 }
 
 # monitor_loop <port> <fw> <initial_flash:1|0>: forever — passively monitor
-# until flashme appears, then flash + re-monitor (with reset-on-connect for
-# clean boot capture). Ctrl-C / TERM bails cleanly.
+# until .spangap-flashme appears (then flash + re-monitor) or .spangap-resetme
+# appears (then restart the monitor with the device reset, no reflash).
+# Ctrl-C / TERM bails cleanly.
 monitor_loop() {
     local port=$1 fw=$2 do_initial=$3
-    # Without a firmware dir we can neither flash, watch for flashme, nor
-    # write a stripped-output log file. The monitor still runs.
-    local flashme="" log=""
-    if [ -n "$fw" ]; then
-        # Ensure build/ exists before we point the stripper's log redirect at
-        # it: on a not-yet-built straddle build/ is absent, the `> "$log"`
-        # redirect fails with ENOENT, and the dead stripper takes the monitor
-        # down with it. mkdir -p mirrors what `flash` already does.
-        mkdir -p "$fw/build"
-        flashme="$fw/build/flashme"
-        log="$fw/build/flasher.log"
-    fi
+    # Signal + log files live at the workspace root so the host and the
+    # in-container `spangap flash` reach them identically ($workspace/... vs
+    # /workspace/...), and so the stripped-output log target always exists (the
+    # workspace dir is always present, unlike a not-yet-built build/).
+    #   .spangap-flashme  request a reflash
+    #   .spangap-resetme  request a monitor restart that resets the device
+    #   .spangap-ping     readiness probe — deleted on sight, nothing else; its
+    #                     disappearance is how in-container `spangap show` learns
+    #                     a monitor is running and able to flash
+    #   .spangap-log      stripped monitor / esptool output
+    # Flashing still needs a firmware dir (build artifacts); the resetme restart
+    # and the live monitor both work without one.
+    local flashme="$workspace/.spangap-flashme"
+    local resetme="$workspace/.spangap-resetme"
+    local ping="$workspace/.spangap-ping"
+    local log="$workspace/.spangap-log"
 
     trap 'kill_monitor; exit 0' INT TERM
     # Don't drop a present flashme on startup: a pending signal from another
@@ -559,33 +571,48 @@ monitor_loop() {
     local pending=$do_initial
     while true; do
         local reset_flags="--no-reset"
-        if [ "$pending" = "1" ] || { [ -n "$flashme" ] && [ -f "$flashme" ]; }; then
-            if [ -n "$flashme" ] && [ -f "$flashme" ]; then
-                log "flashme seen — holding 3s so other flashers can latch it"
-                sleep 3
-                rm -f "$flashme"
+        if [ -f "$resetme" ]; then
+            # Restart the monitor with the device reset (clean boot capture),
+            # no reflash. Remove the trigger up front so the watcher below
+            # doesn't instantly re-fire on it.
+            rm -f "$resetme"
+            reset_flags=""
+        elif [ "$pending" = "1" ] || [ -f "$flashme" ]; then
+            local rm_pid=""
+            if [ -f "$flashme" ]; then
+                # Hand the 3s grace + removal to a detached shell so the flash
+                # starts now instead of waiting it out; the window only lets
+                # other hosts' flashers latch the same signal before it goes.
+                ( sleep 3; rm -f "$flashme" ) &
+                rm_pid=$!
             fi
-            if do_flash "$port" "$fw" "$log"; then
+            if [ -n "$fw" ] && do_flash "$port" "$fw" "$log"; then
                 reset_flags=""
                 sleep 2
             else
+                [ -n "$fw" ] || log "flashme seen but not in a straddle — can't flash (no build artifacts)"
                 sleep 2
                 pending=0
                 continue
             fi
             pending=0
+            # The flash already ran alongside the grace period; make sure the
+            # consumed flashme is gone before arming the watcher so it doesn't
+            # instantly re-fire. Rarely blocks (do_flash outlasts the 3s).
+            [ -n "$rm_pid" ] && wait "$rm_pid" 2>/dev/null || true
         fi
 
-        # Watcher: nuke the running monitor the instant flashme appears.
-        # No watcher when we have no flashme path — the monitor just runs
-        # until Ctrl-].
-        local watcher=""
-        if [ -n "$flashme" ]; then
-            ( while [ ! -f "$flashme" ]; do sleep 1; done
-              kill_monitor
-            ) &
-            watcher=$!
-        fi
+        # Watcher: nuke the running monitor the instant either signal appears,
+        # so the next loop iteration consumes it (reflash or reset-restart).
+        ( while [ ! -f "$flashme" ] && [ ! -f "$resetme" ]; do
+              # Answer readiness probes without disturbing the live monitor:
+              # delete the ping and keep polling (no kill_monitor, no break).
+              [ -f "$ping" ] && rm -f "$ping"
+              sleep 1
+          done
+          kill_monitor
+        ) &
+        local watcher=$!
 
         if [ -n "$reset_flags" ]; then
             if [ -n "$fw" ]; then
@@ -598,19 +625,17 @@ monitor_loop() {
         fi
         run_monitor "$port" "$fw" "$log" "$reset_flags"
 
-        # If flashme is present, the watcher killed monitor as a reflash
-        # signal — keep looping so the next iteration consumes it. If it
-        # isn't, the user (Ctrl-]) or the hardware ended the monitor;
-        # don't fight them — exit so a single Ctrl-] actually quits.
-        if [ -n "$flashme" ] && [ -f "$flashme" ]; then
+        # A signal present means the watcher killed monitor to drive the next
+        # iteration — keep looping so it gets consumed. Otherwise the user
+        # (Ctrl-]) or the hardware ended the monitor; don't fight them — exit
+        # so a single Ctrl-] actually quits.
+        if [ -f "$flashme" ] || [ -f "$resetme" ]; then
             wait "$watcher" 2>/dev/null || true
             sleep 1
             continue
         fi
-        if [ -n "$watcher" ]; then
-            kill "$watcher" 2>/dev/null || true
-            wait "$watcher" 2>/dev/null || true
-        fi
+        kill "$watcher" 2>/dev/null || true
+        wait "$watcher" 2>/dev/null || true
         log "monitor exited — bye"
         return 0
     done
@@ -625,6 +650,16 @@ ensure-venv)
     ensure_venv
     exit 0
     ;;
+reset)
+    # Signal a running `spangap monitor` to restart and reset the device (a
+    # clean reboot + boot-log capture). Just a marker file at the workspace
+    # root — the monitor loop watches for it alongside .spangap-flashme. No
+    # docker, no container. (Tearing the workspace's container/image down is
+    # `spangap reset-workspace`.)
+    touch "$workspace/.spangap-resetme"
+    log "signaled monitor to reset the device (.spangap-resetme)"
+    exit 0
+    ;;
 flash)
     shift
     proj=$(require_straddle flash)
@@ -636,26 +671,26 @@ flash)
     fi
     fw=$(resolve_firmware_dir "$proj") \
         || die "no CMakeLists.txt in $proj or its esp-idf/ subdir"
-    mkdir -p "$fw/build"
+    flashme="$workspace/.spangap-flashme"
     if port_busy "$port"; then
-        touch "$fw/build/flashme"
-        log "$port busy — signaled $fw/build/flashme; waiting for a monitor to pick it up..."
+        touch "$flashme"
+        log "$port busy — signaled $flashme; waiting for a monitor to pick it up..."
         for _ in 1 2 3 4 5; do
             sleep 1
-            [ -f "$fw/build/flashme" ] || { log "flashing."; exit 0; }
+            [ -f "$flashme" ] || { log "flashing."; exit 0; }
         done
         die "$port was busy but nobody is flashing when I signal to. Start \`spangap monitor\` on a host with the port."
     fi
     ensure_venv
     # Flash once and exit. To watch the device afterwards, chain a monitor:
     #   spangap flash <port> && spangap monitor
-    do_flash "$port" "$fw" "$fw/build/flasher.log" || exit 1
+    do_flash "$port" "$fw" "$workspace/.spangap-log" || exit 1
     # We just flashed directly, so clear any pending flashme — otherwise a
     # monitor that starts later would treat the stale signal as a fresh
     # reflash request and re-flash a board that's already current. (The
     # monitor loop consumes flashme itself on the signalled path; this covers
     # the port-free direct flash, which never goes through it.)
-    rm -f "$fw/build/flashme"
+    rm -f "$flashme"
     exit 0
     ;;
 monitor)
@@ -814,7 +849,7 @@ esac
 
 # ws_hash / container are defined up in the config section (the monitor path
 # needs them before this point).
-# Persistent per-user home: a single bind mount at /home/ubuntu inside
+# Persistent per-user home: a single bind mount at /home/spangap inside
 # the container. `pip install --user`, `npm install -g`, ccache, the
 # Claude CLI's auth + history, shell history, dotfiles — everything that
 # would normally live in $HOME persists across container recreations and
@@ -1052,7 +1087,7 @@ ensure_container() {
     # symlinks and no host paths inside the container: the build navigates
     # /repos/<repo>, and `file:../../<sibling>` resolves to /repos/<sibling>
     # because the tree is flat. Adding/removing a straddle under <repo_path>
-    # needs no `spangap reset` — the whole-tree mount picks it up live. (No
+    # needs no `spangap reset-workspace` — the whole-tree mount picks it up live. (No
     # repo_path → straddles are git-cloned as real flat dirs in the workspace,
     # covered by the /workspace mount.)
     local repo_mount=()
@@ -1074,7 +1109,7 @@ ensure_container() {
     # directly anyway. Either way the flag buys nothing, so it's gone.
     docker run -d --name "$container" \
         -v "$workspace:/workspace" \
-        -v "$spangap_home:/home/ubuntu" \
+        -v "$spangap_home:/home/spangap" \
         ${repo_mount[@]+"${repo_mount[@]}"} \
         --workdir /workspace \
         --label spangap.workspace="$workspace" \
@@ -1082,12 +1117,12 @@ ensure_container() {
         "$IMAGE" sleep infinity >/dev/null
 
     # Pre-create the npm prefix dir (Dockerfile sets NPM_CONFIG_PREFIX
-    # but the bind mount hides any dirs the image baked into /home/ubuntu)
-    # and align ownership with the in-container ubuntu user. Failures are
+    # but the bind mount hides any dirs the image baked into /home/spangap)
+    # and align ownership with the in-container spangap user. Failures are
     # benign on Docker Desktop where the bind mount handles uid mapping
     # for us.
     docker exec -u 0 "$container" sh -c \
-        'mkdir -p /home/ubuntu/.npm-global && chown -R ubuntu:ubuntu /home/ubuntu 2>/dev/null || true'
+        'mkdir -p /home/spangap/.npm-global && chown -R spangap:spangap /home/spangap 2>/dev/null || true'
 }
 
 # Host-side require-fetching loop. Runs `spangap list-deps` inside the
@@ -1198,7 +1233,7 @@ ensure-container)
     ensure_container
     exit 0
     ;;
-reset)
+reset-workspace)
     shift
     ensure_daemon
     # reallyclean first while the container is still alive: it sweeps every
@@ -1223,13 +1258,13 @@ reset)
         log "removing image $IMAGE"
         docker rmi "$IMAGE" >/dev/null
     fi
-    # Rebuild the image and start a fresh container now, so `spangap reset`
-    # hands back a ready-to-use container instead of deferring first-run
-    # latency to the next command. ensure_container honours SPANGAP_QUIET
-    # (set for reset up top), so docker build output collapses to a single
-    # status line unless -v/--verbose.
+    # Rebuild the image and start a fresh container now, so `spangap
+    # reset-workspace` hands back a ready-to-use container instead of deferring
+    # first-run latency to the next command. ensure_container honours
+    # SPANGAP_QUIET (set for reset-workspace up top), so docker build output
+    # collapses to a single status line unless -v/--verbose.
     ensure_container
-    log "reset complete — container rebuilt."
+    log "reset-workspace complete — container rebuilt."
     exit 0
     ;;
 esac

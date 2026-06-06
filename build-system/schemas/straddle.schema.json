@@ -53,7 +53,7 @@
       "default": []
     },
     "optional_requires": {
-      "description": "Other straddles this one integrates with WHEN PRESENT — pruned silently from the build if absent (because they weren't cloned, because the buildable doesn't list them, or because --exclude/--no-X dropped them). Source code must gate corresponding call sites on the auto-generated CONFIG_STRADDLE_<UPPER_NAME> (or the CONFIG_SPANGAP_LCD/CONFIG_SPANGAP_WEB shortcuts) so absence compiles away cleanly.",
+      "description": "Other straddles this one integrates with WHEN PRESENT — pruned silently from the build if absent (because they weren't cloned, because the buildable doesn't list them, or because --without/--no-X dropped them). Source code must gate corresponding call sites on the auto-generated CONFIG_STRADDLE_<UPPER_NAME> (or the CONFIG_SPANGAP_LCD/CONFIG_SPANGAP_WEB shortcuts) so absence compiles away cleanly.",
       "type": "array",
       "items": {
         "type": "string",
@@ -61,8 +61,30 @@
       },
       "default": []
     },
+    "start": {
+      "description": "START-phase hooks: bare-hardware bring-up the platform itself depends on, run by the generated spangapStartStraddles() dispatcher as the FIRST thing in app_main — BEFORE spangapInit(), i.e. before fs/storage/log/cli even exist. This is the band for a board straddle to power a peripheral rail before spangap-core's fs_mount_sd() touches the SD bus, register the display/touch HAL before spangap-lcd's lcdInit(), etc. CONTRACT (the strict inverse of init:): a start hook runs on bare hardware — it must NOT use info()/warn()/dbg(), storage*, fs_*, or ITS (none are up yet); raw peripherals only (GPIO, power rails, pin mux, bus CS parking, HAL/driver registration that later init: hooks consume). Ordering is the same dependency-topo walk as init: (a board lands early because its dependents require: it); within one straddle, hooks fire in listed order. Same entry shape and `when:` gating as init:. By convention a start hook is named xStart (e.g. tdeckStart), mirroring the xInit convention of init:.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["call"],
+        "properties": {
+          "call": {
+            "description": "Start function symbol, e.g. 'tdeckStart'. A plain global `void <name>()` (default C++ linkage) defined in this straddle's firmware half — same convention as init:'s xInit. The dispatcher forward-declares it with C++ linkage and calls it, so no header wiring and no `extern \"C\"` wrapper is needed (a C-linkage symbol from a .c file would need one to match).",
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "when": {
+            "description": "Optional gate: emit this hook's call only when the named straddle ('<org>/<repo>') is in the staged build set. Resolved at generation time against the staged set — when the straddle is pruned the call is simply NOT written (no #if), so the hook symbol is never referenced and -ffunction-sections/--gc-sections drops it along with its references into the now-absent dep. Use the same '<org>/<repo>' vocabulary as optional_requires (e.g. 'spangap/spangap-lcd'). Omit for an unconditional hook.",
+            "type": "string",
+            "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+$"
+          }
+        }
+      },
+      "default": []
+    },
     "init": {
-      "description": "Boot init hooks this straddle wants the buildable to run automatically. spangap-inside collects these across the staged set and generates staging/spangap_init_dispatch.gen.cpp — a spangapInitStraddles() that calls them in two bands: first spangap's own platform components (core, net, web, lcd) in that fixed order, then every other straddle in dependency-topo order (a straddle inits after the straddles it requires:). There is no per-hook order knob — a straddle that must come up after another declares it in requires:/optional_requires: and the topo walk handles it; everything in the straddle band can already assume the platform band is up. Within one straddle, hooks fire in listed order. The buildable calls spangapInitStraddles() once; from then on, staging a straddle that declares init: is enough to have it initialize — no consumer main.cpp edit. Each entry's `call` is a plain global `void <name>()` defined in this straddle's firmware half (the dispatcher emits its own C++-linkage forward declaration, so no header wiring and no `extern \"C\"` is needed).",
+      "description": "INIT-phase hooks this straddle wants the buildable to run automatically, AFTER spangapInit() (the platform foundations) — the post-infrastructure band, contrast start: above. spangap-inside collects these across the staged set and generates staging/spangap_init_dispatch.gen.cpp — a spangapInitStraddles() that calls them in two bands: first spangap's own platform components (core, net, web, lcd) in that fixed order, then every other straddle in dependency-topo order (a straddle inits after the straddles it requires:). There is no per-hook order knob — a straddle that must come up after another declares it in requires:/optional_requires: and the topo walk handles it; everything in the straddle band can already assume the platform band is up. Within one straddle, hooks fire in listed order. The buildable calls spangapInitStraddles() once; from then on, staging a straddle that declares init: is enough to have it initialize — no consumer main.cpp edit. Each entry's `call` is a plain global `void <name>()` defined in this straddle's firmware half (the dispatcher emits its own C++-linkage forward declaration, so no header wiring and no `extern \"C\"` is needed). By convention an init hook is named xInit.",
       "type": "array",
       "items": {
         "type": "object",
@@ -73,8 +95,22 @@
             "description": "Init function symbol, e.g. 'sshdInit'. A plain global `void <name>()` (default C++ linkage) defined in this straddle's firmware half — the same convention every straddle's xInit() already follows. The dispatcher forward-declares it with C++ linkage and calls it, so no header wiring and no `extern \"C\"` wrapper is needed (a C-linkage symbol from a .c file would need one to match).",
             "type": "string",
             "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "when": {
+            "description": "Optional gate: emit this hook's call only when the named straddle ('<org>/<repo>') is in the staged build set. Resolved at generation time against the staged set — when the straddle is pruned the call is simply NOT written (no #if), so the hook symbol is never referenced and -ffunction-sections/--gc-sections drops it along with its references into the now-absent dep. Use the same '<org>/<repo>' vocabulary as optional_requires (e.g. 'spangap/spangap-lcd'). Omit for an unconditional hook. This is the finer-grained twin of how a whole straddle's hooks already appear only when it is staged — it lets one straddle's hook ride on ANOTHER straddle's presence.",
+            "type": "string",
+            "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+$"
           }
         }
+      },
+      "default": []
+    },
+    "kconfig": {
+      "description": "Sdkconfig default lines this straddle contributes to the build — the road by which a NON-buildable straddle (typically a board, e.g. hw-tdeck) supplies Kconfig VALUES that another non-buildable straddle's component Kconfig DEFINES (LoRa/SD/LCD pins, etc.). spangap-inside collects every staged straddle's lines into staging/sdkconfig.spangap-fragments, which bootstrap.cmake layers into SDKCONFIG_DEFAULTS between the platform defaults and the buildable's own sdkconfig.defaults. Precedence is the init order: platform band first, then the straddle band in dependency-topo order, then the buildable itself last (the building straddle wins among fragments); the buildable's sdkconfig.defaults and CLI overrides win over all of it. Each item is emitted verbatim as an sdkconfig line, so the RHS (=y, ints, hex, \"quoted strings\") is preserved exactly. The peripheral straddle still owns the option's schema/help/range in its component Kconfig — this only sets the value. Two different straddles setting the same symbol is warned about (silent last-wins otherwise).",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(CONFIG_[A-Z0-9_]+=.+|# CONFIG_[A-Z0-9_]+ is not set)$"
       },
       "default": []
     },

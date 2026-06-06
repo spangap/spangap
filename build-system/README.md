@@ -12,22 +12,25 @@ the container-side map.
 
 ## Where you are
 
-You're `spangap`, cwd **`/workspace`**, `HOME=/home/spangap`. The container is started
-with `sleep infinity` and you reach it by `docker exec`; it always carries at least two
-host bind mounts — **`/workspace`** (the spangap workspace dir) and **`/home/spangap`**
-(persistent home) — plus optionally **`/repos`** (only when this workspace was init'd
-with `--repo-path`; see below). On macOS Docker Desktop these mounts are `fakeowner`
+You're `spangap`, cwd **`<workspace>`** (the host workspace dir, bind-mounted at
+`/home/spangap/<basename>` — nested under the persistent home mount), `HOME=/home/spangap`.
+The container is started
+with `sleep infinity` and you reach it by `docker exec`; it always carries at least the
+host bind mount **`/home/spangap`** (persistent home, with the workspace nested under it
+at `/home/spangap/<basename>`) — plus optionally **`/straddles`** (only when this workspace
+was init'd with `--straddles`; see below). On macOS Docker Desktop these mounts are `fakeowner`
 type, which drives a couple of gotchas at the end of this file.
 
-Don't assume the rest of your situation — **discover it.** `spangap show` reports the
-resolved project + its deps + the toolchain/environment; `ls /workspace` and `ls /repos
+Don't assume the rest of your situation — **discover it.** Bare `spangap` (same as
+`spangap show`) reports the
+resolved project + its deps + the toolchain/environment; `ls <workspace>` and `ls /straddles
 2>/dev/null` show what's mounted; the workspace dotfiles tell you the mode:
 
-- `/workspace/spangap.workspace.yaml` — the workspace marker (always present).
-- `/workspace/.spangap-repo_path` — **present ⟺ `--repo-path` mode** (its contents are
-  the host checkout path that's bind-mounted at `/repos`). Absent ⟹ clone mode.
-- `/workspace/.spangap-project` — the default buildable straddle, if one was set at
-  `init` (a bare `spangap build` from `/workspace` then targets it, no `cd` needed).
+- `<workspace>/spangap.workspace.yaml` — the workspace marker (always present).
+- `<workspace>/.spangap-straddles` — **present ⟺ `--straddles` mode** (its contents are
+  the host checkout path that's bind-mounted at `/straddles`). Absent ⟹ clone mode.
+- `<workspace>/.spangap-project` — the default buildable straddle, if one was set at
+  `init` (a bare `spangap build` from `<workspace>` then targets it, no `cd` needed).
   **This is your main orientation pointer.** The user is most likely working on this
   specific project, so resolve it to its straddle dir (`<root>/<that-repo>/`) and **read
   its `README.md` first** (then `INTERNALS.md` / any `docs/`). The buildable straddle is
@@ -55,22 +58,22 @@ tree (see ["What `spangap build` does"](#what-spangap-build-does-under-the-hood)
 `spangap-inside` scans **two** container-native roots, in this order, and a straddle in
 either is equally usable:
 
-- **`/workspace/<repo>`** — git clones. This is the **default** mode (no `--repo-path`),
+- **`<workspace>/<repo>`** — git clones. This is the **default** mode (no `--straddles`),
   and what most sessions see: `init` clones the build-system skeleton (`spangap`), the
   project, and every transitive dep into the workspace as flat sibling dirs, and they
   stay pinned there. **Look here first.**
-- **`/repos/<repo>`** — a **flat `--repo-path` checkout** bind-mounted whole, *only* when
-  the workspace was init'd with `--repo-path <dir>`. When this mode is in play, the
-  straddles are under `/repos` and `/workspace` holds just workspace state (marker,
-  dotfiles, host venv); `/repos` isn't mounted at all otherwise.
+- **`/straddles/<repo>`** — a **flat `--straddles` checkout** bind-mounted whole, *only* when
+  the workspace was init'd with `--straddles <dir>`. When this mode is in play, the
+  straddles are under `/straddles` and `<workspace>` holds just workspace state (marker,
+  dotfiles, host venv); `/straddles` isn't mounted at all otherwise.
 
-Quick check: `cat /workspace/.spangap-repo_path 2>/dev/null` — a path means look in
-`/repos`, nothing means look in `/workspace`. (The two roots are disjoint by
-construction: repo_path mode never clones into `/workspace`.)
+Quick check: `cat <workspace>/.spangap-straddles 2>/dev/null` — a path means look in
+`/straddles`, nothing means look in `<workspace>`. (The two roots are disjoint by
+construction: --straddles mode never clones into `<workspace>`.)
 
 Both roots are **host bind mounts**, so anything you write under a straddle's `build/`
-is read directly by the host flasher, and the container path (`/workspace/<repo>` or
-`/repos/<repo>`) is what gets baked into `build/CMakeCache.txt`'s `CMAKE_HOME_DIRECTORY`
+is read directly by the host flasher, and the container path (`<workspace>/<repo>` or
+`/straddles/<repo>`) is what gets baked into `build/CMakeCache.txt`'s `CMAKE_HOME_DIRECTORY`
 — stable and host-independent. **Never bake a host-absolute path into the build.**
 
 ## `spangap` in here = the in-container CLI
@@ -86,17 +89,19 @@ container these verbs work directly, with the IDF env already set up:
 | `spangap validate` | parse + jsonschema-check the manifest and dep graph (fast, read-only) |
 | `spangap list-requires` / `list-deps` | full transitive set / missing siblings (read-only diagnostics) |
 | `spangap clean` / `reallyclean` | `idf.py fullclean` / strip **every** straddle in the active root back to source (gitignored artifacts only) |
-| `spangap show` | project straddle + deps in init order, the env report (python, IDF_PATH, node/npm/idf.py versions), and whether a host `spangap monitor` is ready to flash |
-| `spangap cli [-h host] <cmd>` | talk to a running device over the network (TCP CLI) |
+| `spangap show` | project straddle + deps in init order, the env report (python, IDF_PATH, node/npm/idf.py versions), and whether a host `spangap monitor` is ready to flash (bare `spangap` with no subcommand does the same; `show` stays as an explicit alias) |
+| `spangap cli [-h host] [<cmd>]` | talk to a running device over the network (ssh, else TCP CLI) |
 | `spangap flash` | **signal only** — touches `.spangap-flashme` (workspace root) and waits ≤5s for a host monitor to consume it (see below) |
+| `spangap reset` | **signal only** — touches `.spangap-resetme` (workspace root) and waits ≤5s for a host monitor to consume it; the monitor restarts with a device reset (clean reboot + boot-log capture), no reflash |
 
-**`spangap flash` / `spangap cli` from in here don't touch hardware directly** — the
-container has no USB. `flash` only signals a host monitor; `cli` reaches the device
+**`spangap flash` / `spangap reset` / `spangap cli` from in here don't touch hardware
+directly** — the
+container has no USB. `flash`/`reset` only signal a host monitor; `cli` reaches the device
 over the network. The full device loop is its own section below
 ([Working with a real device](#working-with-a-real-device--the-you--user--board-loop)).
 
 **Host-only verbs you can't run from this container:** `monitor`, `probe`, real
-`flash`, `init`, `reset`, `reset-workspace`, `get-deps` (the cloning side), and
+`flash`, `init`, `reset-workspace`, `get-deps` (the cloning side), and
 `docker <cmd>` — those
 live in **`spangap-outside`** on the host and need the serial port / docker / the
 container lifecycle. There is **no `docker` and no `esptool.py`** in here by design
@@ -143,7 +148,7 @@ it isn't up (or isn't in the project dir) — ask the user to (re)start it there
 
 **2. See what the board is doing.** The monitor writes a live, ANSI-stripped copy of
 the serial output to **`.spangap-log` at the workspace root** — it's on the bind mount
-(`/workspace/.spangap-log` in here), so you can `tail -f` / read it from in here. **This
+(`<workspace>/.spangap-log` in here), so you can `tail -f` / read it from in here. **This
 is your only window into the device — use it.**
 In particular it's where you check:
 
@@ -154,30 +159,40 @@ In particular it's where you check:
 
 It's truncated on each flash, so it reflects the **current** boot.
 
-**3. Drive the device over the network.** By default the device CLI is serial-only. To
-let you reach it from in here, have the user type — **in the monitor window** (that
-window is a live serial CLI to the device) — :
+**3. Drive the device over the network.** `spangap cli [<cmd>]` reaches the device, and
+the host `spangap monitor` **owns the bridge** that fronts it (the container can't route
+to the device's LAN, so on Docker Desktop it dials `host.docker.internal` and the monitor
+splices to the real device; native Linux reaches the LAN directly). The monitor opens the
+bridge on start from whatever endpoints are configured and closes it on exit, so the bridge
+only lives while a monitor is running. Two workspace-root files name the device:
 
-```
-set s.net.cli_port=2323
-```
+- **`.spangap-ssh`** — `<host-or-ip>:<port>` (ssh; default 22). `spangap cli` **prefers this.**
+- **`.spangap-tcp`** — `<host-or-ip>:<port>` (TCP CLI; default 2323).
 
-That opens the device's TCP CLI on port **2323** (the `s.` prefix persists it to flash).
-From then on, from inside this container:
+**First-time SSH setup** (the default path): run `spangap cli` with neither file present.
+It generates `~/.ssh/id_ed25519` if missing, asks for the device IP (from `.spangap-log`),
+writes `.spangap-ssh`, and prints a `sshd add <pubkey>` line. Have the user paste that line
+**in the monitor window** (a live serial CLI to the device) to authorize the key. `sshd` is
+enabled by default and admits no one without an authorized key; if it isn't in the build,
+add it with `spangap build --with spangap/sshd`. Then, from inside this container:
 
 ```sh
-spangap cli -h <device-ip> get s.net      # IP from .spangap-log; -h is sticky, omit it afterwards
-spangap cli set s.some.key value          # subsequent calls reuse the sticky host
+spangap cli get s.net                     # over ssh; one-shot exec, prints and exits
+spangap cli set s.some.key value          # subsequent calls reuse .spangap-ssh
+spangap cli                               # no args → interactive shell
 ```
 
-`spangap cli` defaults to port 2323 to match. **Device CLI commands are silent on
-success** (`set` / `unset` / `save` print nothing when they work) — no output means it
-worked, not that it hung.
+**TCP CLI alternative:** have the user type `set s.net.cli_port=2323` in the monitor window
+(opens the device's TCP CLI; `s.` persists it to flash) and write `.spangap-tcp` with
+`<device-ip>:2323`. With no `.spangap-ssh` present, `spangap cli` then uses that socket.
+
+**Device CLI commands are silent on success** (`set` / `unset` / `save` print nothing when
+they work) — no output means it worked, not that it hung.
 
 **Iteration tips.**
 
-- **Sticky state:** the serial port (`.spangap-port-<os>-<arch>`) and CLI host
-  (`.spangap-host`) are remembered — set each once, omit thereafter.
+- **Sticky state:** the serial port (`.spangap-port-<os>-<arch>`) and the device endpoint
+  (`.spangap-ssh` / `.spangap-tcp`) are remembered — set each once, omit thereafter.
 - **One terminal, both jobs:** the single host `spangap monitor` gives the *user* the
   live console *and* gives *you* the flash signal + the `.spangap-log` to read. Once it's
   running, a normal cycle needs no user action: you build, you `spangap flash`, you read
@@ -189,7 +204,7 @@ worked, not that it hung.
 - **Stack decode** needs the build's ELF, which the monitor finds in `esp-idf/build/` —
   so flash a build you actually built here and panics in `.spangap-log` resolve to source.
 
-## The straddle tree (`/workspace` or `/repos`)
+## The straddle tree (`<workspace>` or `/straddles`)
 
 Whichever root applies (above), it's a **flat** directory of straddle dirs. A fully
 populated checkout of the core platform plus a downstream project looks like:
@@ -208,13 +223,13 @@ populated checkout of the core platform plus a downstream project looks like:
 per-buildable subset into one flat tree.) The flat layout is **mandatory**: on macOS
 Docker Desktop a symlink resolves through to its host target, so the browser
 `file:../../<sibling>/browser` deps only resolve when straddle roots are flat siblings
-(INTERNALS → "Flat repo_path"). Don't add an org/ layer.
+(INTERNALS → "Flat --straddles checkout"). Don't add an org/ layer.
 
 `straddle.yaml` keys (contract: `build-system/schemas/straddle.schema.json` — the
 **authoritative** list; the schema is local, read it before hand-writing a manifest):
 `name` (`<org>/<repo>`), `prefix` (symbol/import prefix; empty reserved for
 spangap-core), `version` (`X.Y.Z`); `requires` (hard — missing = error;
-`--exclude`ing one cascades the drop to whatever hard-requires it, and is
+dropping one with `--without` cascades the drop to whatever hard-requires it, and is
 refused only when it would take out spangap-core or a buildable hard-require),
 `optional_requires` (soft, **default-on**, pruned silently when absent —
 call sites **must** gate on `CONFIG_*`); `firmware:` / `browser:` (paths to the two
@@ -231,24 +246,24 @@ gate, which keys off the **repo name**, not the prefix):
 | repo | prefix | repo | prefix |
 |---|---|---|---|
 | `spangap-core` | `""` (reads as language primitives: `storageGet`, `info`…) | `rns` | `rns` |
-| `spangap-net` | `net` | `tr-tcp` | `rns_tcp` |
-| `spangap-web` | `web` | `tr-auto` | `rns_auto` |
-| `spangap-lcd` | `lcd` | `tr-espnow` | `rns_espnow` |
-| `acme` `duckdns` `upnp` `wg` `ota` | (= repo) | `tr-lora` | `rns_lora` |
+| `spangap-net` | `net` | `iface-tcp` | `rns_tcp` |
+| `spangap-web` | `web` | `iface-auto` | `rns_auto` |
+| `spangap-lcd` | `lcd` | `iface-espnow` | `rns_espnow` |
+| `acme` `duckdns` `upnp` `wg` `ota` | (= repo) | `iface-lora` | `rns_lora` |
 | `sshd` | `sshd` | `lxmf` | `lxmf` |
 | `maps` | `maps` | `nomad` | `nomad` |
 | | | `hw-tdeck` | `tdeck` |
 
-This table can go stale — `spangap-inside` reads the real values; `ls /repos` +
-`grep -h '^prefix:' /repos/*/straddle.yaml` is the source of truth. Note `sshd` and
+This table can go stale — `spangap-inside` reads the real values; `ls /straddles` +
+`grep -h '^prefix:' /straddles/*/straddle.yaml` is the source of truth. Note `sshd` and
 `maps` exist as straddles but are **absent from the org-README straddle tables and from
 the `CONFIG_SPANGAP_*` alias list** below — don't assume the documented set is complete;
-enumerate `/repos`.
+enumerate `/straddles`.
 
 ## What `spangap build` does under the hood
 
-1. resolve `spangap-core (implicit) ∪ requires ∪ optional_requires ∪ --include`, transitively,
-   minus `--exclude`/`--no-X` and the reverse-dependency cascade they trigger.
+1. resolve `spangap-core (implicit) ∪ requires ∪ optional_requires ∪ --with`, transitively,
+   minus `--without`/`--no-X` and the reverse-dependency cascade they trigger.
 2. stage each kept dep into `staging/components/<repo>/`: symlinks to source + a generated
    `spangap_requires.cmake` (`set(SPANGAP_REQUIRES …)`), plus a synthetic `_spangap_present`
    component whose `Kconfig.projbuild` declares `CONFIG_STRADDLE_<UPPER_REPO>` (default y)
@@ -290,8 +305,8 @@ diverged from the image's `org.spangap.buildsys-hash` LABEL and rebuilds on the 
 host command).
 
 To **test an edit to the in-container CLI without a rebuild**, run the source copy
-directly (use the spangap repo's actual path — `/workspace/spangap` in clone mode,
-`/repos/spangap` under `--repo-path`):
+directly (use the spangap repo's actual path — `<workspace>/spangap` in clone mode,
+`/straddles/spangap` under `--straddles`):
 
 ```sh
 . "$IDF_PATH/export.sh"                              # only needed for build; not for validate/list-*
@@ -341,11 +356,11 @@ then `spangap list-requires`; a real `spangap build` confirms staging + linking.
   leave it; don't "fix" the mode noise or chmod to silence it.
 - **The running `spangap` is the image copy**, not the source tree (see "Editing"
   above). Don't expect source edits to take effect through `spangap …` without a rebuild.
-- **Under `--repo-path`, `/repos` is a pinned checkout** — nothing is ever cloned; a
+- **Under `--straddles`, `/straddles` is a pinned checkout** — nothing is ever cloned; a
   missing required straddle is an error ("add it to the checkout"), not a fetch. In clone
-  mode, missing transitive deps are fetched host-side into `/workspace`.
+  mode, missing transitive deps are fetched host-side into `<workspace>`.
 - **`reallyclean` is workspace-wide** — it reaches across *every* straddle in the active
-  root (including into a `--repo-path` checkout, since `/repos` *is* that checkout), but
+  root (including into a `--straddles` checkout, since `/straddles` *is* that checkout), but
   only removes gitignored, regenerable output.
 
 ## Stale-doc caveats (the sibling READMEs are mid-rewrite — don't trust these bits)
@@ -355,8 +370,8 @@ superseded per-straddle `CLAUDE.md` files. Four concrete traps when reading them
 
 - **The flat layout is real; the `s/` paths in docs are not.** Some READMEs (notably
   `hw-tdeck`) link siblings as `../../s/spangap/INTERNALS.md` or
-  `[…](../../s/)`. There is **no `s/` directory** — `/repos` (or `/workspace`) is flat,
-  as this file's tree shows. Resolve any `s/`-style link to `/repos/<repo>/…` directly.
+  `[…](../../s/)`. There is **no `s/` directory** — `/straddles` (or `<workspace>`) is flat,
+  as this file's tree shows. Resolve any `s/`-style link to `/straddles/<repo>/…` directly.
 - **README file-layout boxes are partly aspirational.** The org-profile README and
   `spangap-core` README describe the spangap repo as `cli/spangap`, `install/spangap`,
   `scripts/`, etc. The **actual** tree is `build-system/{spangap-inside, spangap-outside,

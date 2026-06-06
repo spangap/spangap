@@ -16,10 +16,11 @@
 #   probe [<dev>]    run esptool flash_id and print chip + flash size, plus
 #                    the matching `spangap build --flash-size <MB>` invocation.
 #                    Useful for generic builds against unknown hardware.
-#   cli [-h host] [cmd...]
-#                    talk to the device's TCP CLI. -h persists hostname to
-#                    ./.spangap-host in the workspace root; subsequent calls
-#                    can omit it.
+#   cli [-h host[:port]] [cmd...]
+#                    talk to the device. Prefers ssh (.spangap-ssh), else the
+#                    TCP CLI (.spangap-tcp); with neither, bootstraps an ed25519
+#                    key + writes .spangap-ssh. -h persists the ssh endpoint to
+#                    ./.spangap-ssh in the workspace root; subsequent calls omit it.
 #   get-deps         git-clone any missing transitive `requires:` siblings
 #                    (uses host github creds; container has none). Also runs
 #                    automatically as part of `build`.
@@ -48,10 +49,10 @@
 #
 # Everything else docker-exec's into spangap-inside unchanged.
 #
-# Serial-port and CLI-host stickiness: explicit args overwrite
+# Serial-port and device-endpoint stickiness: explicit args overwrite
 # $SPANGAP_WORKSPACE/.spangap-port-<os>-<arch> (per-host, since /dev paths
-# differ) and .spangap-host (workspace-wide) respectively, and bare
-# invocations read whichever file's there.
+# differ) and .spangap-ssh / .spangap-tcp (workspace-wide) respectively, and
+# bare invocations read whichever file's there.
 set -euo pipefail
 
 # Silence Docker CLI's "What's next:" hint footer, which the docker CLI prints
@@ -63,6 +64,14 @@ export DOCKER_CLI_HINTS=false
 
 IMAGE="${SPANGAP_IMAGE:-spangap-build-env:dev}"
 workspace="${SPANGAP_WORKSPACE:?spangap-outside: SPANGAP_WORKSPACE not set (invoke via the root \`spangap\` script)}"
+
+# In-container path of the workspace bind mount. The workspace is mounted UNDER
+# the persistent home (~ = /home/spangap) at its own basename, so the whole tree
+# the user works on lives under $HOME in the container (e.g. host
+# /Users/me/code/foo → /home/spangap/foo). spangap-inside learns it via
+# SPANGAP_WORKSPACE, passed on every `docker exec` below; host_to_container and
+# the addr2line shim remap host paths against it.
+container_ws="/home/spangap/$(basename "$workspace")"
 
 # Decide SPANGAP_QUIET very early so that the host-side phases — git-clone and
 # container/image setup — can collapse their verbose output into a single
@@ -175,13 +184,13 @@ find_straddle() {
 
 # project_host_dir <name>: host dir of straddle <name>, or return 1. A
 # straddle is either git-cloned at $workspace/<name> or lives in the flat
-# repo_path checkout at <repo_path>/<name> (the latter is what gets bind-
-# mounted to /repos inside the container). Checks the clone first.
+# --straddles checkout at <straddles>/<name> (the latter is what gets bind-
+# mounted to /straddles inside the container). Checks the clone first.
 project_host_dir() {
-    local name=$1 rp
+    local name=$1 sd
     [ -f "$workspace/$name/straddle.yaml" ] && { printf '%s\n' "$workspace/$name"; return 0; }
-    rp=$(read_repo_path)
-    [ -n "$rp" ] && [ -f "$rp/$name/straddle.yaml" ] && { printf '%s\n' "$rp/$name"; return 0; }
+    sd=$(read_straddles)
+    [ -n "$sd" ] && [ -f "$sd/$name/straddle.yaml" ] && { printf '%s\n' "$sd/$name"; return 0; }
     return 1
 }
 
@@ -220,7 +229,7 @@ require_straddle() {
             local init_project init_dir
             init_project=$(cat "$proj_file")
             init_dir=$(project_host_dir "$init_project") \
-                || die ".spangap-project names '$init_project' but no straddle.yaml at $workspace/$init_project or <repo_path>/$init_project — cd into the straddle you want to $cmd"
+                || die ".spangap-project names '$init_project' but no straddle.yaml at $workspace/$init_project or <straddles>/$init_project — cd into the straddle you want to $cmd"
             grep -qE '^buildable:' "$init_dir/straddle.yaml" \
                 || die "$init_project is not buildable (no \`buildable:\` block) — cd into a buildable straddle and retry"
             printf '%s\n' "$init_dir"
@@ -245,35 +254,39 @@ resolve_firmware_dir() {
 }
 
 # ---------------------------------------------------------------------------
-# Sticky $SPANGAP_PORT / $SPANGAP_HOST via workspace-root state files.
+# Sticky $SPANGAP_PORT + device endpoints via workspace-root state files.
 # ---------------------------------------------------------------------------
 
 # Port path is per-host (e.g. /dev/cu.usbmodem* on macOS vs /dev/ttyUSB*
 # on Linux), so a workspace shared across hosts needs one sticky-port
-# file per host. Device hostname is the same from anywhere, so HOST_FILE
-# stays workspace-wide.
+# file per host.
 PORT_FILE="$workspace/.spangap-port-$(uname -s)-$(uname -m)"
-HOST_FILE="$workspace/.spangap-host"
 
-# Host-side LAN relay (see ensure_forwarder). Script is workspace-wide (static
-# content); pid/log are per-host since the relay is a host-local process — a
+# Device endpoints, workspace-wide (the device address is the same from
+# anywhere). `spangap cli` prefers ssh, then the TCP CLI; `spangap monitor`
+# owns the host-side bridge that fronts these. Each holds "<host-or-ip>:<port>".
+SSH_FILE="$workspace/.spangap-ssh"   # ssh, default port 22
+TCP_FILE="$workspace/.spangap-tcp"   # TCP CLI, default port 2323
+
+# Host-side LAN bridge (see start_bridge). Script is workspace-wide (static
+# content); pid/log are per-host since the bridge is a host-local process — a
 # workspace shared across machines would otherwise clash on one pidfile.
 FORWARD_SCRIPT="$workspace/.spangap-forward.py"
 FORWARD_PID="$workspace/.spangap-forward-$(uname -s)-$(uname -m).pid"
 FORWARD_LOG="$workspace/.spangap-forward-$(uname -s)-$(uname -m).log"
 
-# Local-repo override: $workspace/.spangap-repo_path holds one host path —
+# Local straddles override: $workspace/.spangap-straddles holds one host path —
 # a flat checkout whose <repo>/ children are the straddles. Instead of
-# git-cloning, the whole tree is bind-mounted to /repos inside the container,
+# git-cloning, the whole tree is bind-mounted to /straddles inside the container,
 # so the build runs against your working tree without round-tripping through
-# github. Written by `spangap init --repo-path <dir>`; empty/missing file or
+# github. Written by `spangap init --straddles <dir>`; empty/missing file or
 # a path that no longer exists ⇒ silently disabled (fall through to git
 # clone as before).
-REPO_PATH_FILE="$workspace/.spangap-repo_path"
-read_repo_path() {
-    [ -f "$REPO_PATH_FILE" ] || return 0
+STRADDLES_FILE="$workspace/.spangap-straddles"
+read_straddles() {
+    [ -f "$STRADDLES_FILE" ] || return 0
     local p
-    p=$(head -1 "$REPO_PATH_FILE" 2>/dev/null)
+    p=$(head -1 "$STRADDLES_FILE" 2>/dev/null)
     # Trim surrounding whitespace.
     p=${p#"${p%%[![:space:]]*}"}
     p=${p%"${p##*[![:space:]]}"}
@@ -293,6 +306,151 @@ sticky_get() {
 
 sticky_set() {
     printf '%s\n' "$2" > "$1"
+}
+
+# Parse "<host>:<port>" (port optional) into the globals EP_HOST / EP_PORT.
+# Splits on the LAST colon when the tail is all digits; bracketed IPv6 literals
+# ("[::1]:22") keep their inner colons. A bare host keeps the supplied default.
+parse_endpoint() {
+    local text=$1 default=$2 host port
+    text=$(printf '%s' "$text" | tr -d ' \t\n')
+    case $text in
+        \[*\]*)  host=${text#\[}; host=${host%%\]*}
+                 port=${text##*\]}; port=${port#:}
+                 [ -n "$port" ] || port=$default ;;
+        *:[0-9]*) port=${text##*:}; host=${text%:*}
+                 case $port in *[!0-9]*) host=$text; port=$default ;; esac ;;
+        *)       host=$text; port=$default ;;
+    esac
+    EP_HOST=$host; EP_PORT=$port
+}
+
+# ---------------------------------------------------------------------------
+# Host-side LAN bridge, owned by `spangap monitor` (defined here, above the
+# command dispatch, because the monitor path runs before the docker section).
+# ---------------------------------------------------------------------------
+
+# Drop the pure-stdlib python TCP relay to disk (idempotent — content is
+# static, so an unconditional rewrite is cheaper than a compare). Args are
+# "<dhost>:<port>" specs; it listens on 0.0.0.0:<port> and splices each accepted
+# connection to <dhost>:<port> (same port number). Bind 0.0.0.0 (not loopback)
+# so Docker Desktop's host.docker.internal gateway can reach it; this is a dev
+# relay to a device already on the LAN, so it widens nothing. Threads, no deps.
+write_forward_script() {
+    cat > "$FORWARD_SCRIPT" <<'PY'
+import socket, sys, threading, signal
+
+def pipe(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try: dst.shutdown(socket.SHUT_WR)
+        except OSError: pass
+
+def handle(client, dhost, dport):
+    try:
+        up = socket.create_connection((dhost, dport), timeout=10)
+    except OSError as e:
+        print(f"spangap-forward: {dhost}:{dport}: {e}", flush=True)
+        client.close()
+        return
+    t = threading.Thread(target=pipe, args=(client, up), daemon=True)
+    t.start()
+    pipe(up, client)
+    client.close(); up.close()
+
+def serve(lport, dhost, dport):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("0.0.0.0", lport))
+    except OSError as e:
+        print(f"spangap-forward: bind :{lport}: {e}", flush=True)
+        return
+    srv.listen(64)
+    while True:
+        try:
+            client, _ = srv.accept()
+        except OSError:
+            return
+        threading.Thread(target=handle, args=(client, dhost, dport),
+                         daemon=True).start()
+
+# Each arg is "<dhost>:<port>" — listen on :port, splice to dhost:port.
+specs = []
+for a in sys.argv[1:]:
+    dhost, _, p = a.rpartition(":")
+    specs.append((dhost, int(p)))
+for dhost, p in specs:
+    threading.Thread(target=serve, args=(p, dhost, p), daemon=True).start()
+print(f"spangap-forward: relaying {specs}", flush=True)
+signal.pause()
+PY
+}
+
+# A container on Docker Desktop can't route to the Mac's LAN segment — "host"
+# networking is the VM's namespace and gvproxy proxies internet egress but not
+# the host's local subnet (see the docker run comment). So the in-container
+# `spangap cli` reaches the device by connecting to host.docker.internal:<port>,
+# where this bridge — running on the Mac, the one machine actually on that LAN —
+# accepts and splices to the device. It forwards whatever endpoints are
+# configured in .spangap-ssh (ssh) and .spangap-tcp (TCP CLI). Darwin-only — on a
+# native Linux host the bridge network reaches the LAN directly, so it's a no-op.
+
+# bridge_specs: emit one "<dhost>:<port>" line per configured endpoint.
+bridge_specs() {
+    local f
+    for f in "$SSH_FILE" "$TCP_FILE"; do
+        [ -f "$f" ] || continue
+        case $f in *-ssh) parse_endpoint "$(cat "$f")" 22 ;; *) parse_endpoint "$(cat "$f")" 2323 ;; esac
+        printf '%s:%s\n' "$EP_HOST" "$EP_PORT"
+    done
+}
+
+# start_bridge: bring up (or refresh) the forwarder for the configured endpoints.
+# Idempotent: a re-run is a liveness check and only restarts when the spec set
+# changed. The pidfile is two lines: pid, then the space-joined spec set.
+start_bridge() {
+    [ "$(uname -s 2>/dev/null)" = Darwin ] || return 0
+    local specs want
+    specs=$(bridge_specs | tr '\n' ' '); specs=${specs% }
+    [ -z "$specs" ] && return 0          # nothing configured yet
+    want=$specs
+
+    if [ -f "$FORWARD_PID" ]; then
+        local pid have
+        pid=$(sed -n 1p "$FORWARD_PID" 2>/dev/null)
+        have=$(sed -n 2p "$FORWARD_PID" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            [ "$have" = "$want" ] && return 0
+            kill "$pid" 2>/dev/null || true   # endpoints changed — restart
+        fi
+    fi
+
+    command -v python3 >/dev/null 2>&1 || {
+        log "skipping LAN bridge: python3 not on PATH"
+        return 0
+    }
+    write_forward_script
+    # shellcheck disable=SC2086
+    nohup python3 "$FORWARD_SCRIPT" $specs >"$FORWARD_LOG" 2>&1 &
+    local pid=$!
+    printf '%s\n%s\n' "$pid" "$want" > "$FORWARD_PID"
+    log "LAN bridge up (pid $pid): host.docker.internal → $specs"
+}
+
+# stop_bridge: tear the forwarder down (called on `spangap monitor` exit).
+stop_bridge() {
+    [ -f "$FORWARD_PID" ] || return 0
+    local pid; pid=$(sed -n 1p "$FORWARD_PID" 2>/dev/null)
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    rm -f "$FORWARD_PID"
 }
 
 # ---------------------------------------------------------------------------
@@ -377,16 +535,16 @@ ensure_addr2line_shim() {
         printf 'notool\n'; return 0
     fi
     # Translate against what the *container* actually has mounted, not the
-    # current .spangap-repo_path. The /repos bind mount is fixed when the
-    # container is created and recorded in its org.spangap.repo-path label;
-    # the .spangap-repo_path file can drift from it (toggling repo_path on/off,
+    # current .spangap-straddles. The /straddles bind mount is fixed when the
+    # container is created and recorded in its org.spangap.straddles label;
+    # the .spangap-straddles file can drift from it (toggling --straddles on/off,
     # or comparing both modes, without `spangap reset-workspace`). Translating against the
     # file instead of the live mount would hand the container a path that isn't
     # mounted there → addr2line can't open the ELF → silent no-decode. The label
     # is the source of truth.
-    local rp
-    rp=$(docker inspect -f '{{ index .Config.Labels "org.spangap.repo-path" }}' \
-        "$container" 2>/dev/null) || rp=""
+    local sd
+    sd=$(docker inspect -f '{{ index .Config.Labels "org.spangap.straddles" }}' \
+        "$container" 2>/dev/null) || sd=""
     mkdir -p "$SHIM_DIR"
     {
         printf '%s\n' '#!/bin/bash'
@@ -397,19 +555,20 @@ ensure_addr2line_shim() {
         printf 'container=%q\n' "$container"
         printf 'a2l=%q\n' "$a2l"
         printf 'workspace=%q\n' "$workspace"
-        printf 'repo_path=%q\n' "$rp"
+        printf 'container_ws=%q\n' "$container_ws"
+        printf 'straddles=%q\n' "$sd"
         cat <<'SHIM'
 # addr2line's only path argument is the ELF (-e <path>); bare addresses pass
-# through untouched. Rewrite any arg that lives under the workspace / repo_path
-# to its container mount (/workspace/... or /repos/...).
+# through untouched. Rewrite any arg that lives under the workspace / straddles
+# checkout to its container mount ($container_ws/... or /straddles/...).
 args=()
 for a in "$@"; do
     case $a in
-        "$workspace")   args+=(/workspace) ;;
-        "$workspace"/*) args+=("/workspace/${a#"$workspace"/}") ;;
+        "$workspace")   args+=("$container_ws") ;;
+        "$workspace"/*) args+=("$container_ws/${a#"$workspace"/}") ;;
         *)
-            if [ -n "$repo_path" ] && { [ "$a" = "$repo_path" ] || case $a in "$repo_path"/*) true ;; *) false ;; esac; }; then
-                [ "$a" = "$repo_path" ] && args+=(/repos) || args+=("/repos/${a#"$repo_path"/}")
+            if [ -n "$straddles" ] && { [ "$a" = "$straddles" ] || case $a in "$straddles"/*) true ;; *) false ;; esac; }; then
+                [ "$a" = "$straddles" ] && args+=(/straddles) || args+=("/straddles/${a#"$straddles"/}")
             else
                 args+=("$a")
             fi
@@ -549,7 +708,7 @@ monitor_loop() {
     local port=$1 fw=$2 do_initial=$3
     # Signal + log files live at the workspace root so the host and the
     # in-container `spangap flash` reach them identically ($workspace/... vs
-    # /workspace/...), and so the stripped-output log target always exists (the
+    # $container_ws/...), and so the stripped-output log target always exists (the
     # workspace dir is always present, unlike a not-yet-built build/).
     #   .spangap-flashme  request a reflash
     #   .spangap-resetme  request a monitor restart that resets the device
@@ -623,6 +782,12 @@ monitor_loop() {
         else
             log "monitor (Ctrl-] exits, \`spangap flash\` re-flashes)"
         fi
+        # Start a fresh logfile on every monitor (re)start — initial attach,
+        # post-flash, or post-reset — so .spangap-log always reflects only the
+        # current boot. run_monitor's perl redirect also opens $log with `>`,
+        # but truncate here explicitly so the guarantee doesn't ride on that
+        # side effect (and holds even if a start path ever skips the stripper).
+        : > "$log"
         run_monitor "$port" "$fw" "$log" "$reset_flags"
 
         # A signal present means the watcher killed monitor to drive the next
@@ -650,16 +815,13 @@ ensure-venv)
     ensure_venv
     exit 0
     ;;
-reset)
-    # Signal a running `spangap monitor` to restart and reset the device (a
-    # clean reboot + boot-log capture). Just a marker file at the workspace
-    # root — the monitor loop watches for it alongside .spangap-flashme. No
-    # docker, no container. (Tearing the workspace's container/image down is
-    # `spangap reset-workspace`.)
-    touch "$workspace/.spangap-resetme"
-    log "signaled monitor to reset the device (.spangap-resetme)"
-    exit 0
-    ;;
+# NOTE: `reset` is intentionally NOT handled here. It now lives in
+# spangap-inside (it must work from inside the container too, reached via
+# `spangap docker claude`), so we let it fall through to the in-container
+# dispatch below — `ensure_container` then `docker exec ... spangap reset`,
+# which touches the same workspace-root .spangap-resetme marker. (Tearing the
+# workspace's container/image down is still the host-only `spangap
+# reset-workspace`.)
 flash)
     shift
     proj=$(require_straddle flash)
@@ -735,6 +897,12 @@ monitor)
             notool)      log "note: no xtensa addr2line found in the build-env container — backtraces won't decode" ;;
         esac
     fi
+    # The monitor owns the host-side bridge: bring it up for whatever endpoints
+    # are configured (.spangap-ssh / .spangap-tcp), and tear it down on exit
+    # (Ctrl-], INT/TERM via monitor_loop's `exit 0`, or normal return all fire
+    # the EXIT trap). Darwin-only inside start_bridge/stop_bridge.
+    trap stop_bridge EXIT
+    start_bridge
     monitor_loop "$port" "$fw" 0
     exit 0
     ;;
@@ -777,14 +945,48 @@ cli)
     while [ $# -gt 0 ]; do
         case $1 in
             -h) [ $# -ge 2 ] || die "-h needs a hostname"
-                sticky_set "$HOST_FILE" "$2"
+                parse_endpoint "$2" 22
+                printf '%s:%s\n' "$EP_HOST" "$EP_PORT" > "$SSH_FILE"
                 shift 2 ;;
             --) shift; break ;;
             *)  break ;;
         esac
     done
-    host=$(sticky_get "$HOST_FILE" SPANGAP_HOST cli "hostname (use -h <host>)")
-    cli_port=${SPANGAP_CLI_PORT:-2323}
+
+    # ssh first, then the legacy TCP CLI, else bootstrap. On the host we sit on
+    # the device's LAN, so dial it directly — no host.docker.internal bridge
+    # (that's the in-container path).
+    if [ -f "$SSH_FILE" ]; then
+        parse_endpoint "$(cat "$SSH_FILE")" 22
+        exec ssh -p "$EP_PORT" \
+            -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=10 "$EP_HOST" "$@"
+    fi
+
+    if [ ! -f "$TCP_FILE" ]; then
+        # Bootstrap: generate a key (no passphrase, no prompts), ask for the
+        # device, persist .spangap-ssh, and print the line to authorize the key
+        # in the device serial monitor.
+        key="$HOME/.ssh/id_ed25519"
+        [ -f "$key" ] || { mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+            ssh-keygen -t ed25519 -N "" -f "$key" -q; }
+        printf 'spangap cli: device hostname or IP: ' >&2
+        read -r dhost
+        [ -n "$dhost" ] || die "no host entered"
+        parse_endpoint "$dhost" 22
+        printf '%s:%s\n' "$EP_HOST" "$EP_PORT" > "$SSH_FILE"
+        printf '\nWrote %s → %s:%s\n\n' ".spangap-ssh" "$EP_HOST" "$EP_PORT"
+        printf 'Now, in the device serial monitor, authorize this key:\n\n'
+        printf '    sshd add %s\n\n' "$(cat "$key.pub")"
+        printf 'sshd is enabled by default; on an older build also run: sshd enable\n'
+        printf 'If sshd is not in your build, rebuild with: spangap build --with spangap/sshd\n'
+        printf '\nThen re-run `spangap cli` to connect over ssh.\n'
+        exit 0
+    fi
+
+    parse_endpoint "$(cat "$TCP_FILE")" 2323
+    host=$EP_HOST
+    cli_port=${SPANGAP_CLI_PORT:-$EP_PORT}
     # Pure-Python TCP CLI — no docker, no IDF, just a socket. Mirrors the
     # in-container `spangap cli` so dev experience is the same from either
     # side.
@@ -881,124 +1083,17 @@ ensure_daemon() {
     esac
 }
 
-# Drop the pure-stdlib python TCP relay to disk (idempotent — content is
-# static, so an unconditional rewrite is cheaper than a compare). Listens on
-# 0.0.0.0:<port> for each forwarded port and splices each accepted connection
-# to <device>:<same-port>. Bind 0.0.0.0 (not loopback) so Docker Desktop's
-# host.docker.internal gateway can reach it; this is a dev relay to a device
-# already on the LAN, so it widens nothing. Threads, no deps.
-write_forward_script() {
-    cat > "$FORWARD_SCRIPT" <<'PY'
-import socket, sys, threading, signal
-
-def pipe(src, dst):
-    try:
-        while True:
-            data = src.recv(65536)
-            if not data:
-                break
-            dst.sendall(data)
-    except OSError:
-        pass
-    finally:
-        try: dst.shutdown(socket.SHUT_WR)
-        except OSError: pass
-
-def handle(client, dhost, dport):
-    try:
-        up = socket.create_connection((dhost, dport), timeout=10)
-    except OSError as e:
-        print(f"spangap-forward: {dhost}:{dport}: {e}", flush=True)
-        client.close()
-        return
-    t = threading.Thread(target=pipe, args=(client, up), daemon=True)
-    t.start()
-    pipe(up, client)
-    client.close(); up.close()
-
-def serve(lport, dhost, dport):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        srv.bind(("0.0.0.0", lport))
-    except OSError as e:
-        print(f"spangap-forward: bind :{lport}: {e}", flush=True)
-        return
-    srv.listen(64)
-    while True:
-        try:
-            client, _ = srv.accept()
-        except OSError:
-            return
-        threading.Thread(target=handle, args=(client, dhost, dport),
-                         daemon=True).start()
-
-host = sys.argv[1]
-ports = [int(p) for p in sys.argv[2:]]
-for p in ports:
-    threading.Thread(target=serve, args=(p, host, p), daemon=True).start()
-print(f"spangap-forward: relaying {ports} -> {host}", flush=True)
-signal.pause()
-PY
-}
-
-# Host-side LAN relay (Docker Desktop / macOS only). A container there can't
-# route to the Mac's LAN segment — "host" networking is the VM's namespace and
-# gvproxy proxies internet egress but not the host's local subnet (see the
-# docker run comment). So the in-container ssh/cli straddles reach the device by
-# connecting to host.docker.internal:<port>, where this relay — running on the
-# Mac, the one machine actually on that LAN — accepts and splices to the device.
-# Forwards $SPANGAP_HOST ports 2323 (TCP CLI) and 22 (ssh) by default; override
-# with SPANGAP_FORWARD_PORTS. Idempotent: a re-run is a liveness check and only
-# restarts when the device host or port set changed. Darwin-only — on a native
-# Linux host the bridge network reaches the LAN directly, so no relay is needed.
-ensure_forwarder() {
-    [ "$(uname -s 2>/dev/null)" = Darwin ] || return 0
-    # No device configured yet ⇒ nothing to relay. Silent: the relay only
-    # becomes meaningful once spangap is pointed at a device (-h / SPANGAP_HOST).
-    local host=${SPANGAP_HOST:-}
-    [ -z "$host" ] && [ -f "$HOST_FILE" ] && host=$(cat "$HOST_FILE")
-    [ -z "$host" ] && return 0
-
-    local ports="${SPANGAP_FORWARD_PORTS:-2323 22}"
-    ports=$(printf '%s' "$ports" | tr ',' ' ')
-    local want="$host $ports"
-
-    # pidfile is two lines: pid, then the "host ports" it was started for.
-    if [ -f "$FORWARD_PID" ]; then
-        local pid have
-        pid=$(sed -n 1p "$FORWARD_PID" 2>/dev/null)
-        have=$(sed -n 2p "$FORWARD_PID" 2>/dev/null)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            [ "$have" = "$want" ] && return 0
-            kill "$pid" 2>/dev/null || true   # device/ports changed — restart
-        fi
-    fi
-
-    command -v python3 >/dev/null 2>&1 || {
-        log "skipping LAN relay: python3 not on PATH"
-        return 0
-    }
-    write_forward_script
-    # shellcheck disable=SC2086
-    nohup python3 "$FORWARD_SCRIPT" "$host" $ports >"$FORWARD_LOG" 2>&1 &
-    local pid=$!
-    printf '%s\n%s\n' "$pid" "$want" > "$FORWARD_PID"
-    log "LAN relay up (pid $pid): host.docker.internal:{$ports} → $host"
-}
-
 ensure_container() {
     ensure_daemon
-    ensure_forwarder
 
     # The spangap build-system straddle (Dockerfile + build-system/) is the
-    # build context. With a flat repo_path it lives at <repo_path>/spangap;
-    # without one it's git-cloned into $workspace/spangap. No symlink either
-    # way — repo_path itself is the source of truth.
-    local repo_path
-    repo_path=$(read_repo_path)
+    # build context. With a flat --straddles checkout it lives at
+    # <straddles>/spangap; without one it's git-cloned into $workspace/spangap.
+    # No symlink either way — the checkout itself is the source of truth.
+    local straddles
+    straddles=$(read_straddles)
     local ctx="$workspace/spangap"
-    [ -n "$repo_path" ] && [ -d "$repo_path/spangap" ] && ctx="$repo_path/spangap"
+    [ -n "$straddles" ] && [ -d "$straddles/spangap" ] && ctx="$straddles/spangap"
     local local_hash=""
     [ -f "$ctx/build-system/Dockerfile" ] && local_hash=$(buildsys_hash "$ctx")
 
@@ -1030,27 +1125,27 @@ ensure_container() {
             # Desktop's grpc-fuse share pointing at the gone inode; same
             # on Linux if the workspace was rm'd + recreated under the
             # bind mount. We probe for the workspace marker file because
-            # `test -d /workspace` can return true even on a dangling
+            # `test -d "$container_ws"` can return true even on a dangling
             # mount (the mount point's directory entry outlives the
             # underlying inode). The marker file can only be visible
             # through a live mount. --workdir / so we don't get derailed
-            # by chdir into a stale /workspace, which fails with an OCI
+            # by chdir into a stale workspace mount, which fails with an OCI
             # "container breakout" error before `test` ever runs.
             if docker exec --workdir / "$container" \
-                    test -f /workspace/spangap.workspace.yaml >/dev/null 2>&1; then
-                # Also recreate if .spangap-repo_path changed since the
-                # container was started — the bind mount for repo_path is
-                # baked in at `docker run` time.
-                local stored_rp
-                stored_rp=$(docker inspect --format \
-                    '{{ index .Config.Labels "org.spangap.repo-path" }}' \
-                    "$container" 2>/dev/null) || stored_rp=""
-                if [ "$repo_path" = "$stored_rp" ]; then
+                    test -f "$container_ws/spangap.workspace.yaml" >/dev/null 2>&1; then
+                # Also recreate if .spangap-straddles changed since the
+                # container was started — the bind mount for the straddles
+                # checkout is baked in at `docker run` time.
+                local stored_sd
+                stored_sd=$(docker inspect --format \
+                    '{{ index .Config.Labels "org.spangap.straddles" }}' \
+                    "$container" 2>/dev/null) || stored_sd=""
+                if [ "$straddles" = "$stored_sd" ]; then
                     return 0
                 fi
                 announce_container_setup
                 [ -z "$SPANGAP_QUIET" ] \
-                    && log ".spangap-repo_path changed since container start — recreating"
+                    && log ".spangap-straddles changed since container start — recreating"
                 docker rm -f "$container" >/dev/null
             else
                 announce_container_setup
@@ -1082,16 +1177,16 @@ ensure_container() {
     announce_container_setup
     mkdir -p "$spangap_home"
 
-    # Bind-mount the flat repo_path at /repos — one whole-tree mount, so every
-    # straddle shows up at /repos/<repo> as a real, container-native dir. No
-    # symlinks and no host paths inside the container: the build navigates
-    # /repos/<repo>, and `file:../../<sibling>` resolves to /repos/<sibling>
-    # because the tree is flat. Adding/removing a straddle under <repo_path>
-    # needs no `spangap reset-workspace` — the whole-tree mount picks it up live. (No
-    # repo_path → straddles are git-cloned as real flat dirs in the workspace,
-    # covered by the /workspace mount.)
-    local repo_mount=()
-    [ -n "$repo_path" ] && repo_mount=(-v "$repo_path:/repos")
+    # Bind-mount the flat --straddles checkout at /straddles — one whole-tree
+    # mount, so every straddle shows up at /straddles/<repo> as a real,
+    # container-native dir. No symlinks and no host paths inside the container:
+    # the build navigates /straddles/<repo>, and `file:../../<sibling>` resolves
+    # to /straddles/<sibling> because the tree is flat. Adding/removing a straddle
+    # under <straddles> needs no `spangap reset-workspace` — the whole-tree mount
+    # picks it up live. (No --straddles → straddles are git-cloned as real flat
+    # dirs in the workspace, covered by the workspace mount.)
+    local straddles_mount=()
+    [ -n "$straddles" ] && straddles_mount=(-v "$straddles:/straddles")
 
     # macOS still ships bash 3.2 where `${empty_array[@]}` trips `set -u`
     # with "unbound variable" — only bash 4+ treats it as zero words.
@@ -1107,13 +1202,16 @@ ensure_container() {
     # default bridge network without host networking. On a native-Linux host
     # --network=host *would* bridge to the LAN, but there the device is reachable
     # directly anyway. Either way the flag buys nothing, so it's gone.
+    # The workspace mounts UNDER the persistent home (/home/spangap) at its
+    # basename; Docker orders nested bind mounts by depth, so /home/spangap
+    # lands first and $container_ws on top of it regardless of -v order.
     docker run -d --name "$container" \
-        -v "$workspace:/workspace" \
         -v "$spangap_home:/home/spangap" \
-        ${repo_mount[@]+"${repo_mount[@]}"} \
-        --workdir /workspace \
+        -v "$workspace:$container_ws" \
+        ${straddles_mount[@]+"${straddles_mount[@]}"} \
+        --workdir "$container_ws" \
         --label spangap.workspace="$workspace" \
-        --label org.spangap.repo-path="$repo_path" \
+        --label org.spangap.straddles="$straddles" \
         "$IMAGE" sleep infinity >/dev/null
 
     # Pre-create the npm prefix dir (Dockerfile sets NPM_CONFIG_PREFIX
@@ -1130,18 +1228,18 @@ ensure_container() {
 # (so host github auth is used — the container has no creds). Loops because
 # this iteration's siblings may add their own requires:.
 # Shared one-spec acquire: <org>/<repo>[@<ref>] → $workspace/<repo>. Only
-# ever called for genuinely-missing deps — anything present under repo_path
-# already shows up at /repos/<repo> inside the container, so list-deps never
-# reports it.
+# ever called for genuinely-missing deps — anything present under the
+# --straddles checkout already shows up at /straddles/<repo> inside the
+# container, so list-deps never reports it.
 #
-# repo_path mode is local-only and **never clones**: a repo_path is a pinned
-# set of straddles you always build against, so reaching out to github for a
-# missing one would silently mix in a different copy. If the repo is in the
-# checkout it's already on /repos (no-op here); if it isn't, that's an error
+# --straddles mode is local-only and **never clones**: a --straddles checkout is
+# a pinned set of straddles you always build against, so reaching out to github
+# for a missing one would silently mix in a different copy. If the repo is in the
+# checkout it's already on /straddles (no-op here); if it isn't, that's an error
 # telling you to add it to your checkout — we don't fall back to a clone.
-# Without a repo_path, git-clone into $workspace/<repo> (a real dir the scan
+# Without --straddles, git-clone into $workspace/<repo> (a real dir the scan
 # picks up). Honours SPANGAP_QUIET (single rollup line instead of one per
-# repo). Used by both the explicit --include pre-fetch and the list-deps loop.
+# repo). Used by both the explicit --with pre-fetch and the list-deps loop.
 __clone_announced=0
 clone_spec() {
     local spec=$1
@@ -1150,10 +1248,10 @@ clone_spec() {
     local repo=${bare#*/}
     local dest="$workspace/$repo"
     [ -e "$dest" ] && return 0
-    local rp; rp=$(read_repo_path)
-    if [ -n "$rp" ]; then
-        [ -d "$rp/$repo" ] && return 0   # already in the checkout → on /repos
-        die "$bare is not in your repo_path checkout ($rp), and repo_path mode never clones — add it to $rp and retry (or fix its straddle.yaml 'name:' if it's there under another dir name)."
+    local sd; sd=$(read_straddles)
+    if [ -n "$sd" ]; then
+        [ -d "$sd/$repo" ] && return 0   # already in the checkout → on /straddles
+        die "$bare is not in your --straddles checkout ($sd), and --straddles mode never clones — add it to $sd and retry (or fix its straddle.yaml 'name:' if it's there under another dir name)."
     fi
     if [ -n "$SPANGAP_QUIET" ]; then
         if [ "$__clone_announced" = "0" ]; then
@@ -1173,14 +1271,14 @@ clone_spec() {
     fi
 }
 
-# Walk `spangap build ...` argv; for each --include <org/repo> value, clone
+# Walk `spangap build ...` argv; for each --with <org/repo> value, clone
 # it onto disk before the container starts listing missing deps. Bare-form
-# --include values are left for spangap-inside to validate against the
-# workspace. We accept `-i X`, `--include X`, and `--include=X` forms.
+# --with values are left for spangap-inside to validate against the
+# workspace. We accept `-w X`, `--with X`, and `--with=X` forms.
 prefetch_explicit_includes() {
     while [ $# -gt 0 ]; do
         case $1 in
-            -i|--include)
+            -w|--with)
                 if [ $# -ge 2 ]; then
                     case $2 in */*) clone_spec "$2" ;; esac
                     shift 2
@@ -1188,7 +1286,7 @@ prefetch_explicit_includes() {
                     shift
                 fi
                 ;;
-            -i=*|--include=*)
+            -w=*|--with=*)
                 spec=${1#*=}
                 case $spec in */*) clone_spec "$spec" ;; esac
                 shift
@@ -1207,7 +1305,7 @@ fetch_missing_deps() {
         # docker exec's own stderr is left alone so the user sees the
         # actual failure (e.g. OCI "container breakout" from a stale mount)
         # before the die line below.
-        missing=$(docker exec --workdir "$container_cwd" "$container" spangap list-deps) \
+        missing=$(docker exec -e SPANGAP_WORKSPACE="$container_ws" --workdir "$container_cwd" "$container" spangap list-deps) \
             || die "spangap list-deps failed in container $container (see error above)"
         [ -z "$missing" ] && return 0
         for spec in $missing; do
@@ -1238,8 +1336,8 @@ reset-workspace)
     ensure_daemon
     # reallyclean first while the container is still alive: it sweeps every
     # straddle's build/, managed_components/, node_modules/, .quasar/, etc.
-    # Those artifacts live under the straddles (at /repos/<repo> or
-    # /workspace/<repo>), so removing the container without cleaning them
+    # Those artifacts live under the straddles (at /straddles/<repo> or
+    # <workspace>/<repo>), so removing the container without cleaning them
     # first leaves source-realpath addresses baked into CMakeCache that
     # resurface on the next build. reallyclean is workspace-wide and needs no
     # project context, so any cwd works. Best-effort — if it fails we still
@@ -1247,7 +1345,7 @@ reset-workspace)
     if docker inspect "$container" >/dev/null 2>&1 \
         && [ "$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null)" = "running" ]; then
         log "running reallyclean across all straddles before container teardown"
-        docker exec --workdir /workspace "$container" \
+        docker exec -e SPANGAP_WORKSPACE="$container_ws" --workdir "$container_ws" "$container" \
             spangap reallyclean >/dev/null 2>&1 || true
     fi
     if docker inspect "$container" >/dev/null 2>&1; then
@@ -1272,29 +1370,29 @@ esac
 ensure_container
 
 # host_to_container <host-path>: map an absolute host path to its in-container
-# equivalent. The two bind mounts are /workspace (the workspace dir) and
-# /repos (the flat repo_path checkout, when set), so a path under the
-# workspace becomes /workspace/<rel> and one under repo_path becomes
-# /repos/<rel>. Used to turn a resolved straddle's host dir (which may live in
-# either) into the --workdir for docker exec.
+# equivalent. The two bind mounts are the workspace (at $container_ws =
+# /home/spangap/<basename>) and /straddles (the flat --straddles checkout, when
+# set), so a path under the workspace becomes $container_ws/<rel> and one under
+# the straddles checkout becomes /straddles/<rel>. Used to turn a resolved
+# straddle's host dir (which may live in either) into the --workdir for docker exec.
 host_to_container() {
-    local h=$1 rp
+    local h=$1 sd
     case $h in
-        "$workspace")   printf '/workspace\n'; return ;;
-        "$workspace"/*) printf '/workspace/%s\n' "${h#"$workspace"/}"; return ;;
+        "$workspace")   printf '%s\n' "$container_ws"; return ;;
+        "$workspace"/*) printf '%s/%s\n' "$container_ws" "${h#"$workspace"/}"; return ;;
     esac
-    rp=$(read_repo_path)
-    if [ -n "$rp" ]; then
+    sd=$(read_straddles)
+    if [ -n "$sd" ]; then
         case $h in
-            "$rp")   printf '/repos\n'; return ;;
-            "$rp"/*) printf '/repos/%s\n' "${h#"$rp"/}"; return ;;
+            "$sd")   printf '/straddles\n'; return ;;
+            "$sd"/*) printf '/straddles/%s\n' "${h#"$sd"/}"; return ;;
         esac
     fi
-    die "path $h is under neither the workspace ($workspace) nor repo_path"
+    die "path $h is under neither the workspace ($workspace) nor the --straddles checkout"
 }
 
 # Container cwd = host cwd remapped. find_workspace guarantees cwd is under the
-# workspace, so this lands at /workspace/<rel>.
+# workspace, so this lands at $container_ws/<rel>.
 container_cwd=$(host_to_container "$(pwd)")
 
 exec_flags="-i"
@@ -1320,11 +1418,11 @@ build)
     command -v git >/dev/null 2>&1 || die "git required on host PATH (for auto get-deps)"
     proj=$(require_straddle build)
     container_cwd=$(host_to_container "$proj")
-    # Pre-clone any `--include <org>/<repo>` (slash-form) so the included
+    # Pre-clone any `--with <org>/<repo>` (slash-form) so the included
     # straddle is on disk before the container starts listing missing
     # deps. The list-deps loop below then picks up any transitive
     # requires: of the included straddle just like any other workspace
-    # sibling. Bare-form `--include X` is left for spangap-inside to
+    # sibling. Bare-form `--with X` is left for spangap-inside to
     # validate against the workspace.
     prefetch_explicit_includes "$@"
     fetch_missing_deps "$container_cwd"
@@ -1348,7 +1446,7 @@ build)
     [ -z "$verbose" ] && log "building $proj_name"
     # No -t: keep output non-interactive (matches the previous piped path).
     set +e
-    docker exec -i -e SPANGAP_PORT="$sticky_port" \
+    docker exec -i -e SPANGAP_PORT="$sticky_port" -e SPANGAP_WORKSPACE="$container_ws" \
         --workdir "$container_cwd" "$container" spangap build "$@"
     rc=$?
     set -e
@@ -1360,17 +1458,20 @@ shell)
     # trailing args are forwarded to bash (e.g. `spangap shell -c '...'`).
     shift
     # shellcheck disable=SC2086
-    exec docker exec $exec_flags --workdir "$container_cwd" "$container" bash "$@"
+    exec docker exec $exec_flags -e SPANGAP_WORKSPACE="$container_ws" \
+        --workdir "$container_cwd" "$container" bash "$@"
     ;;
 docker)
     shift
     [ $# -gt 0 ] || die "missing command (e.g. \`spangap docker sh\`)"
     # shellcheck disable=SC2086
-    exec docker exec $exec_flags --workdir "$container_cwd" "$container" "$@"
+    exec docker exec $exec_flags -e SPANGAP_WORKSPACE="$container_ws" \
+        --workdir "$container_cwd" "$container" "$@"
     ;;
 esac
 
 # Anything outside doesn't understand goes through the in-container spangap
 # wrapper, which sources IDF env then dispatches via the Python CLI.
 # shellcheck disable=SC2086
-exec docker exec $exec_flags --workdir "$container_cwd" "$container" spangap "$@"
+exec docker exec $exec_flags -e SPANGAP_WORKSPACE="$container_ws" \
+    --workdir "$container_cwd" "$container" spangap "$@"

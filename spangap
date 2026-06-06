@@ -26,20 +26,23 @@ usage() {
 spangap — ESP-32 build system.
 
 Usage:
-  spangap init [--repo-path DIR] [<org>/<repo> | <url>]
+  spangap init [--straddles DIR] [<name> | <org>/<repo> | <url>]
   spangap <command> [args...]
+  spangap            (no command: same as `spangap show`)
   spangap --help | -h | help
 
 init  (run outside any workspace; creates one in the current dir):
-  --repo-path DIR    Use a local checkout of the spangap tree, laid out flat
+  --straddles DIR    Use a local checkout of the spangap tree, laid out flat
                      as <DIR>/<repo>/ (every straddle a direct child). The
-                     tree is bind-mounted into the build container (at /repos)
-                     instead of straddles being cloned from github.
-  <org>/<repo>       Optional project to start from. May also be a full
-                     https:// URL. Becomes the default target for `build`,
-                     `flash`, `monitor` from the workspace root. Init also
-                     fetches the project's transitive deps so the first
-                     build is immediate.
+                     tree is bind-mounted into the build container (at
+                     /straddles) instead of straddles being cloned from github.
+  <name>             Optional project to start from. With --straddles, a bare
+                     <name> selects the straddle already present at <DIR>/<name>
+                     (it is NOT cloned; a missing name is an error). Otherwise
+                     an <org>/<repo> or full https:// URL is git-cloned.
+                     Becomes the default target for `build`, `flash`, `monitor`
+                     from the workspace root. Init also fetches the project's
+                     transitive deps so the first build is immediate.
   -v, --verbose      Show docker build / git clone / dep-fetch output.
                      Without it, init prints one status line per phase.
 
@@ -58,7 +61,8 @@ Commands (run inside a workspace):
   cli [-h <host>] [args...]      Talk to a running device over the network.
                                  Host is sticky like port.
   show                           List the project straddle and its deps in
-                                 initialization order.
+                                 initialization order. (Bare `spangap` with no
+                                 command does the same.)
   reset                          Signal a running monitor to reset the device.
   reset-workspace                Wipe the build state (container + image) and
                                  start fresh.
@@ -103,35 +107,37 @@ init)
     command -v python3 >/dev/null 2>&1 || die "python3 required for \`spangap init\` (used to create the host-side flash/monitor venv) — install python3 (with the venv module) and retry"
 
     # init args:
-    #   --repo-path <dir>   local source-of-truth checkout laid out flat as
+    #   --straddles <dir>   local source-of-truth checkout laid out flat as
     #                       <dir>/<repo>/. When given, the whole tree is
-    #                       bind-mounted to /repos in the build container
+    #                       bind-mounted to /straddles in the build container
     #                       (no per-straddle symlinks or clones — including
     #                       the skeleton, run from <dir>/spangap, and the
-    #                       project); $workspace/.spangap-repo_path is
+    #                       project); $workspace/.spangap-straddles is
     #                       persisted so subsequent `spangap` commands find
     #                       the same tree.
-    #   <project>           optional <org/repo> shorthand (→ github.com)
-    #                       or a full https://... URL. Lands in a workspace
-    #                       sibling so the user can `cd <repo> && spangap
-    #                       build` right after init.
+    #   <project>           optional project. With --straddles, a bare <name>
+    #                       selects the straddle already at <dir>/<name> (no
+    #                       clone; missing = error). Otherwise an <org/repo>
+    #                       shorthand (→ github.com) or full https://... URL,
+    #                       git-cloned into a workspace sibling so the user can
+    #                       `cd <repo> && spangap build` right after init.
     #   -v|--verbose        show the docker build / git clone / dep-fetch
     #                       output. Without it, init prints one status
     #                       line per phase and suppresses the underlying
     #                       commands' output.
     shift
-    repo_path_arg=
+    straddles_arg=
     project=
     verbose=
     while [ $# -gt 0 ]; do
         case $1 in
             -v|--verbose) verbose=1; shift ;;
-            --repo-path)
-                [ $# -ge 2 ] || die "spangap init: --repo-path needs a directory"
-                repo_path_arg=$2
+            --straddles)
+                [ $# -ge 2 ] || die "spangap init: --straddles needs a directory"
+                straddles_arg=$2
                 shift 2 ;;
-            --repo-path=*)
-                repo_path_arg=${1#*=}
+            --straddles=*)
+                straddles_arg=${1#*=}
                 shift ;;
             --) shift; break ;;
             -*) die "spangap init: unknown flag '$1'" ;;
@@ -147,6 +153,16 @@ init)
         project=$1
     fi
 
+    # Resolve --straddles first: a bare-name project (below) is only valid
+    # when a straddles checkout is set, since it names a straddle already
+    # present there rather than something to clone.
+    straddles=
+    if [ -n "$straddles_arg" ]; then
+        [ -d "$straddles_arg" ] \
+            || die "spangap init --straddles: $straddles_arg is not a directory"
+        straddles=$(cd "$straddles_arg" && pwd)
+    fi
+
     project_url=
     project_dir=
     if [ -n "$project" ]; then
@@ -154,21 +170,26 @@ init)
             *://*)
                 project_url=$project ;;
             *@*|*:*|*\ *)
-                die "spangap init: project must be 'org/repo' or a URL; got '$project'" ;;
+                die "spangap init: project must be '<name>', 'org/repo', or a URL; got '$project'" ;;
             */*)
                 project_url="https://github.com/$project.git" ;;
             *)
-                die "spangap init: project must be 'org/repo' or a URL; got '$project'" ;;
+                # Bare name (no slash, no URL). Only meaningful with --straddles,
+                # where it selects an already-present straddle — we never clone a
+                # bare name (there's no org to derive a github URL from).
+                [ -n "$straddles" ] \
+                    || die "spangap init: bare project name '$project' needs --straddles (the straddle must already be checked out there); otherwise pass 'org/repo' or a URL"
+                [ -f "$straddles/$project/straddle.yaml" ] \
+                    || die "spangap init --straddles: no straddle '$project' at $straddles/$project (expected $straddles/$project/straddle.yaml) — add it to the checkout, or pass 'org/repo' to clone"
+                project_dir=$project ;;
         esac
-        project_dir=$(basename "$project_url" .git)
-        [ -e "$project_dir" ] && die "./$project_dir already exists in $PWD"
-    fi
-
-    repo_path=
-    if [ -n "$repo_path_arg" ]; then
-        [ -d "$repo_path_arg" ] \
-            || die "spangap init --repo-path: $repo_path_arg is not a directory"
-        repo_path=$(cd "$repo_path_arg" && pwd)
+        # Cloned forms (URL / org/repo): derive the dir and refuse to clobber an
+        # existing one in cwd. The bare-name form lives in the straddles checkout,
+        # not the workspace, so it skips this.
+        if [ -n "$project_url" ]; then
+            project_dir=$(basename "$project_url" .git)
+            [ -e "$project_dir" ] && die "./$project_dir already exists in $PWD"
+        fi
     fi
 
     # Tag every spangap-outside helper we shell out to below (ensure-venv,
@@ -178,22 +199,22 @@ init)
     export SPANGAP_PHASE=init
 
     : > spangap.workspace.yaml
-    if [ -n "$repo_path" ]; then
-        printf '%s\n' "$repo_path" > .spangap-repo_path
-        echo "init: wrote .spangap-repo_path = $repo_path" >&2
+    if [ -n "$straddles" ]; then
+        printf '%s\n' "$straddles" > .spangap-straddles
+        echo "init: wrote .spangap-straddles = $straddles" >&2
     fi
 
-    # Skeleton: the spangap build-system straddle. With a flat repo_path it's
-    # at <repo_path>/spangap and reached there directly (the whole tree gets
-    # bind-mounted to /repos in the container; the host-side dispatcher finds
-    # spangap-outside under repo_path) — nothing is dropped in the workspace.
-    # Without repo_path, git-clone it into ./spangap/ so the workspace carries
-    # its own build system. skel_target is just where init invokes the
-    # spangap-outside helpers from below.
+    # Skeleton: the spangap build-system straddle. With a flat --straddles
+    # checkout it's at <straddles>/spangap and reached there directly (the whole
+    # tree gets bind-mounted to /straddles in the container; the host-side
+    # dispatcher finds spangap-outside under the checkout) — nothing is dropped
+    # in the workspace. Without --straddles, git-clone it into ./spangap/ so the
+    # workspace carries its own build system. skel_target is just where init
+    # invokes the spangap-outside helpers from below.
     skel_target=
-    if [ -n "$repo_path" ] && [ -d "$repo_path/spangap" ]; then
-        echo "init: using spangap skeleton from $repo_path/spangap" >&2
-        skel_target="$repo_path/spangap"
+    if [ -n "$straddles" ] && [ -d "$straddles/spangap" ]; then
+        echo "init: using spangap skeleton from $straddles/spangap" >&2
+        skel_target="$straddles/spangap"
     else
         echo "init: cloning $INIT_URL into ./spangap/..." >&2
         git clone --quiet "$INIT_URL" spangap
@@ -211,21 +232,25 @@ init)
     # one place (it's also called lazily on flash/monitor for robustness).
     SPANGAP_WORKSPACE="$PWD" "$skel_target/build-system/spangap-outside" ensure-venv \
         || die "host-side flash/monitor venv setup failed (see above)"
-    if [ -n "$project_url" ]; then
-        # Project: under repo_path (flat, at <repo_path>/<project_dir>) it's
-        # already in the /repos bind mount — nothing to place in the
-        # workspace. Otherwise git-clone it into the bare project_dir.
-        if [ -n "$repo_path" ] && [ -d "$repo_path/$project_dir" ]; then
-            echo "init: using $project_dir from repo_path" >&2
-        else
+    if [ -n "$project_dir" ]; then
+        # Project: under a --straddles checkout (flat, at <straddles>/<project_dir>)
+        # it's already in the /straddles bind mount — nothing to place in the
+        # workspace. Otherwise (a cloned org/repo or URL form) git-clone it into
+        # the bare project_dir. A bare <name> is always the former (validated
+        # present above), so it never reaches the clone branch.
+        if [ -n "$straddles" ] && [ -d "$straddles/$project_dir" ]; then
+            echo "init: using $project_dir from the straddles checkout" >&2
+        elif [ -n "$project_url" ]; then
             echo "init: cloning $project_dir" >&2
             git clone --quiet "$project_url" "$project_dir"
+        else
+            die "spangap init: internal error — project '$project_dir' has no source (neither in the straddles checkout nor a clonable URL)"
         fi
         # Remember the project so subsequent commands run from the workspace
         # root (e.g. `spangap build`, `spangap flash`) default to it instead
         # of asking the user to cd. Records the bare project_dir; it's
-        # reachable at /repos/<project_dir> (repo_path) or $workspace/<project_dir>
-        # (clone) in the container.
+        # reachable at /straddles/<project_dir> (--straddles) or
+        # $workspace/<project_dir> (clone) in the container.
         printf '%s\n' "$project_dir" > .spangap-project
     fi
     # Quiet by default — collapse the docker build / git clone /
@@ -244,11 +269,11 @@ init)
     echo "init: building docker container (image build + container create)..." >&2
     SPANGAP_WORKSPACE="$PWD" "$skel_target/build-system/spangap-outside" ensure-container \
         || die "container setup failed (see above)"
-    if [ -n "$project_url" ]; then
+    if [ -n "$project_dir" ]; then
         # Fetch transitive deps so the workspace is build-ready right
-        # after init. With repo_path, every dep checked out there is already
-        # visible at /repos/<repo> and list-deps returns nothing (no-op);
-        # any dep not in repo_path — and, without repo_path, all of them —
+        # after init. With --straddles, every dep checked out there is already
+        # visible at /straddles/<repo> and list-deps returns nothing (no-op);
+        # any dep not in the checkout — and, without --straddles, all of them —
         # is git-cloned into the workspace so the first `spangap build`
         # doesn't pause to fetch them.
         SPANGAP_WORKSPACE="$PWD" "$skel_target/build-system/spangap-outside" get-deps \
@@ -273,18 +298,18 @@ self_dir=$(cd "$(dirname "$self")" && pwd)
 self_outside="$self_dir/build-system/spangap-outside"
 
 if ws=$(find_workspace); then
-    # spangap-outside lives in the spangap build-system straddle: under
-    # repo_path at <repo_path>/spangap when init was given --repo-path
+    # spangap-outside lives in the spangap build-system straddle: under the
+    # straddles checkout at <straddles>/spangap when init was given --straddles
     # (nothing is dropped in the workspace), else the ./spangap clone.
-    rp=
-    [ -f "$ws/.spangap-repo_path" ] && rp=$(head -1 "$ws/.spangap-repo_path" 2>/dev/null)
-    if [ -n "$rp" ] && [ -x "$rp/spangap/build-system/spangap-outside" ]; then
-        outside="$rp/spangap/build-system/spangap-outside"
+    sd=
+    [ -f "$ws/.spangap-straddles" ] && sd=$(head -1 "$ws/.spangap-straddles" 2>/dev/null)
+    if [ -n "$sd" ] && [ -x "$sd/spangap/build-system/spangap-outside" ]; then
+        outside="$sd/spangap/build-system/spangap-outside"
     else
         outside="$ws/spangap/build-system/spangap-outside"
     fi
     [ -x "$outside" ] \
-        || die "spangap-outside not found ($outside) — re-clone or update the workspace skeleton, or check .spangap-repo_path"
+        || die "spangap-outside not found ($outside) — re-clone or update the workspace skeleton, or check .spangap-straddles"
     export SPANGAP_WORKSPACE="$ws"
     exec "$outside" "$@"
 fi

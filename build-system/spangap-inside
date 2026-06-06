@@ -25,20 +25,40 @@ from jsonschema import Draft202012Validator
 SCHEMA_PATH = Path("/usr/local/share/spangap/straddle.schema.json")
 # Straddles live under one of two flat, container-native roots — no symlinks,
 # no host paths inside:
-#   /repos/<repo>      the flat repo_path checkout, bind-mounted here whole
-#                      when `init --repo-path` was used (one mount, every
+#   /straddles/<repo>  the flat --straddles checkout, bind-mounted here whole
+#                      when `init --straddles` was used (one mount, every
 #                      straddle a direct child). Because it's flat, the browser
 #                      `file:../../<sibling>` deps resolve straight through.
-#   /workspace/<repo>  git clones (the no-repo_path case), plus any dep cloned
-#                      because it wasn't present under repo_path.
-# The workspace dir itself (/workspace) also holds the marker, the dotfiles,
-# and the per-host venv; non-straddle entries have no straddle.yaml and are
-# skipped. Builds bake the container path (e.g. /repos/<repo>) into
-# CMakeCache, so it's stable and host-independent.
-WORKSPACE = Path("/workspace")
-REPOS = Path("/repos")
-STRADDLE_ROOTS = (REPOS, WORKSPACE)
-HOST_FILE = WORKSPACE / ".spangap-host"
+#   <workspace>/<repo> git clones (the no-straddles case), plus any dep cloned
+#                      because it wasn't present under --straddles.
+# The workspace dir itself also holds the marker, the dotfiles, and the per-host
+# venv; non-straddle entries have no straddle.yaml and are skipped. Builds bake
+# the container path (e.g. /straddles/<repo>) into CMakeCache, so it's stable
+# and host-independent.
+#
+# The workspace is bind-mounted at /home/spangap/<basename-of-host-workspace>
+# (nested under the persistent ~ = /home/spangap mount), not a fixed path — so
+# spangap-outside passes its container path in via SPANGAP_WORKSPACE on every
+# `docker exec`. Fall back to walking up from cwd for the marker (covers a
+# hand-run spangap-inside with no env set).
+def _discover_workspace() -> Path:
+    env = os.environ.get("SPANGAP_WORKSPACE")
+    if env:
+        return Path(env)
+    cur = Path.cwd()
+    for d in (cur, *cur.parents):
+        if (d / "spangap.workspace.yaml").is_file():
+            return d
+    return cur
+
+
+WORKSPACE = _discover_workspace()
+STRADDLES = Path("/straddles")
+STRADDLE_ROOTS = (STRADDLES, WORKSPACE)
+# Device endpoints, workspace-wide. `spangap cli` prefers ssh, then TCP CLI;
+# `spangap monitor` owns the host-side bridge that fronts these (see spangap-outside).
+SSH_FILE = WORKSPACE / ".spangap-ssh"   # "<host-or-ip>:<port>" (ssh, default 22)
+TCP_FILE = WORKSPACE / ".spangap-tcp"   # "<host-or-ip>:<port>" (TCP CLI, default 2323)
 # Canonical assistant-instructions file, baked into the image (Dockerfile) and
 # seeded into the workspace as CLAUDE.md on first `spangap claude`.
 README_PATH = Path("/usr/local/share/spangap/README.md")
@@ -61,7 +81,7 @@ CLAUDE_MD_POINTER = (
 # spangap-core is the implicit platform foundation. Its prefix is "" — its
 # symbols (storageGet, cliRegister, info, …) read as language primitives, so
 # every straddle links it the way C code links libc: you never declare it. The
-# build always stages it (it can't be --exclude'd) and auto-injects it into
+# build always stages it (it can't be dropped with --without) and auto-injects it into
 # every component's cross-straddle REQUIRES. No straddle.yaml lists it.
 CORE_NAME = "spangap/spangap-core"
 
@@ -119,11 +139,21 @@ class Manifest:
     def optional_requires(self) -> list[str]:
         return list(self.data.get("optional_requires", []))
     @property
+    def start(self) -> list[dict[str, Any]]:
+        return list(self.data.get("start", []))
+    @property
     def init(self) -> list[dict[str, Any]]:
         return list(self.data.get("init", []))
     @property
+    def kconfig(self) -> list[str]:
+        return list(self.data.get("kconfig", []))
+    @property
     def is_buildable(self) -> bool:
         return "buildable" in self.data
+    @property
+    def buildable_name(self) -> str | None:
+        b = self.data.get("buildable")
+        return b.get("name") if isinstance(b, dict) else None
 
 
 def die(msg: str, exit_code: int = 1):
@@ -131,11 +161,15 @@ def die(msg: str, exit_code: int = 1):
     sys.exit(exit_code)
 
 
+def warn(msg: str) -> None:
+    sys.stderr.write(f"spangap: warning: {msg}\n")
+
+
 def find_project(start: Path | None = None) -> Manifest:
     """Resolve the project straddle for the current invocation.
 
     Walk up from cwd until straddle.yaml. Each straddle has one container-
-    native location (/repos/<repo> or /workspace/<repo>) — no symlinks, no
+    native location (/straddles/<repo> or <workspace>/<repo>) — no symlinks, no
     host paths — so the CMAKE_HOME_DIRECTORY baked into build/CMakeCache.txt is
     stable and host-independent.
 
@@ -173,8 +207,8 @@ def find_project(start: Path | None = None) -> Manifest:
 def default_project() -> Manifest | None:
     """The straddle named by .spangap-project, or None.
 
-    The straddle is at /repos/<name> (repo_path mount) or /workspace/<name>
-    (git clone); check both roots.
+    The straddle is at /straddles/<name> (--straddles mount) or
+    <workspace>/<name> (git clone); check both roots.
     """
     proj_file = WORKSPACE / ".spangap-project"
     if not proj_file.is_file():
@@ -187,6 +221,42 @@ def default_project() -> Manifest | None:
         if cand.is_file():
             return load_manifest(cand)
     return None
+
+
+def resolve_target_straddle(
+    name: str, all_straddles: dict[str, Manifest]
+) -> Manifest | None:
+    """Resolve an explicit `spangap build <target>` token to a straddle.
+
+    This is what lets you name the image to build instead of cd-ing into its
+    dir (or relying on .spangap-project) — handy under --straddles, where the
+    straddles live at /straddles/<repo>, not inside the workspace. Matches:
+
+      - the full <org>/<repo> name        (reticulous/hw-tdeck)
+      - the straddle's directory basename  (hw-tdeck)
+      - a buildable's product name         (buildable.name, e.g. reticulous —
+        the name of the *image* hw-tdeck produces, NOT a repo)
+
+    Returns the Manifest, or None if the token names no straddle at all (so the
+    caller can leave it for idf.py — keeping `spangap build menuconfig`, idf
+    build targets, etc. working as passthrough). A non-buildable match still
+    resolves here; cmd_build's own buildable check then reports it. Dies only
+    on a genuinely ambiguous match (the same token naming two straddles).
+    """
+    if name in all_straddles:  # exact <org>/<repo>
+        return all_straddles[name]
+    matches: dict[Path, Manifest] = {}
+    for m in all_straddles.values():
+        keys = {m.repo, m.dir.name}
+        if m.buildable_name:
+            keys.add(m.buildable_name)
+        if name in keys:
+            matches[m.path] = m
+    if len(matches) > 1:
+        names = ", ".join(sorted(m.name for m in matches.values()))
+        die(f"`spangap build {name}`: ambiguous — '{name}' names more than one "
+            f"straddle ({names}). Use the full <org>/<repo> form.")
+    return next(iter(matches.values())) if matches else None
 
 
 def load_manifest(path: Path) -> Manifest:
@@ -209,20 +279,20 @@ def load_manifest(path: Path) -> Manifest:
 def scan_workspace_straddles() -> dict[str, Manifest]:
     """Every straddle.yaml visible to the container, indexed by name.
 
-    Walks the two flat straddle roots — /repos (the repo_path mount) and
-    /workspace (git clones) — in that order. Both are plain directories of
+    Walks the two flat straddle roots — /straddles (the --straddles mount) and
+    the workspace (git clones) — in that order. Both are plain directories of
     real straddle dirs; non-straddle entries (dotfiles, the per-host venv,
     the workspace marker) have no straddle.yaml and are skipped. A name seen
-    twice is an error: repo_path and clones are disjoint by construction (a
-    dep present under repo_path is never also cloned), so this only fires on
+    twice is an error: --straddles and clones are disjoint by construction (a
+    dep present under --straddles is never also cloned), so this only fires on
     a mis-set `name:` in a straddle.yaml.
     """
     found: dict[str, Manifest] = {}
     if not WORKSPACE.is_dir():
         die(
             f"{WORKSPACE} not mounted — is the container running with "
-            "-v <ws>:/workspace (and -v <repo_path>:/repos when a repo_path "
-            "is set)?"
+            "-v <ws>:/home/spangap/<basename> (and -v <straddles>:/straddles "
+            "when --straddles is set)?"
         )
 
     for root in STRADDLE_ROOTS:
@@ -251,17 +321,17 @@ def resolve_requires(
 ) -> tuple[list[Manifest], list[str]]:
     """Walk requires: and optional_requires: transitively, plus the implicit
     spangap-core foundation and any user-named `included` straddles as extra
-    roots, then apply --exclude with dependent-cascade.
+    roots, then apply --without with dependent-cascade.
 
     Two tiers in the manifest:
       requires:           hard — always pulled in, missing = error
       optional_requires:  soft, default-on — pruned silently if absent/excluded
 
     spangap-core is always an implicit hard root (see CORE_NAME) and sorts to
-    the head of the topo order. `included` (from --include <name>) seeds the
+    the head of the topo order. `included` (from --with <name>) seeds the
     walk with additional roots treated as soft. The caller ensures every
     `included` name is on disk (the host-side build dispatcher pre-clones
-    slash-form --includes; bare-form is validated against the workspace).
+    slash-form --withs; bare-form is validated against the workspace).
 
     Exclude semantics (the cascade):
       Excluding X also drops every straddle that hard-`requires:` X — it can't
@@ -279,7 +349,7 @@ def resolve_requires(
 
     If `dropped_out` is provided, it's filled with every staged-by-default
     straddle the exclude pass removed (cascade + orphans + the named targets),
-    so the caller can report what an --exclude actually took with it.
+    so the caller can report what a --without actually took with it.
     """
     excluded = set(excluded or set())
     included = included or set()
@@ -288,7 +358,7 @@ def resolve_requires(
         die(
             f"{CORE_NAME} is the platform foundation (its empty-prefix symbols "
             "read as language primitives) — it's always staged and can't be "
-            "--exclude'd."
+            "dropped with --without."
         )
 
     out: list[Manifest] = []
@@ -336,7 +406,7 @@ def resolve_requires(
     for r in proj.optional_requires:
         visit(r, proj.name, hard=False)
     for r in included:
-        visit(r, f"{proj.name} (--include)", hard=False)
+        visit(r, f"{proj.name} (--with)", hard=False)
 
     # Mandatory = spangap-core + the buildable's hard requires:, transitively.
     # Never droppable; excluding one (or anything it hard-requires) is a conflict.
@@ -370,13 +440,13 @@ def resolve_requires(
         lines = []
         for m in sorted(conflict):
             if m in excluded:
-                why = "was --exclude'd directly"
+                why = "named in --without directly"
             else:
                 culprit = ", ".join(sorted(hard_deps.get(m, set()) & excl))
                 why = f"hard-requires excluded {culprit}"
             lines.append(f"  - {m}: {why}")
         die(
-            "--exclude conflict: these straddles are hard-required by "
+            "--without conflict: these straddles are hard-required by "
             f"{proj.name} and can't be dropped:\n" + "\n".join(lines) +
             "\n       Reclassify them as optional_requires: to make them droppable."
         )
@@ -424,7 +494,7 @@ def effective_requires(m: Manifest, staged_repos: set[str]) -> list[str]:
     = implicit spangap-core + hard requires + (optional_requires ∩ staged),
     order-preserved, deduped. Anything in the staged set that this straddle
     declared as a dep flows into its CMake REQUIRES so the include paths line
-    up. Straddles added via --include don't appear here directly — they enter
+    up. Straddles added via --with don't appear here directly — they enter
     the staged set, and any straddle that declares them in its own
     requires/optional_requires picks them up through that path.
 
@@ -448,6 +518,35 @@ def effective_requires(m: Manifest, staged_repos: set[str]) -> list[str]:
     return out
 
 
+def _conditional_sources(base_dir: Path, staged_repos: set[str]) -> tuple[list[str], list[str]]:
+    """Activator-driven source-list exclusion. A component may carry code under
+    <base_dir>/conditional/<name>/{src,include} that should be compiled ONLY when
+    straddle <name> is in the build. Returns (srcs, include_dirs) — paths
+    relative to the component dir — for every <name> in the staged set;
+    everything else is left uncompiled (its symlinked dir is simply not added to
+    SRCS). Nobody is special: the on-device-UI case is just
+    conditional/spangap-lcd/, but the same primitive gates code on any straddle.
+    base_dir is the component dir: a staged dep's firmware_dir, or the
+    buildable's main/ dir.
+    """
+    srcs: list[str] = []
+    incs: list[str] = []
+    cond = base_dir / "conditional"
+    if not cond.is_dir():
+        return srcs, incs
+    for sub in sorted(p for p in cond.iterdir() if p.is_dir()):
+        if sub.name not in staged_repos:
+            continue  # gating straddle absent — leave this dir out of the build
+        srcdir = sub / "src"
+        if srcdir.is_dir():
+            for f in sorted(srcdir.iterdir()):
+                if f.suffix.lower() in (".c", ".cpp", ".cc", ".cxx", ".s"):
+                    srcs.append(f"conditional/{sub.name}/src/{f.name}")
+        if (sub / "include").is_dir():
+            incs.append(f"conditional/{sub.name}/include")
+    return srcs, incs
+
+
 # Top-level docstring (Markdown is fine; reads as `head -1` of the generated file).
 _GEN_HEADER_CMAKE = (
     "# AUTO-GENERATED by spangap-inside. Do not edit; regenerated each build.\n"
@@ -468,9 +567,19 @@ def _name_to_kconfig(repo: str) -> str:
     return repo.upper().replace("-", "_").replace(".", "_")
 
 
-def write_spangap_requires(out_dir: Path, requires_list: list[str]) -> None:
+def write_spangap_requires(out_dir: Path, requires_list: list[str],
+                           cond_srcs: list[str] | None = None,
+                           cond_incs: list[str] | None = None) -> None:
     body = " ".join(requires_list)
-    text = _GEN_HEADER_CMAKE + f"set(SPANGAP_REQUIRES {body})\n"
+    text = (
+        _GEN_HEADER_CMAKE
+        + f"set(SPANGAP_REQUIRES {body})\n"
+        # Activator-driven conditional sources/includes: esp-idf/conditional/<name>/
+        # entries whose <name> is staged. A straddle's CMakeLists appends these to
+        # its idf_component_register SRCS / INCLUDE_DIRS.
+        + f"set(SPANGAP_CONDITIONAL_SRCS {' '.join(cond_srcs or [])})\n"
+        + f"set(SPANGAP_CONDITIONAL_INCLUDE_DIRS {' '.join(cond_incs or [])})\n"
+    )
     (out_dir / "spangap_requires.cmake").write_text(text)
 
 
@@ -609,10 +718,18 @@ def write_main_requires(proj: Manifest, staged_repos: set[str]) -> None:
     if not proj.is_buildable:
         return
     requires_list = effective_requires(proj, staged_repos)
+    # The buildable's main component compiles from <firmware>/main/, so its
+    # conditional/ code lives at <firmware>/main/conditional/<name>/.
+    cond_srcs, cond_incs = _conditional_sources(proj.firmware_dir / "main", staged_repos)
     staging_dir = proj.firmware_dir / "staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
     body = " ".join(requires_list)
-    text = _GEN_HEADER_CMAKE + f"set(SPANGAP_REQUIRES {body})\n"
+    text = (
+        _GEN_HEADER_CMAKE
+        + f"set(SPANGAP_REQUIRES {body})\n"
+        + f"set(SPANGAP_CONDITIONAL_SRCS {' '.join(cond_srcs)})\n"
+        + f"set(SPANGAP_CONDITIONAL_INCLUDE_DIRS {' '.join(cond_incs)})\n"
+    )
     (staging_dir / "main_requires.cmake").write_text(text)
 
 
@@ -646,91 +763,212 @@ def init_order(deps: list[Manifest]) -> list[Manifest]:
 
 def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
     """For a buildable, generate staging/spangap_init_dispatch.gen.cpp — the
-    spangapInitStraddles() dispatcher that calls every staged straddle's
-    declared init: hooks.
+    buildable's ENTIRE entry point: a generated app_main() plus the two phase
+    dispatchers it calls. The buildable ships no main.cpp; app_main is the
+    universal four-call skeleton (start dispatcher → spangapInit → init
+    dispatcher → spangapPostAppInit):
 
-    Two bands, no per-hook ordering knob:
+      spangapStartStraddles()  — the FIRST thing in app_main, BEFORE spangapInit().
+      spangapInitStraddles()   — after spangapInit(), as today.
 
-      1. Platform band — spangap's own components (PLATFORM_ORDER: core, net,
-         web, lcd), in exactly that order, each only if staged. This is the
-         fixed ecosystem bring-up; everything after it can assume it's up.
-      2. Straddle band — every other staged straddle, in the dependency-topo
-         order `deps` already arrives in (a straddle appears after the ones it
-         requires:). That's the whole ordering contract: a straddle that needs
-         another up first declares it in requires:/optional_requires: and the
-         topo walk handles it. No manual `order:` tuning — the platform band
-         removed the cross-cutting reason for it (e.g. "after lcdInit" / "after
-         the net foundation"), and genuine peer dependencies are expressed as
-         requires:.
+    Both collect their hooks across the staged set and order them through the
+    one init_order() source of truth (platform band — core/net/web/lcd — then
+    the dependency-topo straddle band), so the boot order and `spangap show`
+    can never drift. Within one straddle, hooks fire in listed order.
 
-    Within one straddle, hooks fire in the order they're listed in its init:.
+    PHASES (straddle.yaml `start:` / `init:`):
+      start: runs on BARE HARDWARE — before fs/storage/log/cli exist. It is for
+        board bring-up the platform itself depends on: power a peripheral rail
+        before spangap-core's fs_mount_sd() touches the SD bus, register the
+        display/touch HAL before spangap-lcd's lcdInit(). A start hook must not
+        use info()/storage/fs_*/ITS (nothing is up yet) — raw peripherals only.
+        The platform band is empty here in practice (core/net/web have no
+        hardware to power), so it's effectively the board, then its dependents.
+      init:  runs after spangapInit(); the straddle band can assume the whole
+        ecosystem (storage/cron, net, web, lcd) is already up.
 
-    We forward-declare each init symbol and call it directly — referencing the
-    symbol is what keeps it off the linker's static-lib GC list (a self-
-    registration constructor in an otherwise-unreferenced TU would be dropped).
-    No per-straddle header #include: an `--include`d straddle isn't in the
-    buildable's requires graph, so its include/ dir isn't on the main
-    component's path — but its component lib IS on the link line, so a bare
-    forward decl + call resolves at link time regardless.
+    `when:` GATING. A hook with `when: <org>/<repo>` is emitted only if that
+    straddle is in the staged set — resolved here, at generation time, so the
+    output stays preprocessor-free (no #if). When the gating straddle is pruned
+    the call is simply never written, the hook symbol is never referenced, and
+    -ffunction-sections/--gc-sections drops it together with its references into
+    the absent dep. This is the finer-grained twin of how a whole straddle's
+    hooks already appear only when it is staged.
 
-    Linkage: the decls are emitted with default (C++) linkage to match the
-    convention every straddle follows today — a global `void xInit()` /
-    `void xInit(void)` declared in its public header with no `extern "C"`
-    wrapper (in C++ the two spellings are the same symbol). An init defined
-    with C linkage (e.g. in a .c file) would need an `extern "C"` wrapper to
-    match; that's the documented contract for the `init:` hook.
+    We forward-declare each symbol and call it directly — referencing it is what
+    keeps it off the linker's static-lib GC list. No per-straddle header
+    #include: a straddle pulled in with `--with` isn't in the buildable's requires graph,
+    so its include/ dir isn't on the main component's path — but its component
+    lib IS on the link line, so a bare forward decl + call resolves regardless.
+    Decls carry default (C++) linkage to match the hook convention (global
+    `void xStart()` / `void xInit()`, no extern "C"); the dispatchers are
+    extern "C" to match their spangap.h prototypes (an extern "C" function may
+    freely call C++-linkage functions).
 
-    Always written for a buildable (empty body if no straddle declares init:)
-    so spangapInitStraddles() is always defined and the buildable's single call
-    site never dangles — same contract as write_main_requires /
-    write_sdkconfig_overrides.
+    Always written for a buildable (empty dispatcher bodies if nothing declares
+    hooks) so app_main and both dispatchers are always defined — same contract
+    as write_main_requires / write_sdkconfig_overrides.
     """
     if not proj.is_buildable:
         return
 
-    calls: list[str] = []
-    seen_calls: set[str] = set()
+    # The buildable inits LAST — it depends on everything, so its own start:/
+    # init: hooks (the board HAL etc.) fire after every dep. `deps` does NOT
+    # include the buildable itself, so append it — same convention as the
+    # sdkconfig-fragment precedence (init_order(deps) + [proj]).
+    ordered = init_order(deps) + [proj]
+    staged_names = {m.name for m in ordered}
 
-    def emit(dep: Manifest) -> None:
-        for hook in dep.init:
-            call = hook["call"]
-            if call in seen_calls:
-                continue
-            seen_calls.add(call)
-            calls.append(call)
+    def collect(phase_attr: str) -> list[str]:
+        """Per-phase call list, in init order (buildable last), deduped by
+        symbol, with `when:` hooks dropped when their gating straddle isn't
+        staged."""
+        calls: list[str] = []
+        seen: set[str] = set()
+        for dep in ordered:
+            for hook in getattr(dep, phase_attr):
+                when = hook.get("when")
+                if when is not None and when not in staged_names:
+                    continue  # gating straddle pruned — drop the call entirely
+                call = hook["call"]
+                if call in seen:
+                    continue
+                seen.add(call)
+                calls.append(call)
+        return calls
 
-    # Platform band then topo band — the shared init order (see init_order),
-    # so the boot dispatcher and `spangap show` can't disagree.
-    for dep in init_order(deps):
-        emit(dep)
+    start_calls = collect("start")
+    init_calls = collect("init")
 
-    # Forward decls carry default (C++) linkage to match the straddle init
-    # convention (global `void xInit()` in a header, no extern "C"). The
-    # dispatcher itself is extern "C" to match its spangap.h prototype — an
-    # extern "C" function may freely call C++-linkage functions.
-    externs = "".join(f"void {c}(void);\n" for c in calls)
-    body_calls = "".join(f"    {c}();\n" for c in calls)
+    # One forward decl per distinct symbol across both phases (identical
+    # redeclarations are legal C++, but keep the generated file tidy).
+    decls: list[str] = []
+    decl_seen: set[str] = set()
+    for c in start_calls + init_calls:
+        if c not in decl_seen:
+            decl_seen.add(c)
+            decls.append(c)
+    externs = "".join(f"void {c}(void);\n" for c in decls)
+
+    def fn(name: str, calls: list[str]) -> str:
+        body_calls = "".join(f"    {c}();\n" for c in calls)
+        return f'extern "C" void {name}(void) {{\n{body_calls}}}\n'
+
     body = (
         "/* AUTO-GENERATED by spangap-inside. Do not edit; regenerated each build.\n"
-        " * spangapInitStraddles() calls every staged straddle's declared init:\n"
-        " * hooks: first spangap's own platform components (core, net, web, lcd)\n"
-        " * in that fixed order, then every other straddle in dependency-topo\n"
-        " * order. The buildable calls this once from app_main; adding a straddle\n"
-        " * that declares init: is then enough to have it initialize — no edit.\n"
-        " *\n"
-        " * Forward decls use default (C++) linkage — the init convention is a\n"
-        " * global `void xInit()` with no extern \"C\". No header is included: an\n"
-        " * --include'd straddle's include/ dir may not be on this component's\n"
-        " * path, but its lib is on the link line, so the call resolves. */\n"
+        " * The buildable's ENTIRE entry point: a generated app_main() plus the two\n"
+        " * phase dispatchers it calls. The buildable ships NO main.cpp — this IS\n"
+        " * its main. app_main is the universal four-call skeleton:\n"
+        " *   spangapStartStraddles() — FIRST, before spangapInit(): bare-hardware\n"
+        " *     board bring-up (power rails, HAL register) the platform depends on.\n"
+        " *   spangapInit()           — platform core foundations.\n"
+        " *   spangapInitStraddles()  — every staged straddle's init: hook, platform\n"
+        " *     band (core/net/web/lcd) then dependency-topo.\n"
+        " *   spangapPostAppInit()    — finalise.\n"
+        " * Adding a straddle that declares start:/init: is enough to have it run —\n"
+        " * no edit here. `when:`-gated hooks appear only when their straddle is\n"
+        " * staged. Hook forward decls use default (C++) linkage (no extern \"C\");\n"
+        " * spangap.h is included for the four platform prototypes. */\n"
+        '#include \"spangap.h\"\n'
+        "\n"
         f"{externs}"
         "\n"
-        'extern "C" void spangapInitStraddles(void) {\n'
-        f"{body_calls}"
+        f"{fn('spangapStartStraddles', start_calls)}"
+        "\n"
+        f"{fn('spangapInitStraddles', init_calls)}"
+        "\n"
+        'extern \"C\" void app_main(void) {\n'
+        "    spangapStartStraddles();\n"
+        "    spangapInit();\n"
+        "    spangapInitStraddles();\n"
+        "    spangapPostAppInit();\n"
         "}\n"
     )
     staging_dir = proj.firmware_dir / "staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
     (staging_dir / "spangap_init_dispatch.gen.cpp").write_text(body)
+
+
+_KCONFIG_LINE_RE = re.compile(r"^(CONFIG_[A-Z0-9_]+=.+|# CONFIG_[A-Z0-9_]+ is not set)$")
+
+
+def _kconfig_key(line: str) -> str:
+    """The CONFIG_ symbol a validated kconfig: line sets (or un-sets)."""
+    if line.startswith("# "):
+        return line.split()[1]            # "# CONFIG_X is not set"
+    return line.split("=", 1)[0]          # "CONFIG_X=..."
+
+
+def write_sdkconfig_fragments(proj: Manifest, deps: list[Manifest]) -> None:
+    """Collect every staged straddle's `kconfig:` lines into one generated
+    staging/sdkconfig.spangap-fragments — a plain sdkconfig.defaults fragment
+    that bootstrap.cmake layers into SDKCONFIG_DEFAULTS (between the platform
+    defaults and the buildable's own sdkconfig.defaults).
+
+    This is the road by which a NON-buildable straddle hands Kconfig values to
+    other straddles: a board straddle (hw-tdeck) declares its pins in
+    straddle.yaml `kconfig:`, and they reach iface-lora / the SD driver / the LCD
+    here, via the shared global sdkconfig. The peripheral straddle still OWNS
+    the option schema (its component Kconfig); the board only supplies values.
+
+    Precedence — last wins, the same contract as the init order:
+      1. straddles in init_order(deps): platform band (core/net/web/lcd) first,
+         then the straddle band in dependency-topo order (a straddle's values
+         override the values of the straddles it requires:);
+      2. the buildable itself LAST, so the building straddle always wins among
+         fragments — `reticulous` overriding a value `hw-tdeck` set is the
+         intended "if you're the building straddle you win".
+    The buildable's own sdkconfig.defaults file (layered after this whole file
+    by bootstrap.cmake) and the CLI overrides win over everything here, in that
+    order.
+
+    Each entry is emitted verbatim — what you write in `kconfig:` is exactly the
+    sdkconfig line that lands — so the RHS (`=y`, ints, hex, quoted strings)
+    survives untouched. Written deterministically (stable order, no timestamps)
+    so its hash only moves when a fragment actually changes — bootstrap.cmake's
+    SDKCONFIG_DEFAULTS staleness check then regenerates sdkconfig on a pin edit
+    with no extra wiring. Always written (empty body if nobody declares
+    kconfig:) so bootstrap can rely on its presence.
+
+    Cross-straddle collisions (two different non-buildable straddles setting the
+    same symbol — e.g. two boards both claiming a pin) are a silent-last-wins
+    footgun, so they're warned about here. The buildable overriding a dep is
+    intended and stays quiet.
+    """
+    sources = init_order(deps) + [proj]   # buildable last → wins among fragments
+    blocks: list[str] = []
+    owner: dict[str, str] = {}            # CONFIG_ key -> straddle that last set it
+
+    for m in sources:
+        lines = m.kconfig
+        if not lines:
+            continue
+        clean: list[str] = []
+        for raw in lines:
+            line = raw.strip()
+            if not _KCONFIG_LINE_RE.match(line):
+                die(
+                    f"{m.path}: kconfig: entry is not a valid sdkconfig line:\n"
+                    f"         {raw!r}\n"
+                    '       expected `CONFIG_NAME=value` or `# CONFIG_NAME is not set`.'
+                )
+            key = _kconfig_key(line)
+            prev = owner.get(key)
+            if prev is not None and prev != m.name and m.name != proj.name:
+                warn(f"{key}: set by both {prev} and {m.name} — {m.name} wins "
+                     "(later in init order)")
+            owner[key] = m.name
+            clean.append(line)
+        blocks.append(f"# ── from {m.name} ──\n" + "\n".join(clean))
+
+    text = (
+        "# AUTO-GENERATED by spangap-inside — collected straddle `kconfig:` blocks.\n"
+        "# Layered into SDKCONFIG_DEFAULTS by bootstrap.cmake; last block wins.\n"
+        + ("\n".join(blocks) + "\n" if blocks else "")
+    )
+    staging_dir = proj.firmware_dir / "staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    (staging_dir / "sdkconfig.spangap-fragments").write_text(text)
 
 
 def signal_preamble(proj: Manifest, deps: list[Manifest], missing: list[str] = ()) -> None:
@@ -771,13 +1009,16 @@ def stage_components(proj: Manifest, deps: list[Manifest], log_staged: bool = Tr
         dst.mkdir()
         for entry in sorted(src.iterdir()):
             (dst / entry.name).symlink_to(entry)
-        write_spangap_requires(dst, effective_requires(dep, staged_repos))
+        cond_srcs, cond_incs = _conditional_sources(dep.firmware_dir, staged_repos)
+        write_spangap_requires(dst, effective_requires(dep, staged_repos),
+                               cond_srcs, cond_incs)
         if log_staged:
             print(f"  staged: {dep.repo} -> {src}", file=sys.stderr)
 
     write_presence_component(staging, deps)
     write_main_requires(proj, staged_repos)
     write_init_dispatch(proj, deps)
+    write_sdkconfig_fragments(proj, deps)
     return staging
 
 
@@ -880,7 +1121,7 @@ def run_build_idf(args: list[str], cwd: Path, quiet: bool, env: dict[str, str] |
     return proc.wait()
 
 
-_NO_SHORTHANDS = {  # --no-<x> maps to --exclude <bare>
+_NO_SHORTHANDS = {  # --no-<x> maps to --without <bare>
     "lcd": "spangap/spangap-lcd",
     "web": "spangap/spangap-web",
     "net": "spangap/spangap-net",
@@ -891,7 +1132,7 @@ _VALID_FLASH_MB = (4, 8, 16, 32, 64, 128)
 
 
 def _resolve_org_repo(raw: str, all_straddles: dict[str, Manifest], flag: str) -> str:
-    """--exclude/--include accept bare repo names or org/repo. Disambiguate."""
+    """--without/--with accept bare repo names or org/repo. Disambiguate."""
     if "/" in raw:
         return raw
     matches = [n for n in all_straddles if all_straddles[n].repo == raw]
@@ -915,10 +1156,12 @@ def write_sdkconfig_overrides(
     as the highest-priority SDKCONFIG_DEFAULTS entry (first build / regen path).
     Always written (even if empty body) so bootstrap can rely on its presence.
 
-    `extra_lines` are raw `CONFIG_*=...` lines (e.g. the --lora* pin/type
-    switches) appended verbatim. Like all SDKCONFIG_DEFAULTS they seed a fresh
-    build / regen only; changing them against an existing sdkconfig needs a
-    `spangap clean` (or edit via `spangap menuconfig`).
+    `extra_lines` are raw `CONFIG_*=...` lines appended verbatim (reserved for a
+    future generic `--kconfig`/config-file CLI override). Like all
+    SDKCONFIG_DEFAULTS they seed a fresh build / regen only; changing them
+    against an existing sdkconfig needs a `spangap clean` (or `spangap
+    menuconfig`). Per-straddle board values flow through the separate
+    sdkconfig.spangap-fragments file (see write_sdkconfig_fragments), not here.
 
     Also edits an existing sdkconfig in-place when --flash-size is given. IDF's
     SDKCONFIG_DEFAULTS only seeds on first build; once sdkconfig exists,
@@ -958,80 +1201,6 @@ def write_sdkconfig_overrides(
     sdkconfig.write_text("\n".join(kept) + "\n")
 
 
-# --lora* switches → CONFIG_LORA* override lines. tr-lora's Kconfig owns the
-# schema (4 radio slots on one shared SPI bus); these let a generic build set
-# pins/type without editing sdkconfig.defaults. Seed a fresh build (or after
-# `spangap clean`); for steady-state edits use `spangap menuconfig`.
-_LORA_RADIO_KINDS = (  # any RadioLib LoRa chip; → CONFIG_LORAn_RADIO_<UPPER>
-    "sx1261", "sx1262", "sx1268", "llcc68",          # SX126x
-    "sx1272", "sx1276", "sx1277", "sx1278",          # SX127x / RFM9x
-    "sx1280", "sx1281", "sx1282",                    # SX128x (2.4 GHz)
-    "lr1110", "lr1120", "lr1121", "lr2021",          # LR11x0 / LR2021
-)
-
-
-def _add_lora_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--lora-count", type=int, default=None, metavar="N",
-                   help="number of LoRa radios (0-4) → CONFIG_LORA_COUNT")
-    p.add_argument("--lora-spi", type=int, default=None, metavar="HOST",
-                   help="shared SPI host (1/2/3) → CONFIG_LORA_SPI_HOST")
-    p.add_argument("--lora-sck", type=int, default=None, metavar="PIN",
-                   help="shared SPI SCK pin → CONFIG_LORA_SCK_PIN")
-    p.add_argument("--lora-mosi", type=int, default=None, metavar="PIN",
-                   help="shared SPI MOSI pin → CONFIG_LORA_MOSI_PIN")
-    p.add_argument("--lora-miso", type=int, default=None, metavar="PIN",
-                   help="shared SPI MISO pin → CONFIG_LORA_MISO_PIN")
-    for i in range(4):
-        g = f"radio {i}"
-        p.add_argument(f"--lora{i}-cs", type=int, default=None, metavar="PIN",
-                       help=f"{g} CS/NSS pin")
-        p.add_argument(f"--lora{i}-dio1", type=int, default=None, metavar="PIN",
-                       help=f"{g} IRQ pin (DIO1/DIO0/IRQ per chip)")
-        p.add_argument(f"--lora{i}-busy", type=int, default=None, metavar="PIN",
-                       help=f"{g} BUSY pin (-1 for SX127x)")
-        p.add_argument(f"--lora{i}-rst", type=int, default=None, metavar="PIN",
-                       help=f"{g} RST pin (-1 if none)")
-        p.add_argument(f"--lora{i}-tcxo", type=int, default=None, metavar="MV",
-                       help=f"{g} TCXO control voltage in mV (0 = XTAL)")
-        p.add_argument(f"--lora{i}-dio2", action="store_true",
-                       help=f"{g} drives DIO2 as the RF switch (SX126x)")
-        p.add_argument(f"--lora{i}-rfsw-rx", type=int, default=None, metavar="PIN",
-                       help=f"{g} external RF-switch RX-enable GPIO")
-        p.add_argument(f"--lora{i}-rfsw-tx", type=int, default=None, metavar="PIN",
-                       help=f"{g} external RF-switch TX-enable GPIO")
-        p.add_argument(f"--lora{i}-radio", choices=_LORA_RADIO_KINDS, default=None,
-                       help=f"{g} chip (any RadioLib LoRa part)")
-
-
-def _lora_overrides(args: argparse.Namespace) -> list[str]:
-    lines: list[str] = []
-
-    def put(attr: str, conf: str) -> None:
-        v = getattr(args, attr, None)
-        if v is not None:
-            lines.append(f"{conf}={v}")
-
-    put("lora_count", "CONFIG_LORA_COUNT")
-    put("lora_spi", "CONFIG_LORA_SPI_HOST")
-    put("lora_sck", "CONFIG_LORA_SCK_PIN")
-    put("lora_mosi", "CONFIG_LORA_MOSI_PIN")
-    put("lora_miso", "CONFIG_LORA_MISO_PIN")
-    for i in range(4):
-        put(f"lora{i}_cs", f"CONFIG_LORA{i}_CS_PIN")
-        put(f"lora{i}_dio1", f"CONFIG_LORA{i}_DIO1_PIN")
-        put(f"lora{i}_busy", f"CONFIG_LORA{i}_BUSY_PIN")
-        put(f"lora{i}_rst", f"CONFIG_LORA{i}_RST_PIN")
-        put(f"lora{i}_tcxo", f"CONFIG_LORA{i}_TCXO_MV")
-        put(f"lora{i}_rfsw_rx", f"CONFIG_LORA{i}_RFSW_RX_PIN")
-        put(f"lora{i}_rfsw_tx", f"CONFIG_LORA{i}_RFSW_TX_PIN")
-        if getattr(args, f"lora{i}_dio2", False):
-            lines.append(f"CONFIG_LORA{i}_DIO2_RF_SWITCH=y")
-        kind = getattr(args, f"lora{i}_radio", None)
-        if kind is not None:
-            lines.append(f"CONFIG_LORA{i}_RADIO_{kind.upper()}=y")
-    return lines
-
-
 def cmd_menuconfig(args: argparse.Namespace) -> int:
     """Stage the buildable's components, then run idf.py menuconfig on it
     interactively. With --save, persist the result into the straddle's
@@ -1063,7 +1232,23 @@ def cmd_menuconfig(args: argparse.Namespace) -> int:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    proj = find_project()
+    all_straddles = scan_workspace_straddles()
+
+    # Optional leading positional target: `spangap build <straddle> [idf args…]`.
+    # If the first non-flag token names a known straddle (by <org>/<repo>, repo
+    # dir, or buildable product name), build THAT image regardless of cwd —
+    # otherwise leave every token for idf.py (passthrough for `menuconfig`,
+    # build targets, -D…). The target frees you from cd-ing into the straddle,
+    # which matters under --straddles (straddles live at /straddles/<repo>, not
+    # in the workspace dir).
+    idf_args = list(args.idf_args or [])
+    target: Manifest | None = None
+    if idf_args and not idf_args[0].startswith("-"):
+        target = resolve_target_straddle(idf_args[0], all_straddles)
+        if target is not None:
+            idf_args.pop(0)
+
+    proj = target if target is not None else find_project()
     if not proj.is_buildable:
         die(
             f"{proj.name} is not a buildable straddle (no `buildable:` block in straddle.yaml).\n"
@@ -1072,22 +1257,20 @@ def cmd_build(args: argparse.Namespace) -> int:
     if not proj.has_firmware:
         die(f"{proj.name}: firmware dir {proj.firmware_dir} has no CMakeLists.txt")
 
-    all_straddles = scan_workspace_straddles()
-
-    # --exclude (with --no-X shorthands) → drop from staged set.
+    # --without (with --no-X shorthands) → drop from staged set.
     excluded: set[str] = set()
     for raw in (args.exclude or []):
-        excluded.add(_resolve_org_repo(raw, all_straddles, "--exclude"))
+        excluded.add(_resolve_org_repo(raw, all_straddles, "--without"))
     for short, full in _NO_SHORTHANDS.items():
         if getattr(args, f"no_{short}", False):
             excluded.add(full)
 
-    # --include → pull additional straddles into the build. Slash-form is
+    # --with → pull additional straddles into the build. Slash-form is
     # trusted (the host dispatcher pre-clones missing ones); bare-form must
     # resolve to a workspace straddle.
     included: set[str] = set()
     for raw in (args.include or []):
-        included.add(_resolve_org_repo(raw, all_straddles, "--include"))
+        included.add(_resolve_org_repo(raw, all_straddles, "--with"))
 
     # --flash-size validation.
     if args.flash_size is not None and args.flash_size not in _VALID_FLASH_MB:
@@ -1111,10 +1294,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         if args.flash_size is not None:
             print(f"flash:     {args.flash_size} MB (--flash-size override)", file=sys.stderr)
     stage_components(proj, deps, log_staged=not quiet)
-    lora_lines = _lora_overrides(args)
-    if not quiet and lora_lines:
-        print(f"lora:      {', '.join(lora_lines)}", file=sys.stderr)
-    write_sdkconfig_overrides(proj, args.flash_size, lora_lines)
+    write_sdkconfig_overrides(proj, args.flash_size)
     lint_cmakelists(proj, deps, all_straddles)
     # Bake the build invocation identity into the image: spangap-core's
     # write-build-info.py (run by CMake during this build) reads these and
@@ -1125,7 +1305,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         "SPANGAP_BUILD_ARGS": getattr(args, "spangap_invocation", "") or "spangap build",
     }
     return run_build_idf(
-        args.idf_args or ["build"], cwd=proj.firmware_dir, quiet=quiet, env=build_env
+        idf_args or ["build"], cwd=proj.firmware_dir, quiet=quiet, env=build_env
     )
 
 
@@ -1151,6 +1331,33 @@ def cmd_flash(args: argparse.Namespace) -> int:
             return 0
     print(
         "spangap: flashme still present after 5s — nobody seems to be running\n"
+        "         `spangap monitor <dev>`. Start it on a host with the serial port.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    """In-container reset: touch .spangap-resetme, wait for a monitor to consume it.
+
+    Like cmd_flash, the container can't touch the device — only the host
+    `spangap monitor` can reset it. We drop the workspace-root .spangap-resetme
+    marker (visible to the host at $workspace/.spangap-resetme); the monitor
+    loop watches for it alongside .spangap-flashme, then restarts with a device
+    reset (clean reboot + boot-log capture) — no reflash. Unlike flash this
+    needs no build artifacts, so there's no buildable check. (Tearing the
+    workspace's container/image down is the host-only `spangap reset-workspace`.)
+    """
+    resetme = WORKSPACE / ".spangap-resetme"
+    resetme.touch()
+    print(f"spangap: signaled {resetme} — waiting for a monitor to pick it up...", file=sys.stderr)
+    for _ in range(5):
+        time.sleep(1)
+        if not resetme.exists():
+            print("spangap: resetting the device.", file=sys.stderr)
+            return 0
+    print(
+        "spangap: resetme still present after 5s — nobody seems to be running\n"
         "         `spangap monitor <dev>`. Start it on a host with the serial port.",
         file=sys.stderr,
     )
@@ -1236,18 +1443,18 @@ def cmd_show(args: argparse.Namespace) -> int:
     The dependency order is THE init order (init_order()) — the same order the
     generated spangapInitStraddles() dispatcher fires the straddles in, derived
     from the same resolve_requires() walk that get-deps and the build use.
-    Paths are the container-native straddle dirs (/repos/<repo> for a repo_path
-    checkout, /workspace/<repo> for a git clone).
+    Paths are the container-native straddle dirs (/straddles/<repo> for a
+    --straddles checkout, <workspace>/<repo> for a git clone).
     """
     proj = find_project()
     deps, _ = resolve_requires(proj, scan_workspace_straddles())
 
-    rp_file = WORKSPACE / ".spangap-repo_path"
-    repo_path = rp_file.read_text().strip() if rp_file.is_file() else ""
-    if repo_path:
+    st_file = WORKSPACE / ".spangap-straddles"
+    straddles = st_file.read_text().strip() if st_file.is_file() else ""
+    if straddles:
         print(
-            f"NOTE: This workspace was initialized with --repo-path: {repo_path}, "
-            "mounted as /repos in container"
+            f"NOTE: This workspace was initialized with --straddles: {straddles}, "
+            "mounted as /straddles in container"
         )
         print()
 
@@ -1385,7 +1592,7 @@ def _present(p: Path) -> bool:
 
 
 def _ensure_workspace_docs() -> None:
-    """Ensure /workspace has README.md (the instructions) + CLAUDE.md (a pointer).
+    """Ensure the workspace has README.md (the instructions) + CLAUDE.md (a pointer).
 
     README.md is normally seeded host-side at `spangap init`; this re-seeds it
     from the image-baked copy if absent, so `spangap claude` still works in a
@@ -1419,54 +1626,110 @@ def cmd_claude(claude_args: list[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# `spangap cli` — TCP CLI client. Same UX as the host-side `spangap cli`:
-# -h persists hostname to /workspace/.spangap-host (= $SPANGAP_WORKSPACE/.spangap-host
-# on the host through the bind mount), subsequent calls can omit it.
+# `spangap cli [<cmd and args>]` — reach the device, preferring ssh.
+#
+#   .spangap-ssh present  → exec `ssh -p <port> <host> [<cmd and args>]` (the
+#                           sshd straddle; one-shot exec with args, shell without)
+#   .spangap-tcp present  → the legacy TCP CLI socket client (port 2323 default)
+#   neither               → bootstrap: generate an ed25519 key (if missing), ask
+#                           for the device host, write .spangap-ssh, and print the
+#                           `sshd add <pubkey>` line to run in the serial monitor.
+#
+# Both endpoints are fronted by the host-side bridge that `spangap monitor` owns
+# (spangap-outside) — inside the container we can't route to the device's LAN, so
+# we dial host.docker.internal and the bridge splices to the real device. On a
+# native-Linux host host.docker.internal isn't injected and the bridge network
+# reaches the LAN directly, so we fall back to dialing the device host itself.
+# A `-h <host[:port]>` flag is a convenience that (re)writes .spangap-ssh.
 # ---------------------------------------------------------------------------
 PROMPT = b"$ "
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10"]
+
+
+def parse_endpoint(text: str, default_port: int) -> tuple[str, int]:
+    """Split "<host>:<port>" (port optional) on the last colon. Bracketed IPv6
+    literals ("[::1]:22") keep their colons inside the brackets."""
+    text = text.strip()
+    if text.startswith("[") and "]" in text:
+        hostpart, _, rest = text[1:].partition("]")
+        port = int(rest[1:]) if rest.startswith(":") and rest[1:] else default_port
+        return hostpart, port
+    host, sep, p = text.rpartition(":")
+    if sep and host and p.isdigit():
+        return host, int(p)
+    return text, default_port
+
+
+def _connect_host(host: str, port: int) -> str:
+    """Reach the device via the monitor's bridge at host.docker.internal when it
+    resolves (Docker Desktop), else dial the device host directly (native Linux)."""
+    try:
+        socket.getaddrinfo("host.docker.internal", port)
+        return "host.docker.internal"
+    except OSError:
+        return host
+
+
+def _cli_bootstrap() -> int:
+    key = Path.home() / ".ssh" / "id_ed25519"
+    if not key.is_file():
+        key.parent.mkdir(mode=0o700, exist_ok=True)
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key), "-q"],
+                       check=True)
+    try:
+        host = input("spangap cli: device hostname or IP: ").strip()
+    except EOFError:
+        die("spangap cli: no device configured — run interactively, or write "
+            f"{SSH_FILE.name} (or {TCP_FILE.name}) with <host>:<port>")
+    if not host:
+        die("spangap cli: no host entered")
+    SSH_FILE.write_text(f"{host}:22\n")
+    pub = (key.with_suffix(".pub")).read_text().strip()
+    print(f"\nWrote {SSH_FILE.name} → {host}:22\n")
+    print("Now, in the device serial monitor, authorize this key:\n")
+    print(f"    sshd add {pub}\n")
+    print("sshd is enabled by default; on an older build also run: sshd enable")
+    print("If sshd isn't in your build, rebuild with: spangap build --with spangap/sshd")
+    print("\nThen re-run `spangap cli` to connect over ssh.")
+    return 0
 
 
 def cmd_cli(argv: list[str]) -> int:
-    host: str | None = None
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "-h":
             if i + 1 >= len(argv):
                 die("spangap cli: -h needs a hostname")
-            host = argv[i + 1]
-            HOST_FILE.write_text(host + "\n")
+            ehost, eport = parse_endpoint(argv[i + 1], 22)
+            SSH_FILE.write_text(f"{ehost}:{eport}\n")
             i += 2
         elif a == "--":
             i += 1
             break
         else:
             break
-    if host is None:
-        host = os.environ.get("SPANGAP_HOST") or (HOST_FILE.read_text().strip() if HOST_FILE.is_file() else "")
-        if not host:
-            die("spangap cli: no host — pass -h <host> first to persist it")
-    port = int(os.environ.get("SPANGAP_CLI_PORT", "2323"))
+    rest = argv[i:]
 
-    # Inside the container we can't route to the device's LAN directly — reach
-    # it through the host-side relay (spangap-outside's ensure_forwarder), which
-    # forwards host.docker.internal:<port> → $SPANGAP_HOST. The resolved `host`
-    # above is still required (it's what the relay dials, persisted via -h /
-    # .spangap-host) but the actual connection target is host.docker.internal.
-    # On a native-Linux host there's no relay and host.docker.internal isn't
-    # injected; there the bridge network reaches the LAN directly, so fall back
-    # to dialing the device host itself.
-    connect_host = host
-    try:
-        socket.getaddrinfo("host.docker.internal", port)
-        connect_host = "host.docker.internal"
-    except OSError:
-        pass
+    # ssh first, then the legacy TCP CLI, else bootstrap.
+    if SSH_FILE.is_file():
+        host, port = parse_endpoint(SSH_FILE.read_text(), 22)
+        ssh = shutil.which("ssh") or "ssh"
+        cmd = [ssh, "-p", str(port), *SSH_OPTS, _connect_host(host, port), *rest]
+        os.execvp(cmd[0], cmd)
+        return 1  # unreachable
+    if not TCP_FILE.is_file():
+        return _cli_bootstrap()
 
+    host, port = parse_endpoint(TCP_FILE.read_text(), 2323)
+    if "SPANGAP_CLI_PORT" in os.environ:
+        port = int(os.environ["SPANGAP_CLI_PORT"])
+    connect_host = _connect_host(host, port)
     try:
         s = socket.create_connection((connect_host, port), timeout=10)
     except OSError as e:
-        die(f"cli: connect {connect_host}:{port} (relay → {host}): {e}")
+        die(f"cli: connect {connect_host}:{port} (bridge → {host}): {e}")
     s.settimeout(None)
 
     def drain():
@@ -1478,7 +1741,6 @@ def cmd_cli(argv: list[str]) -> int:
             buf += d
         return buf
 
-    rest = argv[i:]
     if rest:
         drain()
         s.sendall((" ".join(rest) + "\n").encode())
@@ -1524,7 +1786,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_cli(raw[1:])
 
     p = argparse.ArgumentParser(prog="spangap", description="spangap straddles CLI (in-container)")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # Bare `spangap` (no subcommand) lists the project + deps + environment —
+    # what used to be `spangap show`. `show` stays as an explicit alias.
+    p.set_defaults(func=cmd_show)
+    sub = p.add_subparsers(dest="cmd", required=False)
 
     sub.add_parser("validate", help="parse + validate manifest and dep graph").set_defaults(func=cmd_validate)
     sub.add_parser("clean", help="run idf.py fullclean").set_defaults(func=cmd_clean)
@@ -1538,14 +1803,14 @@ def main(argv: list[str] | None = None) -> int:
              "kept.",
     )
     p_build.add_argument(
-        "-e", "--exclude", action="append", default=[], metavar="STRADDLE",
+        "-x", "--without", dest="exclude", action="append", default=[], metavar="STRADDLE",
         help="drop a straddle from this build's staged set (repeatable; <org>/<repo> "
              "or bare <repo>). Cascades: every straddle that hard-requires the "
              "target drops with it. Refused only if it would remove spangap-core "
              "or a straddle the buildable hard-requires.",
     )
     p_build.add_argument(
-        "-i", "--include", action="append", default=[], metavar="STRADDLE",
+        "-w", "--with", dest="include", action="append", default=[], metavar="STRADDLE",
         help="pull an extra straddle into this build (repeatable). Bare "
              "<repo> must already be a workspace sibling; <org>/<repo> "
              "form is auto-cloned from github if missing.",
@@ -1560,10 +1825,15 @@ def main(argv: list[str] | None = None) -> int:
     for short, full in _NO_SHORTHANDS.items():
         p_build.add_argument(
             f"--no-{short}", dest=f"no_{short}", action="store_true",
-            help=f"shorthand for --exclude {full}",
+            help=f"shorthand for --without {full}",
         )
-    _add_lora_args(p_build)
-    p_build.add_argument("idf_args", nargs="*", help="forwarded to idf.py")
+    p_build.add_argument(
+        "idf_args", nargs="*", metavar="[TARGET] [idf args…]",
+        help="optional leading TARGET names the buildable to build (its "
+             "<org>/<repo>, repo dir, or buildable product name) so you need "
+             "not cd into it; everything else is forwarded to idf.py. Without "
+             "a TARGET the straddle is resolved from cwd / .spangap-project.",
+    )
     p_build.set_defaults(func=cmd_build)
 
     p_mc = sub.add_parser(
@@ -1574,7 +1844,7 @@ def main(argv: list[str] | None = None) -> int:
         "--save", action="store_true",
         help="after editing, write the minimal sdkconfig.defaults via "
              "idf.py save-defconfig — persists the config into this straddle "
-             "(the 'clone hw-generic, configure, save as hw-whatever' step).",
+             "(the 'clone a board straddle, configure, save as hw-whatever' step).",
     )
     p_mc.set_defaults(func=cmd_menuconfig)
 
@@ -1582,6 +1852,11 @@ def main(argv: list[str] | None = None) -> int:
         "flash",
         help="signal a host running `spangap monitor` to reflash (touches .spangap-flashme)",
     ).set_defaults(func=cmd_flash)
+
+    sub.add_parser(
+        "reset",
+        help="signal a host running `spangap monitor` to reset the device for a clean boot (touches .spangap-resetme)",
+    ).set_defaults(func=cmd_reset)
 
     sub.add_parser(
         "show",

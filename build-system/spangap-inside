@@ -136,8 +136,8 @@ class Manifest:
     def requires(self) -> list[str]:
         return list(self.data.get("requires", []))
     @property
-    def optional_requires(self) -> list[str]:
-        return list(self.data.get("optional_requires", []))
+    def additional_installs(self) -> list[str]:
+        return list(self.data.get("additional_installs", []))
     @property
     def start(self) -> list[dict[str, Any]]:
         return list(self.data.get("start", []))
@@ -148,12 +148,26 @@ class Manifest:
     def kconfig(self) -> list[str]:
         return list(self.data.get("kconfig", []))
     @property
-    def is_buildable(self) -> bool:
-        return "buildable" in self.data
-    @property
-    def buildable_name(self) -> str | None:
-        b = self.data.get("buildable")
-        return b.get("name") if isinstance(b, dict) else None
+    def identity_kconfig(self) -> list[str]:
+        """Desugar the immutable-identity root keys (stub/display_name/banner)
+        plus default_hostname into CONFIG_SPANGAP_FW_* sdkconfig lines. These
+        ride the same fragment-collection + dependency-order precedence as
+        kconfig: (write_sdkconfig_fragments), so the built straddle — highest in
+        the dependency tree — wins and spangap-core, deepest, loses."""
+        mapping = (
+            ("stub",             "CONFIG_SPANGAP_FW_STUB"),
+            ("display_name",     "CONFIG_SPANGAP_FW_NAME"),
+            ("banner",           "CONFIG_SPANGAP_FW_BANNER"),
+            ("default_hostname", "CONFIG_SPANGAP_FW_HOSTNAME"),
+        )
+        out: list[str] = []
+        for yaml_key, cfg in mapping:
+            val = self.data.get(yaml_key)
+            if val is None:
+                continue
+            esc = str(val).replace("\\", "\\\\").replace('"', '\\"')
+            out.append(f'{cfg}="{esc}"')
+        return out
 
 
 def die(msg: str, exit_code: int = 1):
@@ -234,22 +248,19 @@ def resolve_target_straddle(
 
       - the full <org>/<repo> name        (reticulous/hw-tdeck)
       - the straddle's directory basename  (hw-tdeck)
-      - a buildable's product name         (buildable.name, e.g. reticulous —
-        the name of the *image* hw-tdeck produces, NOT a repo)
 
     Returns the Manifest, or None if the token names no straddle at all (so the
     caller can leave it for idf.py — keeping `spangap build menuconfig`, idf
-    build targets, etc. working as passthrough). A non-buildable match still
-    resolves here; cmd_build's own buildable check then reports it. Dies only
-    on a genuinely ambiguous match (the same token naming two straddles).
+    build targets, etc. working as passthrough). Any straddle resolves here —
+    there is no buildable gate; whether the build produces a useful image is up
+    to the straddle. Dies only on a genuinely ambiguous match (the same token
+    naming two straddles).
     """
     if name in all_straddles:  # exact <org>/<repo>
         return all_straddles[name]
     matches: dict[Path, Manifest] = {}
     for m in all_straddles.values():
         keys = {m.repo, m.dir.name}
-        if m.buildable_name:
-            keys.add(m.buildable_name)
         if name in keys:
             matches[m.path] = m
     if len(matches) > 1:
@@ -319,13 +330,13 @@ def resolve_requires(
     included: set[str] | None = None,
     dropped_out: set[str] | None = None,
 ) -> tuple[list[Manifest], list[str]]:
-    """Walk requires: and optional_requires: transitively, plus the implicit
+    """Walk requires: and additional_installs: transitively, plus the implicit
     spangap-core foundation and any user-named `included` straddles as extra
     roots, then apply --without with dependent-cascade.
 
     Two tiers in the manifest:
       requires:           hard — always pulled in, missing = error
-      optional_requires:  soft, default-on — pruned silently if absent/excluded
+      additional_installs:  soft, default-on — pruned silently if absent/excluded
 
     spangap-core is always an implicit hard root (see CORE_NAME) and sorts to
     the head of the topo order. `included` (from --with <name>) seeds the
@@ -372,7 +383,14 @@ def resolve_requires(
         if bare in seen or bare in missing:
             return
         if bare in on_stack:
-            die(f"requires: cycle through {bare} (from {requested_by})")
+            # A back-edge while this node is still on the DFS stack. If it came
+            # in over an additional_installs edge it's benign — an aggregator
+            # pulling in something that requires: it back (e.g. spangap-net
+            # additional-installs acme, which hard-requires net) is the normal
+            # case, not a cycle. The node is already being staged; just stop
+            # recursing. Genuine requires:-only cycles (a real init-ordering
+            # impossibility) are caught by the hard-cycle pass after the walk.
+            return
         if bare not in all_straddles:
             if missing_ok:
                 missing[bare] = spec
@@ -388,7 +406,7 @@ def resolve_requires(
         for dep in all_straddles[bare].requires:
             hd.add(_bare(dep))
             visit(dep, bare, hard=True)
-        for dep in all_straddles[bare].optional_requires:
+        for dep in all_straddles[bare].additional_installs:
             visit(dep, bare, hard=False)
         on_stack.discard(bare)
         seen.add(bare)
@@ -403,10 +421,32 @@ def resolve_requires(
         visit(CORE_NAME, f"{proj.name} (implicit core)", hard=True)
     for r in proj.requires:
         visit(r, proj.name, hard=True)
-    for r in proj.optional_requires:
+    for r in proj.additional_installs:
         visit(r, proj.name, hard=False)
     for r in included:
         visit(r, f"{proj.name} (--with)", hard=False)
+
+    # Hard-cycle pass: additional_installs cycles are allowed (above), but a
+    # cycle made purely of requires: edges is a genuine init-ordering
+    # impossibility — A can't come up before B if B must come up before A.
+    # Detect it over the staged closure, following requires: edges only.
+    hc_color: dict[str, int] = {}  # 0/absent = unvisited, 1 = on-stack, 2 = done
+
+    def check_hard_cycle(bare: str) -> None:
+        hc_color[bare] = 1
+        for dep in all_straddles[bare].requires:
+            db = _bare(dep)
+            if db not in seen:  # absent or pruned hard dep — not a staged edge
+                continue
+            if hc_color.get(db, 0) == 1:
+                die(f"requires: cycle through {db} (from {bare})")
+            if hc_color.get(db, 0) == 0:
+                check_hard_cycle(db)
+        hc_color[bare] = 2
+
+    for n in list(seen):
+        if hc_color.get(n, 0) == 0:
+            check_hard_cycle(n)
 
     # Mandatory = spangap-core + the buildable's hard requires:, transitively.
     # Never droppable; excluding one (or anything it hard-requires) is a conflict.
@@ -448,7 +488,7 @@ def resolve_requires(
         die(
             "--without conflict: these straddles are hard-required by "
             f"{proj.name} and can't be dropped:\n" + "\n".join(lines) +
-            "\n       Reclassify them as optional_requires: to make them droppable."
+            "\n       Reclassify them as additional_installs: to make them droppable."
         )
 
     # Forward-prune: keep only what's still reachable from the surviving roots
@@ -456,7 +496,7 @@ def resolve_requires(
     # targets, their cascaded dependents, and any now-orphaned forward deps.
     roots = ([CORE_NAME] if proj.name != CORE_NAME else [])
     roots += [_bare(r) for r in proj.requires]
-    roots += [_bare(r) for r in proj.optional_requires]
+    roots += [_bare(r) for r in proj.additional_installs]
     roots += [_bare(r) for r in included]
     reachable: set[str] = set()
     stack = [r for r in roots if r in seen and r not in excl]
@@ -465,7 +505,7 @@ def resolve_requires(
         if n in reachable:
             continue
         reachable.add(n)
-        for dep in all_straddles[n].requires + all_straddles[n].optional_requires:
+        for dep in all_straddles[n].requires + all_straddles[n].additional_installs:
             db = _bare(dep)
             if db in seen and db not in excl and db not in reachable:
                 stack.append(db)
@@ -488,19 +528,88 @@ def _repo(bare_name: str) -> str:
     return bare_name.split("/", 1)[1] if "/" in bare_name else bare_name
 
 
+# Central straddles get a stable CONFIG_SPANGAP_<NAME> alias (alongside the
+# generic CONFIG_STRADDLE_<REPO>) — the spelling source code gates on. Shared by
+# write_presence_component (which emits them) and the integration-cue scan below
+# (which reads them back out of source to learn what a component integrates with).
+_SHORTCUT_ALIASES = {
+    "spangap-lcd": "SPANGAP_LCD",
+    "spangap-net": "SPANGAP_NET",
+    "spangap-web": "SPANGAP_WEB",
+    "ota":         "SPANGAP_OTA",
+    "wg":          "SPANGAP_WG",
+    "upnp":        "SPANGAP_UPNP",
+    "duckdns":     "SPANGAP_DUCKDNS",
+    "acme":        "SPANGAP_ACME",
+}
+
+_SOURCE_EXTS = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh"}
+_SCAN_SKIP_DIRS = {"build", "managed_components", "components", "staging", ".git"}
+
+
+def _iter_component_sources(root: Path):
+    """Yield a component's own source/header files — skipping vendored
+    sub-components (components/), build output and staging."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SCAN_SKIP_DIRS]
+        for fn in filenames:
+            if Path(fn).suffix in _SOURCE_EXTS:
+                yield Path(dirpath) / fn
+
+
+def _integration_cues(firmware_dir: Path, staged_repos: set[str]) -> set[str]:
+    """Staged straddles this component integrates with, inferred from the CODE
+    (not the manifest), so the gate that already exists in source is the single
+    source of truth — nothing to keep in sync:
+
+      - a conditional/<repo>/ slice dir: compiled ONLY when <repo> is staged
+        (SPANGAP_CONDITIONAL_SRCS), so when present it needs <repo>'s headers; and
+      - a source reference to <repo>'s CONFIG_SPANGAP_<alias> presence shortcut:
+        the same `#if` that already gates an optional cross-straddle call (acme's
+        HTTP-01 path under CONFIG_SPANGAP_WEB, duckdns under CONFIG_SPANGAP_UPNP).
+
+    Either cue adds <repo> to REQUIRES only when it is staged, and never installs
+    it — a peer-less build just drops the dep and the #if / excluded slice
+    compiles away. Returns the cued subset of staged_repos.
+    """
+    cues: set[str] = set()
+    cond = firmware_dir / "conditional"
+    if cond.is_dir():
+        for sub in cond.iterdir():
+            if sub.is_dir() and sub.name in staged_repos:
+                cues.add(sub.name)
+    # CONFIG_SPANGAP_<alias> → the aliased repo, for staged central straddles not
+    # already cued by a slice. Scan source once, dropping tokens as they're found.
+    want = {f"CONFIG_{_SHORTCUT_ALIASES[r]}": r
+            for r in staged_repos if r in _SHORTCUT_ALIASES and r not in cues}
+    if want:
+        for path in _iter_component_sources(firmware_dir):
+            if not want:
+                break
+            try:
+                text = path.read_text(errors="ignore")
+            except OSError:
+                continue
+            for tok in [t for t in want if t in text]:
+                cues.add(want.pop(tok))
+    return cues
+
+
 def effective_requires(m: Manifest, staged_repos: set[str]) -> list[str]:
     """Cross-straddle REQUIRES list for one component, in repo-only form.
 
-    = implicit spangap-core + hard requires + (optional_requires ∩ staged),
-    order-preserved, deduped. Anything in the staged set that this straddle
-    declared as a dep flows into its CMake REQUIRES so the include paths line
-    up. Straddles added via --with don't appear here directly — they enter
-    the staged set, and any straddle that declares them in its own
-    requires/optional_requires picks them up through that path.
+    = implicit spangap-core + hard requires + (additional_installs ∩ staged)
+      + integration cues (see _integration_cues), order-preserved, deduped.
+    Everything past the hard requires is gated on staged_repos, so a dropped or
+    absent dep simply falls out of REQUIRES and its #if / excluded slice compiles
+    away. Integration deps are NOT declared in the manifest — they're read back
+    from the code's own CONFIG_SPANGAP_<X> gates and conditional/<X>/ slices.
 
-    spangap-core leads the list for every component but core itself: its
-    empty-prefix API (spangap.h) is linked everywhere, so it's always in
-    REQUIRES even though no straddle.yaml declares it.
+    Straddles added via --with don't appear here directly — they enter the staged
+    set, and any straddle that cues on them (or the buildable's main, which
+    REQUIRES the full staged set) picks them up. spangap-core leads the list for
+    every component but core itself: its empty-prefix API (spangap.h) is linked
+    everywhere, so it's always in REQUIRES even though nothing declares it.
     """
     out: list[str] = []
     seen: set[str] = set()
@@ -511,9 +620,12 @@ def effective_requires(m: Manifest, staged_repos: set[str]) -> list[str]:
         r = _repo(_bare(spec))
         if r not in seen:
             seen.add(r); out.append(r)
-    for spec in m.optional_requires:
+    for spec in m.additional_installs:
         r = _repo(_bare(spec))
         if r in staged_repos and r not in seen:
+            seen.add(r); out.append(r)
+    for r in sorted(_integration_cues(m.firmware_dir, staged_repos)):
+        if r not in seen:
             seen.add(r); out.append(r)
     return out
 
@@ -551,7 +663,7 @@ def _conditional_sources(base_dir: Path, staged_repos: set[str]) -> tuple[list[s
 _GEN_HEADER_CMAKE = (
     "# AUTO-GENERATED by spangap-inside. Do not edit; regenerated each build.\n"
     "# Effective cross-straddle REQUIRES for this component, derived from the\n"
-    "# straddle's requires: / optional_requires: intersected with the staged set.\n"
+    "# straddle's requires: / additional_installs: intersected with the staged set.\n"
 )
 _GEN_HEADER_KCONFIG = (
     "# AUTO-GENERATED by spangap-inside. Do not edit; regenerated each build.\n"
@@ -599,17 +711,9 @@ def write_presence_component(staging: Path, staged: list[Manifest]) -> None:
         + "idf_component_register()\n"
     )
     lines: list[str] = [_GEN_HEADER_KCONFIG]
-    # repo → short-form Kconfig symbol (the alias used in #if statements).
-    shortcut_aliases = {
-        "spangap-lcd": "SPANGAP_LCD",
-        "spangap-net": "SPANGAP_NET",
-        "spangap-web": "SPANGAP_WEB",
-        "ota":         "SPANGAP_OTA",
-        "wg":          "SPANGAP_WG",
-        "upnp":        "SPANGAP_UPNP",
-        "duckdns":     "SPANGAP_DUCKDNS",
-        "acme":        "SPANGAP_ACME",
-    }
+    # repo → short-form Kconfig alias (module constant — also read back by the
+    # integration-cue scan in effective_requires()).
+    shortcut_aliases = _SHORTCUT_ALIASES
     for m in staged:
         sym = _name_to_kconfig(m.repo)
         lines.append(f"config STRADDLE_{sym}\n    bool\n    default y\n")
@@ -676,7 +780,7 @@ def lint_cmakelists(proj: Manifest, deps: list[Manifest], all_straddles: dict[st
     """Fail loud if any staged CMakeLists hand-writes a known straddle name in REQUIRES.
 
     Forces consumers to flow cross-straddle deps through ${SPANGAP_REQUIRES}, so the
-    --no-X / optional_requires machinery actually narrows the dep graph.
+    --no-X / additional_installs machinery actually narrows the dep graph.
     """
     known_repos = {m.repo for m in all_straddles.values()}
     staging = proj.firmware_dir / "staging" / "components"
@@ -685,10 +789,9 @@ def lint_cmakelists(proj: Manifest, deps: list[Manifest], all_straddles: dict[st
         cml = staging / dep.repo / "CMakeLists.txt"
         if cml.is_symlink() or cml.is_file():
             targets.append(cml)
-    if proj.is_buildable:
-        main_cml = proj.firmware_dir / "main" / "CMakeLists.txt"
-        if main_cml.is_file():
-            targets.append(main_cml)
+    main_cml = proj.firmware_dir / "main" / "CMakeLists.txt"
+    if main_cml.is_file():
+        targets.append(main_cml)
 
     offenses: list[tuple[Path, str]] = []
     for cml in targets:
@@ -705,19 +808,34 @@ def lint_cmakelists(proj: Manifest, deps: list[Manifest], all_straddles: dict[st
             sys.stderr.write(
                 f"spangap: {cml}: hand-written straddle '{tok}' in REQUIRES.\n"
                 f"         Cross-straddle deps must flow through ${{SPANGAP_REQUIRES}} so the\n"
-                f"         optional_requires / --no-X machinery can narrow them. List '{tok}'\n"
-                f"         in the straddle.yaml's requires: or optional_requires: instead.\n"
+                f"         additional_installs / --no-X machinery can narrow them. List '{tok}'\n"
+                f"         in the straddle.yaml's requires: or additional_installs: instead.\n"
             )
         die(f"REQUIRES lint failed ({len(offenses)} hand-written straddle name(s))")
 
 
 def write_main_requires(proj: Manifest, staged_repos: set[str]) -> None:
     """For a buildable straddle, write staging/main_requires.cmake — the
-    effective cross-straddle REQUIRES list for the buildable's main component.
+    cross-straddle REQUIRES list for the buildable's main component.
+
+    main is special: it hosts the generated start/init dispatcher, which can
+    call a hook from ANY staged straddle — including a board pulled in with
+    --with that this buildable never names in requires:/additional_installs:
+    (the `reticulous/reticulous --with reticulous/hw-tdeck` shape). So main
+    REQUIRES the FULL staged set, not just this straddle's declared deps:
+    staging a straddle has to be enough to link and activate it. (Per-component
+    REQUIRES stay narrow — effective_requires() — so only main is the catch-all.)
+    core leads; the rest are sorted for deterministic output.
+
+    Generated for any straddle whose firmware half has a main/ — that main is
+    what consumes main_requires.cmake. A library straddle without a main/ (you
+    can still `spangap build` it; whether that yields a useful image is its own
+    matter) is skipped here, nothing to wire.
     """
-    if not proj.is_buildable:
+    if not (proj.firmware_dir / "main").is_dir():
         return
-    requires_list = effective_requires(proj, staged_repos)
+    core_repo = _repo(CORE_NAME)
+    requires_list = [core_repo] + sorted(r for r in staged_repos if r != core_repo)
     # The buildable's main component compiles from <firmware>/main/, so its
     # conditional/ code lives at <firmware>/main/conditional/<name>/.
     cond_srcs, cond_incs = _conditional_sources(proj.firmware_dir / "main", staged_repos)
@@ -805,11 +923,12 @@ def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
     extern "C" to match their spangap.h prototypes (an extern "C" function may
     freely call C++-linkage functions).
 
-    Always written for a buildable (empty dispatcher bodies if nothing declares
-    hooks) so app_main and both dispatchers are always defined — same contract
-    as write_main_requires / write_sdkconfig_overrides.
+    Written for any straddle whose firmware half has a main/ to compile the
+    generated app_main — empty dispatcher bodies if nothing declares hooks, so
+    app_main and both dispatchers are always defined. Same main/-gated contract
+    as write_main_requires.
     """
-    if not proj.is_buildable:
+    if not (proj.firmware_dir / "main").is_dir():
         return
 
     # The buildable inits LAST — it depends on everything, so its own start:/
@@ -935,12 +1054,16 @@ def write_sdkconfig_fragments(proj: Manifest, deps: list[Manifest]) -> None:
     footgun, so they're warned about here. The buildable overriding a dep is
     intended and stays quiet.
     """
-    sources = init_order(deps) + [proj]   # buildable last → wins among fragments
+    sources = init_order(deps) + [proj]   # project last → wins among fragments
     blocks: list[str] = []
     owner: dict[str, str] = {}            # CONFIG_ key -> straddle that last set it
 
     for m in sources:
-        lines = m.kconfig
+        # Hand-written kconfig: lines plus the desugared identity values
+        # (stub/display_name/banner/default_hostname → CONFIG_SPANGAP_FW_*).
+        # Both ride the same dependency-order precedence, so the built straddle
+        # wins its own identity and spangap-core, deepest, loses.
+        lines = m.kconfig + m.identity_kconfig
         if not lines:
             continue
         clean: list[str] = []
@@ -1207,11 +1330,6 @@ def cmd_menuconfig(args: argparse.Namespace) -> int:
     sdkconfig.defaults via idf.py save-defconfig (the 'save as hw-whatever'
     step)."""
     proj = find_project()
-    if not proj.is_buildable:
-        die(
-            f"{proj.name} is not a buildable straddle (no `buildable:` block in straddle.yaml).\n"
-            "       `spangap menuconfig` configures a buildable straddle."
-        )
     if not proj.has_firmware:
         die(f"{proj.name}: firmware dir {proj.firmware_dir} has no CMakeLists.txt")
 
@@ -1235,8 +1353,8 @@ def cmd_build(args: argparse.Namespace) -> int:
     all_straddles = scan_workspace_straddles()
 
     # Optional leading positional target: `spangap build <straddle> [idf args…]`.
-    # If the first non-flag token names a known straddle (by <org>/<repo>, repo
-    # dir, or buildable product name), build THAT image regardless of cwd —
+    # If the first non-flag token names a known straddle (by <org>/<repo> or repo
+    # dir), build THAT straddle regardless of cwd —
     # otherwise leave every token for idf.py (passthrough for `menuconfig`,
     # build targets, -D…). The target frees you from cd-ing into the straddle,
     # which matters under --straddles (straddles live at /straddles/<repo>, not
@@ -1249,11 +1367,6 @@ def cmd_build(args: argparse.Namespace) -> int:
             idf_args.pop(0)
 
     proj = target if target is not None else find_project()
-    if not proj.is_buildable:
-        die(
-            f"{proj.name} is not a buildable straddle (no `buildable:` block in straddle.yaml).\n"
-            "       `spangap build` only builds buildable straddles. Build a consumer of this one."
-        )
     if not proj.has_firmware:
         die(f"{proj.name}: firmware dir {proj.firmware_dir} has no CMakeLists.txt")
 
@@ -1319,8 +1432,6 @@ def cmd_flash(args: argparse.Namespace) -> int:
     just after it starts flashing).
     """
     proj = find_project()
-    if not proj.is_buildable:
-        die(f"{proj.name} is not a buildable straddle (no `buildable:` block) — nothing to flash.")
     flashme = WORKSPACE / ".spangap-flashme"
     flashme.touch()
     print(f"spangap: signaled {flashme} — waiting for a monitor to pick it up...", file=sys.stderr)

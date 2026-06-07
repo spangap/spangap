@@ -231,7 +231,7 @@ Docker Desktop a symlink resolves through to its host target, so the browser
 spangap-core), `version` (`X.Y.Z`); `requires` (hard — missing = error;
 dropping one with `--without` cascades the drop to whatever hard-requires it, and is
 refused only when it would take out spangap-core or a buildable hard-require),
-`optional_requires` (soft, **default-on**, pruned silently when absent —
+`additional_installs` (soft, **default-on**, pruned silently when absent —
 call sites **must** gate on `CONFIG_*`); `firmware:` / `browser:` (paths to the two
 halves, e.g. `esp-idf` / `browser`); **`init:`** (bring-up function name — see the
 auto-init note below); `buildable:` (an **object**, not a bare flag: presence marks a
@@ -262,7 +262,7 @@ enumerate `/straddles`.
 
 ## What `spangap build` does under the hood
 
-1. resolve `spangap-core (implicit) ∪ requires ∪ optional_requires ∪ --with`, transitively,
+1. resolve `spangap-core (implicit) ∪ requires ∪ additional_installs ∪ --with`, transitively,
    minus `--without`/`--no-X` and the reverse-dependency cascade they trigger.
 2. stage each kept dep into `staging/components/<repo>/`: symlinks to source + a generated
    `spangap_requires.cmake` (`set(SPANGAP_REQUIRES …)`), plus a synthetic `_spangap_present`
@@ -324,7 +324,7 @@ image build, never to the currently-running container.
    above). If the straddle has bring-up code, declare it via **`init:`** (C++-linkage
    function, no `extern "C"`) so the generated `spangapInitStraddles()` calls it in
    dependency order — don't expect the app to hand-call it. Check with `spangap validate`.
-2. **Deps** — hard → `requires`; integrate-when-present → `optional_requires`, and
+2. **Deps** — hard → `requires`; integrate-when-present → `additional_installs`, and
    **gate every such call site** on `CONFIG_STRADDLE_<UPPER_REPO>` (or a
    `CONFIG_SPANGAP_*` alias) so a pruned dep still links. Ungated optional dep = the
    classic break.

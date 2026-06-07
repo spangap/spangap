@@ -26,6 +26,22 @@
       "description": "Semver-ish version string. Pin-only for now; no version-range solver.",
       "type": "string"
     },
+    "stub": {
+      "description": "Immutable firmware identity: the short lowercase stub name (e.g. 'reticulous'). Defines WHAT is running, not what it's running on — not a hostname, not user-editable. Reserved as the future state-directory prefix (so multiple firmwares' state can coexist on one SD card). Desugars to CONFIG_SPANGAP_FW_STUB and is exposed read-only to the browser as fw.stub. Layers by dependency order like any kconfig value — the straddle highest up the dependency tree (the one being built) wins; spangap-core, deepest, loses.",
+      "type": "string"
+    },
+    "display_name": {
+      "description": "Immutable firmware identity: the user-facing proper name shown in the leftmost menu (e.g. 'Reticulous'). Desugars to CONFIG_SPANGAP_FW_NAME, exposed read-only as fw.name. Dependency-order layered; the built straddle wins.",
+      "type": "string"
+    },
+    "banner": {
+      "description": "Immutable firmware identity: a one-line description / slogan / motto (e.g. 'Reticulum mesh networking for the masses!'). Desugars to CONFIG_SPANGAP_FW_BANNER, exposed read-only as fw.banner. Dependency-order layered; the built straddle wins.",
+      "type": "string"
+    },
+    "default_hostname": {
+      "description": "Compile-time DEFAULT for the MUTABLE s.net.hostname (e.g. 'reticulous'). Unlike stub/display_name/banner this seeds a user-settable value (what it's running ON), not immutable identity. Desugars to CONFIG_SPANGAP_FW_HOSTNAME, which seeds s.net.hostname on first boot. Dependency-order layered; the built straddle wins.",
+      "type": "string"
+    },
     "firmware": {
       "description": "Firmware-half path relative to manifest dir. Omit for default 'idf'. Use '.' when the manifest dir IS the firmware project root (buildable straddles).",
       "type": "string",
@@ -52,8 +68,8 @@
       },
       "default": []
     },
-    "optional_requires": {
-      "description": "Other straddles this one integrates with WHEN PRESENT — pruned silently from the build if absent (because they weren't cloned, because the buildable doesn't list them, or because --without/--no-X dropped them). Source code must gate corresponding call sites on the auto-generated CONFIG_STRADDLE_<UPPER_NAME> (or the CONFIG_SPANGAP_LCD/CONFIG_SPANGAP_WEB shortcuts) so absence compiles away cleanly.",
+    "additional_installs": {
+      "description": "Other straddles to ALSO stage whenever this one is in the build — default-on extras pulled in transitively, droppable with --without/--no-X. Unlike requires:, absence is NOT an error: a listed straddle that isn't on disk (or was dropped) is pruned silently. This is the 'pull in the kitchen sink' knob, kept deliberately rare — an aggregator/app straddle uses it to assemble a device's feature set; most straddles list nothing here. Source code that integrates with a thus-pulled straddle must still gate its call sites on the auto-generated CONFIG_STRADDLE_<UPPER_NAME> (or the CONFIG_SPANGAP_LCD/CONFIG_SPANGAP_WEB shortcuts) so a --without drop compiles away cleanly.",
       "type": "array",
       "items": {
         "type": "string",
@@ -75,7 +91,7 @@
             "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
           },
           "when": {
-            "description": "Optional gate: emit this hook's call only when the named straddle ('<org>/<repo>') is in the staged build set. Resolved at generation time against the staged set — when the straddle is pruned the call is simply NOT written (no #if), so the hook symbol is never referenced and -ffunction-sections/--gc-sections drops it along with its references into the now-absent dep. Use the same '<org>/<repo>' vocabulary as optional_requires (e.g. 'spangap/spangap-lcd'). Omit for an unconditional hook.",
+            "description": "Optional gate: emit this hook's call only when the named straddle ('<org>/<repo>') is in the staged build set. Resolved at generation time against the staged set — when the straddle is pruned the call is simply NOT written (no #if), so the hook symbol is never referenced and -ffunction-sections/--gc-sections drops it along with its references into the now-absent dep. Use the same '<org>/<repo>' vocabulary as additional_installs (e.g. 'spangap/spangap-lcd'). Omit for an unconditional hook.",
             "type": "string",
             "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+$"
           }
@@ -84,7 +100,7 @@
       "default": []
     },
     "init": {
-      "description": "INIT-phase hooks this straddle wants the buildable to run automatically, AFTER spangapInit() (the platform foundations) — the post-infrastructure band, contrast start: above. spangap-inside collects these across the staged set and generates staging/spangap_init_dispatch.gen.cpp — a spangapInitStraddles() that calls them in two bands: first spangap's own platform components (core, net, web, lcd) in that fixed order, then every other straddle in dependency-topo order (a straddle inits after the straddles it requires:). There is no per-hook order knob — a straddle that must come up after another declares it in requires:/optional_requires: and the topo walk handles it; everything in the straddle band can already assume the platform band is up. Within one straddle, hooks fire in listed order. The buildable calls spangapInitStraddles() once; from then on, staging a straddle that declares init: is enough to have it initialize — no consumer main.cpp edit. Each entry's `call` is a plain global `void <name>()` defined in this straddle's firmware half (the dispatcher emits its own C++-linkage forward declaration, so no header wiring and no `extern \"C\"` is needed). By convention an init hook is named xInit.",
+      "description": "INIT-phase hooks this straddle wants the buildable to run automatically, AFTER spangapInit() (the platform foundations) — the post-infrastructure band, contrast start: above. spangap-inside collects these across the staged set and generates staging/spangap_init_dispatch.gen.cpp — a spangapInitStraddles() that calls them in two bands: first spangap's own platform components (core, net, web, lcd) in that fixed order, then every other straddle in dependency-topo order (a straddle inits after the straddles it requires:). There is no per-hook order knob — a straddle that must come up after another declares it in requires:/additional_installs: and the topo walk handles it; everything in the straddle band can already assume the platform band is up. Within one straddle, hooks fire in listed order. The buildable calls spangapInitStraddles() once; from then on, staging a straddle that declares init: is enough to have it initialize — no consumer main.cpp edit. Each entry's `call` is a plain global `void <name>()` defined in this straddle's firmware half (the dispatcher emits its own C++-linkage forward declaration, so no header wiring and no `extern \"C\"` is needed). By convention an init hook is named xInit.",
       "type": "array",
       "items": {
         "type": "object",
@@ -97,7 +113,7 @@
             "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
           },
           "when": {
-            "description": "Optional gate: emit this hook's call only when the named straddle ('<org>/<repo>') is in the staged build set. Resolved at generation time against the staged set — when the straddle is pruned the call is simply NOT written (no #if), so the hook symbol is never referenced and -ffunction-sections/--gc-sections drops it along with its references into the now-absent dep. Use the same '<org>/<repo>' vocabulary as optional_requires (e.g. 'spangap/spangap-lcd'). Omit for an unconditional hook. This is the finer-grained twin of how a whole straddle's hooks already appear only when it is staged — it lets one straddle's hook ride on ANOTHER straddle's presence.",
+            "description": "Optional gate: emit this hook's call only when the named straddle ('<org>/<repo>') is in the staged build set. Resolved at generation time against the staged set — when the straddle is pruned the call is simply NOT written (no #if), so the hook symbol is never referenced and -ffunction-sections/--gc-sections drops it along with its references into the now-absent dep. Use the same '<org>/<repo>' vocabulary as additional_installs (e.g. 'spangap/spangap-lcd'). Omit for an unconditional hook. This is the finer-grained twin of how a whole straddle's hooks already appear only when it is staged — it lets one straddle's hook ride on ANOTHER straddle's presence.",
             "type": "string",
             "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+$"
           }
@@ -113,22 +129,6 @@
         "pattern": "^(CONFIG_[A-Z0-9_]+=.+|# CONFIG_[A-Z0-9_]+ is not set)$"
       },
       "default": []
-    },
-    "buildable": {
-      "description": "Top-level config for straddles that build a flashable device image. Its presence is the flag we key on to decide what's buildable — library / feature straddles omit this block entirely.",
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "name": { "type": "string" },
-        "partition_layout": {
-          "description": "Either a path to partitions.csv relative to firmware dir, or a named platform-provided layout.",
-          "type": "string"
-        },
-        "ota_pubkey": {
-          "description": "Path to OTA public-key PEM, relative to firmware dir.",
-          "type": "string"
-        }
-      }
     }
   }
 }

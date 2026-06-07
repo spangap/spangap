@@ -23,7 +23,7 @@ carry the rest of the deps:
   cascades the drop to every straddle that hard-requires it (transitively);
   the exclude is refused only when it would remove spangap-core or a
   straddle the buildable itself hard-requires.
-- **`optional_requires:`** — soft, **default-on**. Pruned silently when
+- **`additional_installs:`** — soft, **default-on**. Pruned silently when
   the dep isn't in the staged set (not cloned, not in the buildable's
   requires, or dropped by `--without` / `--no-X`).
 
@@ -72,7 +72,7 @@ Pass `--no-web` or `--no-lcd` at build time to exclude an activator.
 ### How staging and gating fit together
 
 `spangap-inside` resolves the implicit `spangap-core` ∪ the buildable's
-`requires:` ∪ `optional_requires:` ∪ (any straddles named via `--with`)
+`requires:` ∪ `additional_installs:` ∪ (any straddles named via `--with`)
 transitively, subtracting any `--without` / `--no-X` entries and the
 straddles that hard-require them (the cascade), then stages each kept dep into
 `staging/components/<repo>/` as a real dir containing per-entry symlinks to
@@ -80,7 +80,7 @@ the source dir's contents plus two generated files:
 
 - **`spangap_requires.cmake`** — `set(SPANGAP_REQUIRES …)` with this
   dep's effective cross-straddle REQUIRES (hard requires plus
-  optional_requires intersected with staged). Each consumer
+  additional_installs intersected with staged). Each consumer
   CMakeLists.txt does:
 
   ```cmake
@@ -225,7 +225,7 @@ Common verbs:
     sibling. Fully-qualified `<org>/<repo>` (`spangap/spangap-sshd`) is
     auto-cloned from github by the host dispatcher if not yet present.
     The included straddle is treated as a soft dep root: its own
-    `requires:` / `optional_requires:` are followed transitively. Under
+    `requires:` / `additional_installs:` are followed transitively. Under
     `--straddles` nothing is cloned (see "--straddles is local-only" below) —
     a slash-form `--with` not in the checkout is an error, not a fetch.
   - `--flash-size <MB>` overrides `CONFIG_ESPTOOLPY_FLASHSIZE_*MB` for

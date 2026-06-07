@@ -219,10 +219,9 @@ require_straddle() {
         return 0
     fi
     # No straddle at/above cwd. From the workspace root, default to the
-    # project that `spangap init <project>` recorded in .spangap-project,
-    # provided it's buildable (has a `buildable:` block in straddle.yaml).
-    # If it isn't buildable, or the user wants a different straddle,
-    # they cd into it and retry — we don't guess.
+    # project that `spangap init <project>` recorded in .spangap-project.
+    # Any straddle can be a build target now (no buildable gate); for a
+    # different one, cd into it and retry — we don't guess.
     if [ "$PWD" = "$workspace" ]; then
         local proj_file="$workspace/.spangap-project"
         if [ -f "$proj_file" ]; then
@@ -230,8 +229,6 @@ require_straddle() {
             init_project=$(cat "$proj_file")
             init_dir=$(project_host_dir "$init_project") \
                 || die ".spangap-project names '$init_project' but no straddle.yaml at $workspace/$init_project or <straddles>/$init_project — cd into the straddle you want to $cmd"
-            grep -qE '^buildable:' "$init_dir/straddle.yaml" \
-                || die "$init_project is not buildable (no \`buildable:\` block) — cd into a buildable straddle and retry"
             printf '%s\n' "$init_dir"
             return 0
         fi

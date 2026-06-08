@@ -1,8 +1,6 @@
 # Inside the spangap build-env container
 
-You are running as **`spangap` inside the spangap build-env container** (you most
-likely got here via `spangap docker claude` on the host). This file tells you what
-that means: what's mounted, what `spangap` does *from in here*, what you can and
+This is a spangap workspace directory. It's where spangap projects get assembled and built. You may be seeing this from the host system or from inside the spangap build system docker container. If you are inside the container, you are running as user `spangap`/ This file tells you what that means: what's mounted, what `spangap` does *from in here*, what you can and
 can't do without the host, and how to help with the real job — **writing and
 maintaining straddles**.
 
@@ -12,19 +10,14 @@ the container-side map.
 
 ## Where you are
 
-You're `spangap`, cwd **`<workspace>`** (the host workspace dir, bind-mounted at
-`/home/spangap/<basename>` — nested under the persistent home mount), `HOME=/home/spangap`.
-The container is started
-with `sleep infinity` and you reach it by `docker exec`; it always carries at least the
+You're `spangap`, cwd **`<workspace>`** and the container always carries at least the
 host bind mount **`/home/spangap`** (persistent home, with the workspace nested under it
 at `/home/spangap/<basename>`) — plus optionally **`/straddles`** (only when this workspace
 was init'd with `--straddles`; see below). On macOS Docker Desktop these mounts are `fakeowner`
 type, which drives a couple of gotchas at the end of this file.
 
-Don't assume the rest of your situation — **discover it.** Bare `spangap` (same as
-`spangap show`) reports the
-resolved project + its deps + the toolchain/environment; `ls <workspace>` and `ls /straddles
-2>/dev/null` show what's mounted; the workspace dotfiles tell you the mode:
+Don't assume the rest of your situation — **discover it.** Running bare `spangap` reports the
+resolved project + its deps + the toolchain/environment. Running 'spangap' and looking at the output should ALWAYS be the first order of business to get the lay of the land.
 
 - `<workspace>/spangap.workspace.yaml` — the workspace marker (always present).
 - `<workspace>/.spangap-straddles` — **present ⟺ `--straddles` mode** (its contents are
@@ -98,6 +91,7 @@ container these verbs work directly, with the IDF env already set up:
 | `spangap cli [-h host] [<cmd>]` | talk to a running device over the network (ssh, else TCP CLI) |
 | `spangap flash` | **signal only** — touches `.spangap-flashme` (workspace root) and waits ≤5s for a host monitor to consume it (see below) |
 | `spangap reset` | **signal only** — touches `.spangap-resetme` (workspace root) and waits ≤5s for a host monitor to consume it; the monitor restarts with a device reset (clean reboot + boot-log capture), no reflash |
+| `spangap log [-f]` | print the device serial log (`.spangap-log`), reading **past the stale bind-mount cache** (a plain `cat`/`tail` freezes — see below); `-f` follows like `tail -f` and survives flash/reset truncations |
 
 **`spangap flash` / `spangap reset` / `spangap cli` from in here don't touch hardware
 directly** — the
@@ -154,9 +148,18 @@ it isn't up (or isn't in the project dir) — ask the user to (re)start it there
 
 **2. See what the board is doing.** The monitor writes a live, ANSI-stripped copy of
 the serial output to **`.spangap-log` at the workspace root** — it's on the bind mount
-(`<workspace>/.spangap-log` in here), so you can `tail -f` / read it from in here. **This
-is your only window into the device — use it.**
-In particular it's where you check:
+(`<workspace>/.spangap-log` in here). **This is your only window into the device — use it.**
+
+⚠️ **Read it with `spangap log` (or `spangap log -f`), NOT `cat`/`tail -f`.** The host
+holds the file open and appends to it; the bind mount serves the container a **stale
+cached snapshot** of an open-and-appended file, so `cat`/`tail`/`stat`/`wc` freeze at an
+old size and silently miss the newest lines (even `stat` reports the stale size — this is
+not a flush delay, it does not catch up). `spangap log` reads with `O_DIRECT` to bypass
+that cache and always yields the true current contents; `-f` follows it and survives the
+truncation on flash/reset. (Dentry ops like `.spangap-flashme` propagate fine; only
+growing-content does not — so only the log is affected.)
+
+In particular `spangap log` is where you check:
 
 - **whether networking came up and the device's IP address** — watch for the net
   task's "upstream up" / DHCP / IP lines (you'll need that IP for step 3),

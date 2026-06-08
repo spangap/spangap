@@ -121,6 +121,33 @@
       },
       "default": []
     },
+    "browser_register": {
+      "description": "BROWSER-side registration hooks — the browser-half parallel to init:. spangap-inside collects these across the staged set (same init_order as the firmware spangapInitStraddles()) and generates, into a buildable's browser half, src/boot/straddles.gen.ts: a default-export registerStraddles() that imports each hook's `call` symbol from this straddle's browser package and invokes it, in order. It also injects a `file:../../<repo>/browser` dependency into the buildable's browser package.json so the import resolves under node_modules. The buildable loads the generated function ONCE from its hand-written boot/modules.ts (import registerStraddles from './straddles.gen'; registerStraddles()) — the browser analog of calling spangapInitStraddles() once. From then on, staging a straddle that declares browser_register: is enough to surface its UI (menu pane, etc.); no consumer edit. Only emitted into buildables that have a browser half, and only for staged straddles that themselves have a browser half. Same `when:` gating as init:. By convention the symbol is named register<Prefix> (e.g. registerWg) and is exported from <pkg>/modules/<repo>.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["call"],
+        "properties": {
+          "call": {
+            "description": "Exported registration function to import and call, e.g. 'registerWg'. A named export of this straddle's browser package, conventionally from the modules/<repo> entry point (see `module`). Its job is to register the straddle's UI (menu panes via useMenuStore().register, etc.). The casing is not derivable from the repo name (e.g. duckdns exports registerDuckDns), which is why it is declared explicitly.",
+            "type": "string",
+            "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$"
+          },
+          "module": {
+            "description": "Import subpath within this straddle's browser package (the part after '<pkgname>/'), resolved through the package's exports map. Defaults to 'modules/<repo>' (e.g. wg -> 'modules/wg'), which is the convention every current browser half follows. Override only for a non-standard module layout.",
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._/-]+$"
+          },
+          "when": {
+            "description": "Optional gate: emit this hook's import+call only when the named straddle ('<org>/<repo>') is in the staged build set. Resolved at generation time — when the gating straddle is pruned the registration is simply not written, so its panel never bundles. Same vocabulary and semantics as init:'s when:.",
+            "type": "string",
+            "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+$"
+          }
+        }
+      },
+      "default": []
+    },
     "kconfig": {
       "description": "Sdkconfig default lines this straddle contributes to the build — the road by which a NON-buildable straddle (typically a board, e.g. hw-tdeck) supplies Kconfig VALUES that another non-buildable straddle's component Kconfig DEFINES (LoRa/SD/LCD pins, etc.). spangap-inside collects every staged straddle's lines into staging/sdkconfig.spangap-fragments, which bootstrap.cmake layers into SDKCONFIG_DEFAULTS between the platform defaults and the buildable's own sdkconfig.defaults. Precedence is the init order: platform band first, then the straddle band in dependency-topo order, then the buildable itself last (the building straddle wins among fragments); the buildable's sdkconfig.defaults and CLI overrides win over all of it. Each item is emitted verbatim as an sdkconfig line, so the RHS (=y, ints, hex, \"quoted strings\") is preserved exactly. The peripheral straddle still owns the option's schema/help/range in its component Kconfig — this only sets the value. Two different straddles setting the same symbol is warned about (silent last-wins otherwise).",
       "type": "array",

@@ -36,7 +36,8 @@
 #                    (runs reallyclean inside first so the next build
 #                    doesn't inherit a stale CMakeCache that baked in
 #                    pre-reset paths).
-#   show             list the project straddle + its deps in init order.
+#   show             last build invocation + the resolved straddle + its
+#                    deps in init order.
 #   ensure-container build the image (if missing) and start a fresh
 #                    container with all the bind mounts. Called by
 #                    `spangap init` so first-run latency lands at init
@@ -62,7 +63,6 @@ set -euo pipefail
 # all docker invocations below inherit it.
 export DOCKER_CLI_HINTS=false
 
-IMAGE="${SPANGAP_IMAGE:-spangap-build-env:dev}"
 workspace="${SPANGAP_WORKSPACE:?spangap-outside: SPANGAP_WORKSPACE not set (invoke via the root \`spangap\` script)}"
 
 # In-container path of the workspace bind mount. The workspace is mounted UNDER
@@ -112,6 +112,16 @@ VENV_REQUIREMENTS="esptool==4.8.1 esp-idf-monitor==1.5.0"
 # before that section — needs it to wire up the addr2line decode shim.
 ws_hash=$(printf '%s' "$workspace" | sha256sum | cut -c1-7)
 container="spangap-$ws_hash"
+
+# Per-workspace image tag. The build-env image carries no workspace-specific
+# state, so two workspaces off the same build-system/ produce byte-identical
+# images — but each workspace's container holds a reference to the image it was
+# created from. A shared tag therefore means a stale-hash rebuild here, or a
+# `reset-workspace`, can't `docker rmi` the tag while a *different* workspace's
+# container still references it ("conflict: ... container <id> is using its
+# referenced image"). Scoping the tag to $workspace via ws_hash gives every
+# workspace its own image to build, stamp, and remove independently.
+IMAGE="spangap-build-env:$ws_hash"
 
 # Host-side toolchain shims (currently just xtensa-esp32-elf-addr2line).
 # Prepended to PATH when running esp-idf-monitor so panic backtraces
@@ -182,28 +192,81 @@ find_straddle() {
     done
 }
 
-# project_host_dir <name>: host dir of straddle <name>, or return 1. A
-# straddle is either git-cloned at $workspace/<name> or lives in the flat
-# --straddles checkout at <straddles>/<name> (the latter is what gets bind-
-# mounted to /straddles inside the container). Checks the clone first.
+# project_host_dir <name>: host dir of straddle <name>, or return 1. <name>
+# may be an <org>/<repo> or a bare repo — the flat layout names the dir by the
+# repo basename either way, so we strip any org/ prefix. A straddle is either
+# git-cloned at $workspace/<repo> or lives in the flat --straddles checkout at
+# <straddles>/<repo> (the latter is what gets bind-mounted to /straddles inside
+# the container). Checks the clone first.
 project_host_dir() {
-    local name=$1 sd
-    [ -f "$workspace/$name/straddle.yaml" ] && { printf '%s\n' "$workspace/$name"; return 0; }
+    local name=$1 repo sd
+    repo=${name##*/}
+    [ -f "$workspace/$repo/straddle.yaml" ] && { printf '%s\n' "$workspace/$repo"; return 0; }
     sd=$(read_straddles)
-    [ -n "$sd" ] && [ -f "$sd/$name/straddle.yaml" ] && { printf '%s\n' "$sd/$name"; return 0; }
+    [ -n "$sd" ] && [ -f "$sd/$repo/straddle.yaml" ] && { printf '%s\n' "$sd/$repo"; return 0; }
     return 1
 }
 
-# default_straddle: if the user is at the workspace root and `.spangap-project`
-# (written by `spangap init <project>`) names a straddle, echo its host dir.
+# The last *explicit* build invocation, remembered at the workspace root so a
+# bare `spangap build` repeats it. One line, target first:
+#   <org/repo> [--with <org/repo>]... [--without <org/repo>]... [--flash-size N]
+# Written by the container's cmd_build (it alone resolves bare tokens to
+# straddles); the host reads it here to clone the target/includes and to pick
+# the workspace-root default for build/flash/monitor/show.
+BUILD_FILE="$workspace/.spangap-build"
+
+# remembered_build_target: echo the target token (first word), or return 1.
+remembered_build_target() {
+    [ -f "$BUILD_FILE" ] || return 1
+    # Tokens are simple (org/repo names, flags) — word-splitting is safe.
+    # shellcheck disable=SC2046
+    set -- $(head -1 "$BUILD_FILE" 2>/dev/null)
+    [ $# -ge 1 ] || return 1
+    printf '%s\n' "$1"
+}
+
+# remembered_build_includes: echo each --with <org/repo> value, one per line.
+remembered_build_includes() {
+    [ -f "$BUILD_FILE" ] || return 0
+    # shellcheck disable=SC2046
+    set -- $(head -1 "$BUILD_FILE" 2>/dev/null)
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -w|--with) [ $# -ge 2 ] && { printf '%s\n' "$2"; shift; } ;;
+            -w=*|--with=*) printf '%s\n' "${1#*=}" ;;
+        esac
+        shift
+    done
+}
+
+# first_build_positional ARGS...: echo the first non-flag token (the TARGET
+# candidate), skipping build flags and the values of value-taking ones. Empty
+# (return 1) if there is no positional. Used host-side only to decide what to
+# clone / where to set the container workdir; the container does authoritative
+# resolution.
+first_build_positional() {
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -w|--with|-x|--without|--flash-size)
+                shift; [ $# -gt 0 ] && shift ;;
+            --) shift; [ $# -gt 0 ] && { printf '%s\n' "$1"; return 0; }; return 1 ;;
+            -*) shift ;;
+            *) printf '%s\n' "$1"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# default_straddle: if the user is at the workspace root and the last build's
+# target (.spangap-build) resolves to a present straddle, echo its host dir.
 # Returns 1 silently otherwise. No buildable check — caller decides whether
 # that matters.
 default_straddle() {
     [ -n "${workspace:-}" ] || return 1
     [ "$PWD" = "$workspace" ] || return 1
-    local proj_file="$workspace/.spangap-project"
-    [ -f "$proj_file" ] || return 1
-    project_host_dir "$(cat "$proj_file")"
+    local t
+    t=$(remembered_build_target) || return 1
+    project_host_dir "$t"
 }
 
 # require_straddle: cmd-name → straddle-dir on stdout, or die.
@@ -218,22 +281,20 @@ require_straddle() {
         printf '%s\n' "$s"
         return 0
     fi
-    # No straddle at/above cwd. From the workspace root, default to the
-    # project that `spangap init <project>` recorded in .spangap-project.
-    # Any straddle can be a build target now (no buildable gate); for a
-    # different one, cd into it and retry — we don't guess.
+    # No straddle at/above cwd. From the workspace root, default to the target
+    # of the last build (.spangap-build). Any straddle can be a build target
+    # (no buildable gate); for a different one, cd into it or name it on a
+    # `spangap build <org/repo>` — we don't guess.
     if [ "$PWD" = "$workspace" ]; then
-        local proj_file="$workspace/.spangap-project"
-        if [ -f "$proj_file" ]; then
-            local init_project init_dir
-            init_project=$(cat "$proj_file")
-            init_dir=$(project_host_dir "$init_project") \
-                || die ".spangap-project names '$init_project' but no straddle.yaml at $workspace/$init_project or <straddles>/$init_project — cd into the straddle you want to $cmd"
-            printf '%s\n' "$init_dir"
+        local t dir
+        if t=$(remembered_build_target); then
+            dir=$(project_host_dir "$t") \
+                || die ".spangap-build names target '$t' but no straddle.yaml for it under $workspace or <straddles> — \`spangap build $t\` to (re)acquire it"
+            printf '%s\n' "$dir"
             return 0
         fi
     fi
-    die "not inside a straddle (no straddle.yaml at/above $PWD) — cd into the straddle you want to $cmd"
+    die "not inside a straddle (no straddle.yaml at/above $PWD) and no remembered build — cd into the straddle you want to $cmd, or \`spangap build <org/repo>\`"
 }
 
 # Pick the dir that holds the IDF project's CMakeLists.txt. Same rule as the
@@ -860,8 +921,8 @@ monitor)
     #
     # Resolution order:
     #   1. straddle.yaml at/above cwd (must be under workspace)
-    #   2. workspace-root invocation falls back to .spangap-project
-    #      (same default flash/build use via require_straddle)
+    #   2. workspace-root invocation falls back to the last build's target
+    #      (.spangap-build; same default flash/build use via require_straddle)
     #   3. neither → "no straddle context" warning, monitor still attaches
     proj=""
     if cand=$(find_straddle 2>/dev/null) \
@@ -1403,27 +1464,79 @@ case ${1:-} in
 get-deps)
     command -v git >/dev/null 2>&1 || die "git required on host PATH"
     proj=$(require_straddle get-deps)
-    # Re-derive container_cwd from the resolved straddle so get-deps /
-    # build also work from the workspace root with a single child
-    # straddle (the `init <project> && build` flow).
+    # Re-derive container_cwd from the resolved straddle so get-deps also
+    # works from the workspace root, resolving the cwd straddle or the last
+    # build's target (.spangap-build) via require_straddle.
     container_cwd=$(host_to_container "$proj")
     fetch_missing_deps "$container_cwd"
     log "get-deps done — all requires: present"
     exit 0
     ;;
 build)
-    command -v git >/dev/null 2>&1 || die "git required on host PATH (for auto get-deps)"
-    proj=$(require_straddle build)
-    container_cwd=$(host_to_container "$proj")
-    # Pre-clone any `--with <org>/<repo>` (slash-form) so the included
-    # straddle is on disk before the container starts listing missing
-    # deps. The list-deps loop below then picks up any transitive
-    # requires: of the included straddle just like any other workspace
-    # sibling. Bare-form `--with X` is left for spangap-inside to
-    # validate against the workspace.
+    command -v git >/dev/null 2>&1 || die "git required on host PATH (for auto-clone + get-deps)"
+    shift   # drop 'build'; "$@" is now the build args
+
+    # The cwd straddle (a straddle.yaml at/above cwd, under the workspace), if
+    # any — it outranks the remembered default, so `cd <straddle> && build`
+    # builds THAT one, not the last target.
+    cwd_straddle=""
+    if c=$(find_straddle 2>/dev/null) \
+        && case $c in "$workspace"|"$workspace"/*) true ;; *) false ;; esac; then
+        cwd_straddle=$c
+    fi
+
+    # The host-side build target token. Precedence: an explicit leading
+    # positional, else the cwd straddle, else the remembered target
+    # (.spangap-build) so a bare `build` repeats the last one. The token may be
+    # an idf passthrough (e.g. `menuconfig`) — that's fine; only slash-form
+    # <org/repo> tokens get cloned, and workdir resolution degrades gracefully
+    # when the token names no host straddle. spangap-inside resolves the build
+    # authoritatively; this only steers what we clone and the build's workdir.
+    explicit_tok=$(first_build_positional "$@") || explicit_tok=""
+    target_tok=$explicit_tok
+    use_remembered=
+    if [ -z "$target_tok" ] && [ -z "$cwd_straddle" ]; then
+        target_tok=$(remembered_build_target) || target_tok=""
+        use_remembered=1
+    fi
+
+    # Acquire the project (clone mode): an <org>/<repo> target not yet present.
+    # In --straddles mode clone_spec refuses and points at the checkout.
+    case $target_tok in
+        */*) project_host_dir "$target_tok" >/dev/null 2>&1 || clone_spec "$target_tok" ;;
+    esac
+
+    # Pre-clone any `--with <org>/<repo>` (slash-form) so the included straddle
+    # is on disk before the container lists missing deps. The list-deps loop
+    # then picks up its transitive requires: like any other sibling. Bare-form
+    # `--with X` is left for spangap-inside to validate. On a bare replay the
+    # --with set lives in .spangap-build, not argv, so pull it from there too.
     prefetch_explicit_includes "$@"
+    if [ -n "$use_remembered" ]; then
+        for inc in $(remembered_build_includes); do
+            case $inc in
+                */*) project_host_dir "$inc" >/dev/null 2>&1 || clone_spec "$inc" ;;
+            esac
+        done
+    fi
+
+    # container workdir: the target's dir if host-resolvable, else the cwd
+    # straddle, else the workspace root (the container resolves the target /
+    # remembered default itself). list-deps runs here too, so it inspects the
+    # same straddle the build will. Also names the "building X" line.
+    proj=""
+    if proj=$(project_host_dir "$target_tok" 2>/dev/null); then
+        :
+    elif [ -n "$cwd_straddle" ]; then
+        proj=$cwd_straddle
+    fi
+    if [ -n "$proj" ]; then
+        container_cwd=$(host_to_container "$proj")
+    else
+        container_cwd="$container_ws"
+    fi
+
     fetch_missing_deps "$container_cwd"
-    shift
     # Quiet-by-default + the -v|--verbose flag now live in spangap-inside, so
     # the in-container build behaves the same however it's reached. We just
     # forward argv unchanged (including -v) and hand the build the host's
@@ -1432,12 +1545,18 @@ build)
     # first build arg is -v/--verbose) still gates the host-side cloning +
     # container-setup phases.
     verbose=""
-    case ${1:-} in
-        -v|--verbose) verbose=1 ;;
-    esac
+    for a in "$@"; do
+        case $a in -v|--verbose) verbose=1 ;; esac
+    done
     sticky_port=""
     [ -f "$PORT_FILE" ] && sticky_port=$(cat "$PORT_FILE")
-    proj_name=$(basename "$proj")
+    # Name what's building: the resolved straddle dir if we have one, else the
+    # target token (the container makes the final call).
+    if [ -n "$proj" ]; then
+        proj_name=$(basename "$proj")
+    else
+        proj_name=${target_tok:-the remembered build}
+    fi
     # The quiet build prints almost nothing until a diagnostic fires, so
     # announce what's building. The verbose build narrates itself.
     [ -z "$verbose" ] && log "building $proj_name"

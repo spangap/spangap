@@ -188,7 +188,7 @@ def find_project(start: Path | None = None) -> Manifest:
     stable and host-independent.
 
     If nothing is found and we're at the workspace root, fall back to the
-    project `spangap init <project>` recorded in .spangap-project — this mirrors
+    target of the last build, recorded in .spangap-build — this mirrors
     spangap-outside's require_straddle/default_straddle so `spangap build` (and
     friends) work from the workspace root inside the container too, not only
     from inside the straddle dir.
@@ -207,10 +207,10 @@ def find_project(start: Path | None = None) -> Manifest:
         if proj is not None:
             return proj
         die(
-            f"no straddle.yaml at or above {WORKSPACE} and no usable "
-            ".spangap-project default.\n"
-            "       Run from inside a straddle, or `spangap init <project>` "
-            "to set a workspace default."
+            f"no straddle.yaml at or above {WORKSPACE} and no remembered "
+            "build (.spangap-build) to fall back on.\n"
+            "       Run from inside a straddle, or name one with "
+            "`spangap build <org>/<repo>` (it's cloned + remembered)."
         )
     die(
         f"no straddle.yaml found at or above {Path.cwd()}.\n"
@@ -218,23 +218,83 @@ def find_project(start: Path | None = None) -> Manifest:
     )
 
 
-def default_project() -> Manifest | None:
-    """The straddle named by .spangap-project, or None.
+SPANGAP_BUILD_FILE = WORKSPACE / ".spangap-build"
 
-    The straddle is at /straddles/<name> (--straddles mount) or
-    <workspace>/<name> (git clone); check both roots.
+
+def remembered_build() -> tuple[str, list[str]] | None:
+    """Parse .spangap-build into (target_token, selection_tokens), or None.
+
+    .spangap-build holds the last *explicit* build invocation, target first:
+        <org/repo> [--with <org/repo>]... [--without <org/repo>]... [--flash-size N]
+    Written by cmd_build (canonical org/repo form) so a bare `spangap build`
+    repeats the last one. None if the file is absent or empty.
     """
-    proj_file = WORKSPACE / ".spangap-project"
-    if not proj_file.is_file():
+    if not SPANGAP_BUILD_FILE.is_file():
         return None
-    name = proj_file.read_text().strip()
-    if not name:
+    line = SPANGAP_BUILD_FILE.read_text().strip()
+    if not line:
         return None
-    for root in STRADDLE_ROOTS:
-        cand = root / name / "straddle.yaml"
-        if cand.is_file():
-            return load_manifest(cand)
-    return None
+    toks = shlex.split(line)
+    return (toks[0], toks[1:]) if toks else None
+
+
+def parse_selection(tokens: list[str]) -> tuple[set[str], set[str], int | None]:
+    """Parse remembered selection tokens → (included, excluded, flash_mb)."""
+    inc: set[str] = set()
+    exc: set[str] = set()
+    flash: int | None = None
+    it = iter(tokens)
+    for t in it:
+        if t in ("--with", "-w"):
+            inc.add(next(it, ""))
+        elif t in ("--without", "-x"):
+            exc.add(next(it, ""))
+        elif t == "--flash-size":
+            v = next(it, "")
+            flash = int(v) if v.isdigit() else None
+        elif t.startswith("--with="):
+            inc.add(t.split("=", 1)[1])
+        elif t.startswith("--without="):
+            exc.add(t.split("=", 1)[1])
+        elif t.startswith("--flash-size="):
+            v = t.split("=", 1)[1]
+            flash = int(v) if v.isdigit() else None
+    inc.discard("")
+    exc.discard("")
+    return inc, exc, flash
+
+
+def write_remembered_build(
+    proj: Manifest, included: set[str], excluded: set[str], flash_mb: int | None
+) -> None:
+    """Record the build target + selection in .spangap-build (canonical form)."""
+    parts = [proj.name]
+    for inc in sorted(included):
+        parts += ["--with", inc]
+    for exc in sorted(excluded):
+        parts += ["--without", exc]
+    if flash_mb is not None:
+        parts += ["--flash-size", str(flash_mb)]
+    SPANGAP_BUILD_FILE.write_text(shlex.join(parts) + "\n")
+
+
+def straddle_at_or_above(start: Path) -> Path | None:
+    """Dir of the nearest straddle.yaml at/above `start`, or None."""
+    cur = start.resolve()
+    while True:
+        if (cur / "straddle.yaml").is_file():
+            return cur
+        if cur == cur.parent:
+            return None
+        cur = cur.parent
+
+
+def default_project() -> Manifest | None:
+    """The straddle named by .spangap-build's remembered target, or None."""
+    rb = remembered_build()
+    if rb is None:
+        return None
+    return resolve_target_straddle(rb[0], scan_workspace_straddles())
 
 
 def resolve_target_straddle(
@@ -243,7 +303,7 @@ def resolve_target_straddle(
     """Resolve an explicit `spangap build <target>` token to a straddle.
 
     This is what lets you name the image to build instead of cd-ing into its
-    dir (or relying on .spangap-project) — handy under --straddles, where the
+    dir (or relying on .spangap-build) — handy under --straddles, where the
     straddles live at /straddles/<repo>, not inside the workspace. Matches:
 
       - the full <org>/<repo> name        (reticulous/hw-tdeck)
@@ -1366,7 +1426,16 @@ def cmd_build(args: argparse.Namespace) -> int:
         if target is not None:
             idf_args.pop(0)
 
-    proj = target if target is not None else find_project()
+    # Where the build target comes from decides whether we *remember* it:
+    #   explicit   — a leading positional target token
+    #   cwd        — a straddle.yaml at/above cwd
+    #   remembered — the .spangap-build default (only at the workspace root)
+    if target is not None:
+        proj = target
+        source = "explicit"
+    else:
+        proj = find_project()
+        source = "cwd" if straddle_at_or_above(Path.cwd()) else "remembered"
     if not proj.has_firmware:
         die(f"{proj.name}: firmware dir {proj.firmware_dir} has no CMakeLists.txt")
 
@@ -1385,9 +1454,32 @@ def cmd_build(args: argparse.Namespace) -> int:
     for raw in (args.include or []):
         included.add(_resolve_org_repo(raw, all_straddles, "--with"))
 
+    flash_mb = args.flash_size
+
+    # Remember target + selection in .spangap-build, EXCEPT on a pure replay —
+    # a bare `build` (or passthrough like `build menuconfig`) at the workspace
+    # root, where the target itself came from .spangap-build and the invocation
+    # added no selection of its own. There we instead *reload* the remembered
+    # selection so the repeat matches the last explicit build, and leave the
+    # file untouched (so transient/passthrough runs never clobber it). Any
+    # explicit selection on this run replaces the remembered one wholesale.
+    has_selection = bool(
+        args.include or args.exclude or flash_mb is not None
+        or any(getattr(args, f"no_{s}", False) for s in _NO_SHORTHANDS)
+    )
+    persist = not (source == "remembered" and not has_selection)
+    if not persist:
+        rb = remembered_build()
+        if rb is not None:
+            r_inc, r_exc, r_flash = parse_selection(rb[1])
+            included |= r_inc
+            excluded |= r_exc
+            if flash_mb is None:
+                flash_mb = r_flash
+
     # --flash-size validation.
-    if args.flash_size is not None and args.flash_size not in _VALID_FLASH_MB:
-        die(f"--flash-size {args.flash_size}: choose one of {_VALID_FLASH_MB}")
+    if flash_mb is not None and flash_mb not in _VALID_FLASH_MB:
+        die(f"--flash-size {flash_mb}: choose one of {_VALID_FLASH_MB}")
 
     dropped: set[str] = set()
     deps, _ = resolve_requires(
@@ -1404,11 +1496,13 @@ def cmd_build(args: argparse.Namespace) -> int:
                 print(f"cascade-dropped: {', '.join(sorted(cascaded))}", file=sys.stderr)
         if included:
             print(f"included:  {', '.join(sorted(included))}", file=sys.stderr)
-        if args.flash_size is not None:
-            print(f"flash:     {args.flash_size} MB (--flash-size override)", file=sys.stderr)
+        if flash_mb is not None:
+            print(f"flash:     {flash_mb} MB (--flash-size override)", file=sys.stderr)
     stage_components(proj, deps, log_staged=not quiet)
-    write_sdkconfig_overrides(proj, args.flash_size)
+    write_sdkconfig_overrides(proj, flash_mb)
     lint_cmakelists(proj, deps, all_straddles)
+    if persist:
+        write_remembered_build(proj, included, excluded, flash_mb)
     # Bake the build invocation identity into the image: spangap-core's
     # write-build-info.py (run by CMake during this build) reads these and
     # emits app_build_{straddle,version,args}, which spangapInit() logs on boot.
@@ -1549,16 +1643,18 @@ def _monitor_ready(timeout: float = 4.0) -> bool:
 
 
 def cmd_show(args: argparse.Namespace) -> int:
-    """List the project straddle and its dependencies in initialization order.
+    """Show the last build invocation, its resolved straddle, and the deps.
 
-    The dependency order is THE init order (init_order()) — the same order the
-    generated spangapInitStraddles() dispatcher fires the straddles in, derived
-    from the same resolve_requires() walk that get-deps and the build use.
-    Paths are the container-native straddle dirs (/straddles/<repo> for a
-    --straddles checkout, <workspace>/<repo> for a git clone).
+    The straddle is resolved like a build: the straddle at/above cwd if any,
+    else the target of the last build (.spangap-build). The dependency order is
+    THE init order (init_order()) — the same order the generated
+    spangapInitStraddles() dispatcher fires the straddles in, derived from the
+    same resolve_requires() walk that get-deps and the build use. Paths are the
+    container-native straddle dirs (/straddles/<repo> for a --straddles
+    checkout, <workspace>/<repo> for a git clone).
     """
-    proj = find_project()
-    deps, _ = resolve_requires(proj, scan_workspace_straddles())
+    cwd_dir = straddle_at_or_above(Path.cwd())
+    proj = load_manifest(cwd_dir / "straddle.yaml") if cwd_dir else default_project()
 
     st_file = WORKSPACE / ".spangap-straddles"
     straddles = st_file.read_text().strip() if st_file.is_file() else ""
@@ -1569,18 +1665,32 @@ def cmd_show(args: argparse.Namespace) -> int:
         )
         print()
 
-    print("Project straddle:")
-    print(f"  {proj.name} ({proj.version}) - {proj.dir}")
+    rb = remembered_build()
+    print("Last build invocation:")
+    if rb is not None:
+        print(f"  spangap build {shlex.join([rb[0], *rb[1]])}")
+    else:
+        print("  (none yet — run `spangap build <org>/<repo>`)")
     print()
 
-    ordered = init_order(deps)
-    print("Dependencies (in order of initialization):")
-    if ordered:
-        for d in ordered:
-            print(f"  {d.name} - {d.dir}")
+    if proj is None:
+        print("Resolved straddle:")
+        print("  (none — cwd is not in a straddle and no remembered build)")
+        print()
     else:
-        print("  (none)")
-    print()
+        deps, _ = resolve_requires(proj, scan_workspace_straddles())
+        print("Resolved straddle:")
+        print(f"  {proj.name} ({proj.version}) - {proj.dir}")
+        print()
+
+        ordered = init_order(deps)
+        print("Dependencies (in order of initialization):")
+        if ordered:
+            for d in ordered:
+                print(f"  {d.name} - {d.dir}")
+        else:
+            print("  (none)")
+        print()
 
     print("Environment:")
     print(f"  python:     {sys.version.split()[0]}")
@@ -1943,7 +2053,8 @@ def main(argv: list[str] | None = None) -> int:
         help="optional leading TARGET names the buildable to build (its "
              "<org>/<repo>, repo dir, or buildable product name) so you need "
              "not cd into it; everything else is forwarded to idf.py. Without "
-             "a TARGET the straddle is resolved from cwd / .spangap-project.",
+             "a TARGET the straddle is resolved from cwd, else the last build "
+             "(.spangap-build). TARGET + --with/--without are remembered there.",
     )
     p_build.set_defaults(func=cmd_build)
 

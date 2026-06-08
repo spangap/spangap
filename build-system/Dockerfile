@@ -9,8 +9,9 @@
 # Built by spangap-outside with the spangap repo as context and this file as
 # -f, i.e. COPY paths below are relative to the repo root.
 #
-# Tag: spangap-build-env:dev (local). Eventual public tag is
-# ghcr.io/spangap/build-env:<version> matching the platform-straddle version.
+# Tag: spangap-build-env:<ws_hash> (local, per-workspace — see spangap-outside).
+# Eventual public tag is ghcr.io/spangap/build-env:<version> matching the
+# platform-straddle version.
 FROM espressif/idf:v5.5.4
 
 # Node 20 via NodeSource (Ubuntu 22.04 ships Node 12, too old for Quasar/Vite).

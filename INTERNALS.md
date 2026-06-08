@@ -185,12 +185,19 @@ container path — stable and host-independent. (Flash/monitor on the host read
 
 **Project resolution is symmetric across the two sides.** From the workspace
 root, both `spangap-outside` (`require_straddle`) and `spangap-inside`
-(`find_project`) fall back to the `.spangap-project` default, so `build` /
-`flash` / `validate` work from the root — on the host and inside the
-container — not only from inside the straddle dir. (Targeting a *non-default*
-straddle by `cd`-ing into it isn't supported under --straddles, since those
-straddles live at `/straddles`, outside the workspace tree on the host; that's a
-future `spangap build <straddle>` argument.)
+(`find_project`) fall back to the target of the last build — recorded in
+`.spangap-build` — so `build` / `flash` / `validate` / `show` work from the
+root, on the host and inside the container, not only from inside the straddle
+dir. A *different* straddle is named directly: `spangap build <org>/<repo>`
+resolves the target regardless of cwd (and, in clone mode, git-clones it +
+deps if missing), which is what makes targeting work under --straddles, where
+straddles live at `/straddles` outside the workspace tree. The container's
+`cmd_build` writes `.spangap-build` (canonical `<org/repo>` + `--with` /
+`--without` / `--flash-size`) whenever the target came from an explicit
+positional or cwd — never on a pure replay (bare `build`, or passthrough like
+`build menuconfig`), so a transient run can't clobber the remembered selection.
+The host reads `.spangap-build` to clone the target/includes on a bare replay
+and to pick the workspace-root default.
 
 **No-workspace fallback** — `spangap cli` and `spangap probe` also run with no
 `spangap.workspace.yaml` at/above cwd. The entry script resolves its own real

@@ -29,15 +29,19 @@ resolved project + its deps + the toolchain/environment; `ls <workspace>` and `l
 - `<workspace>/spangap.workspace.yaml` — the workspace marker (always present).
 - `<workspace>/.spangap-straddles` — **present ⟺ `--straddles` mode** (its contents are
   the host checkout path that's bind-mounted at `/straddles`). Absent ⟹ clone mode.
-- `<workspace>/.spangap-project` — the default buildable straddle, if one was set at
-  `init` (a bare `spangap build` from `<workspace>` then targets it, no `cd` needed).
-  **This is your main orientation pointer.** The user is most likely working on this
-  specific project, so resolve it to its straddle dir (`<root>/<that-repo>/`) and **read
-  its `README.md` first** (then `INTERNALS.md` / any `docs/`). The buildable straddle is
-  where the project's identity *and its target hardware* live — the board HAL, pin map,
-  partition layout, and OTA key are all owned there — so that README tells you what's
-  being built and **which board it compiles for**. If `.spangap-project` is absent, the
-  user targets a straddle by `cd`-ing into its dir instead.
+- `<workspace>/.spangap-build` — the **last build invocation**, target first:
+  `<org/repo> [--with …] [--without …] [--flash-size N]`. Written by `spangap build`
+  whenever a target is named explicitly or resolved from cwd, so a bare `spangap build`
+  (and `flash`/`monitor`/`show`) from `<workspace>` repeats it with no `cd` needed.
+  **This is your main orientation pointer.** Its target names the straddle the user is
+  most likely working on, so resolve it to its straddle dir (`<root>/<that-repo>/`) and
+  **read its `README.md` first** (then `INTERNALS.md` / any `docs/`). That buildable
+  straddle is where the project's identity *and its target hardware* live — the board
+  HAL, pin map, partition layout, and OTA key are all owned there — so its README tells
+  you what's being built and **which board it compiles for**. The `--with` line often
+  names that board straddle (e.g. `--with reticulous/hw-tdeck`). If `.spangap-build` is
+  absent (nothing built yet), the user names a target with `spangap build <org>/<repo>`
+  (cloned + remembered on first build) or `cd`s into a straddle dir.
 - `.spangap-port-<os>-<arch>` (sticky serial port) and `.spangap-venv-<os>-<arch>/`
   also live here. **That venv is the *host's* flash/monitor tooling**
   (esptool/esp-idf-monitor), built for the host OS/arch — **not runnable in this
@@ -59,9 +63,10 @@ tree (see ["What `spangap build` does"](#what-spangap-build-does-under-the-hood)
 either is equally usable:
 
 - **`<workspace>/<repo>`** — git clones. This is the **default** mode (no `--straddles`),
-  and what most sessions see: `init` clones the build-system skeleton (`spangap`), the
-  project, and every transitive dep into the workspace as flat sibling dirs, and they
-  stay pinned there. **Look here first.**
+  and what most sessions see: `init` clones just the build-system skeleton (`spangap`);
+  the first `spangap build <org>/<repo>` then clones the project and every transitive
+  dep into the workspace as flat sibling dirs, where they stay pinned. **Look here
+  first.**
 - **`/straddles/<repo>`** — a **flat `--straddles` checkout** bind-mounted whole, *only* when
   the workspace was init'd with `--straddles <dir>`. When this mode is in play, the
   straddles are under `/straddles` and `<workspace>` holds just workspace state (marker,
@@ -126,7 +131,8 @@ the host**, plus the device's network CLI. Set this up once and you can iterate 
 without the user touching anything per cycle.
 
 **1. Let you flash.** Ask the user to run, **on the host, from the project directory**
-(or the workspace root if `.spangap-project` is set), and leave it running:
+(or the workspace root, once something has been built — `.spangap-build` then names the
+target), and leave it running:
 
 ```sh
 spangap monitor <port>      # <port> is sticky after the first time

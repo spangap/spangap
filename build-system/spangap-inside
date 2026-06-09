@@ -1449,6 +1449,40 @@ _FLASH_LINE_RE = re.compile(
     r"^CONFIG_ESPTOOLPY_FLASHSIZE=\".+\"$"
 )
 
+# A line that actively *selects* a flash size (the `=y` choice form). Narrower
+# than _FLASH_LINE_RE, which also matches the `is not set` / synthesized-string
+# forms — here we only care whether something picks a size at all.
+_FLASHSIZE_SET_RE = re.compile(r"^CONFIG_ESPTOOLPY_FLASHSIZE_\d+MB=y$")
+
+
+def flash_size_configured(
+    proj: Manifest, deps: list[Manifest], flash_mb: int | None
+) -> bool:
+    """True if any spangap-controlled source fixes the flash size.
+
+    Without one, ESP-IDF silently falls back to its 2MB Kconfig default while
+    spangap's partition generator falls back to 8MB (bootstrap.cmake) — the two
+    disagree and the resulting image doesn't fit. We mirror the spangap layers
+    bootstrap.cmake feeds into SDKCONFIG_DEFAULTS: the --flash-size override,
+    each straddle's `kconfig:` lines, and the checked-in
+    sdkconfig.defaults{,.spangap} files. (IDF's own 2MB default is deliberately
+    NOT a source here — that's exactly the silent fallback we want to reject.)
+    """
+    if flash_mb is not None:
+        return True
+    for m in deps + [proj]:
+        if any(_FLASHSIZE_SET_RE.match(ln.strip()) for ln in m.kconfig):
+            return True
+    for m in deps + [proj]:
+        for fname in ("sdkconfig.defaults", "sdkconfig.defaults.spangap"):
+            f = m.firmware_dir / fname
+            if f.exists() and any(
+                _FLASHSIZE_SET_RE.match(ln.strip())
+                for ln in f.read_text().splitlines()
+            ):
+                return True
+    return False
+
 
 def write_sdkconfig_overrides(
     proj: Manifest, flash_mb: int | None, extra_lines: list[str] | None = None
@@ -1604,6 +1638,20 @@ def cmd_build(args: argparse.Namespace) -> int:
         proj, all_straddles, excluded=excluded, included=included,
         dropped_out=dropped,
     )
+
+    # Flash size must be set explicitly — IDF's silent 2MB default would mismatch
+    # the spangap-generated partition table (8MB fallback). Force the user to pick.
+    if not flash_size_configured(proj, deps, flash_mb):
+        die(
+            "flash size not configured. ESP-IDF would silently fall back to "
+            "2MB, which won't match the generated partition table.\n"
+            f"       Pass `--flash-size <MB>` (one of "
+            f"{', '.join(str(n) for n in _VALID_FLASH_MB)}), or set "
+            "CONFIG_ESPTOOLPY_FLASHSIZE_<MB>MB=y\n"
+            "       in a board straddle's `kconfig:` (the right home for a "
+            "hardware property)."
+        )
+
     quiet = not args.verbose
     if not quiet:
         signal_preamble(proj, deps)
@@ -1902,9 +1950,17 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 
 # Per-straddle build artifacts reallyclean strips. Firmware: idf build/,
-# generated staging/, downloaded managed_components/. Browser: node_modules/,
-# dist/, .quasar/, package-lock.json.
-_FW_ARTIFACTS = ("build", "staging", "managed_components")
+# generated staging/, downloaded managed_components/, plus the generated
+# sdkconfig (and its .old backup) and dependencies.lock — all gitignored.
+# Dropping sdkconfig matters: it's the file IDF treats as authoritative once
+# it exists, so leaving it behind means changed sdkconfig.defaults are silently
+# ignored on the next build. A source-only reset must remove it (matches
+# spangap-core's reallyclean.sh, which idf.py reallyclean routes through).
+# Browser: node_modules/, dist/, .quasar/, package-lock.json.
+_FW_ARTIFACTS = (
+    "build", "staging", "managed_components",
+    "sdkconfig", "sdkconfig.old", "dependencies.lock",
+)
 _BROWSER_ARTIFACTS = ("node_modules", "dist", ".quasar", "package-lock.json")
 
 
@@ -1920,6 +1976,21 @@ def cmd_reallyclean(args: argparse.Namespace) -> int:
     straddles = scan_workspace_straddles()
     removed = 0
 
+    def _rmtree(t: Path) -> None:
+        # /straddles is virtiofs with keep_cache (dir-entry caching), so
+        # shutil.rmtree's fd walk can rmdir a parent before the cache reflects
+        # the just-unlinked children and bail with ENOTEMPTY (errno 39) on a
+        # dir that really is now empty. Retrying re-reads the fresh listing and
+        # converges; a short sleep lets the cache settle between passes.
+        for attempt in range(6):
+            try:
+                shutil.rmtree(t)
+                return
+            except OSError as e:
+                if e.errno != 39 or attempt == 5:
+                    raise
+                time.sleep(0.1)
+
     def rm(t: Path) -> None:
         nonlocal removed
         if t.is_symlink() or t.is_file():
@@ -1927,7 +1998,7 @@ def cmd_reallyclean(args: argparse.Namespace) -> int:
             removed += 1
             print(f"  rm {t}", file=sys.stderr)
         elif t.is_dir():
-            shutil.rmtree(t)
+            _rmtree(t)
             removed += 1
             print(f"  rm -r {t}", file=sys.stderr)
 

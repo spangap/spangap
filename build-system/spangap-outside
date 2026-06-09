@@ -1219,16 +1219,24 @@ ensure_container() {
             || die "can't build $IMAGE: no Dockerfile at $ctx/build-system/Dockerfile"
         announce_container_setup
         if [ -n "$SPANGAP_QUIET" ]; then
-            docker build -t "$IMAGE" \
-                --build-arg "BUILDSYS_HASH=$local_hash" \
-                -f "$ctx/build-system/Dockerfile" "$ctx" >/dev/null 2>&1 \
-                || die "docker build failed (re-run without -s to see why)"
+            # Quiet build: capture the output to a temp log and only surface it
+            # if the build fails (dump the whole thing in place, then drop the
+            # temp file), so a one-off failure is debuggable without -v.
+            local build_log="$workspace/.spangap-build-$(uname -s)-$(uname -m).log"
+            if ! docker build -t "$IMAGE" \
+                    --build-arg "BUILDSYS_HASH=$local_hash" \
+                    -f "$ctx/build-system/Dockerfile" "$ctx" >"$build_log" 2>&1; then
+                cat "$build_log" >&2
+                rm -f "$build_log"
+                die "docker build failed"
+            fi
+            rm -f "$build_log"
         else
-            log "building $IMAGE (one-time, takes a few minutes)..."
+            log "building $IMAGE (one-time, just a moment)..."
             docker build -t "$IMAGE" \
                 --build-arg "BUILDSYS_HASH=$local_hash" \
                 -f "$ctx/build-system/Dockerfile" "$ctx" \
-                || die "docker build failed; see output above"
+                || die "docker build failed"
         fi
     fi
 

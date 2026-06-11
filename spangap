@@ -249,10 +249,12 @@ init)
         || die "host-side flash/monitor venv setup failed (see above)"
     # Quiet by default — collapse the docker build / git clone noise into one
     # status line per phase. -v|--verbose turns it all back on. SPANGAP_QUIET
-    # propagates into spangap-outside via the env (see the
-    # SPANGAP_QUIET=${SPANGAP_QUIET:-} preamble there) and gates the docker
-    # build output, clone_spec per-repo logging, etc.
-    [ -z "$verbose" ] && export SPANGAP_QUIET=1
+    # propagates into spangap-outside via the env (see the ${SPANGAP_QUIET+set}
+    # preamble there) and gates the docker build output, clone_spec per-repo
+    # logging, etc. Export it either way — empty for verbose — so spangap-outside
+    # (which now defaults every verb to quiet) sees the explicit choice rather
+    # than re-deriving it from argv that no longer carries init's -v.
+    if [ -z "$verbose" ]; then export SPANGAP_QUIET=1; else export SPANGAP_QUIET=; fi
 
     # Pre-build the container so the first real `spangap build` (or
     # `spangap docker sh`, `spangap claude`, ...) doesn't pay the

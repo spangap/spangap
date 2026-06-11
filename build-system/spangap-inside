@@ -56,10 +56,23 @@ def _discover_workspace() -> Path:
 WORKSPACE = _discover_workspace()
 STRADDLES = Path("/straddles")
 STRADDLE_ROOTS = (STRADDLES, WORKSPACE)
-# Device endpoints, workspace-wide. `spangap cli` prefers ssh, then TCP CLI;
-# `spangap monitor` owns the host-side bridge that fronts these (see spangap-outside).
-SSH_FILE = WORKSPACE / ".spangap-ssh"   # "<host-or-ip>:<port>" (ssh, default 22)
-TCP_FILE = WORKSPACE / ".spangap-tcp"   # "<host-or-ip>:<port>" (TCP CLI, default 2323)
+# The active device's address, workspace-wide: a bare "<host-or-ip>" — the last
+# one explicitly set (via `spangap cli -h` / `spangap dev -h`), or the project's
+# `<default_hostname>.local` mDNS name when never set. ONE address, many ports:
+# ssh on 22, the legacy TCP CLI on 2323, the device's TLS/wss on 443 — each verb
+# supplies its own port, so the file never stores one. `spangap monitor` owns the
+# host-side bridge that fronts the address (see spangap-outside).
+TCP_FILE = WORKSPACE / ".spangap-tcp"   # bare "<host-or-ip>" (the device address)
+# Manual-kconfig marker. Present ⇒ `spangap menuconfig` was run and the user is
+# hand-tuning sdkconfig; spangap-core's bootstrap.cmake then stops reseeding
+# sdkconfig from changed sdkconfig.defaults (it would otherwise clobber the
+# edits). `spangap autoconfig` removes it. Read by bootstrap.cmake via
+# $ENV{SPANGAP_WORKSPACE}, so the path here must match WORKSPACE exactly.
+MANUAL_KCONFIG_FILE = WORKSPACE / ".spangap-manual-kconfig"
+SSH_PORT = 22         # device sshd (the spangap/sshd straddle)
+TCP_CLI_PORT = 2323   # legacy TCP CLI socket (builds without sshd)
+WSS_PORT = 443        # device TLS — what the browser SPA dials (?port= default)
+DEV_PORT = 9000       # `spangap dev` quasar dev server (published by the container)
 # Canonical assistant-instructions file, baked into the image (Dockerfile) and
 # seeded into the workspace as CLAUDE.md on first `spangap claude`.
 README_PATH = Path("/usr/local/share/spangap/README.md")
@@ -121,6 +134,11 @@ class Manifest:
     def prefix(self) -> str: return self.data["prefix"]
     @property
     def version(self) -> str: return self.data["version"]
+    @property
+    def default_hostname(self) -> str:
+        """The device's mDNS/DHCP hostname — `default_hostname:` if set, else the
+        repo name. `<this>.local` is the out-of-the-box device address."""
+        return str(self.data.get("default_hostname") or self.repo)
     @property
     def firmware_dir(self) -> Path:
         return (self.dir / self.data.get("firmware", "idf")).resolve()
@@ -1337,12 +1355,12 @@ def run_idf(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> in
 # the in-container build behaves identically however it's reached (`spangap
 # build` from the host, `spangap docker spangap build`, or a shell inside the
 # container) and there's a single copy of the filter rules. spangap-outside
-# just forwards argv (and the sticky port via $SPANGAP_PORT) now.
+# just forwards argv now.
 # ---------------------------------------------------------------------------
 
-# idf.py's "all done" banner. Both modes rewrite it: idf.py's own multi-line
-# flash hints don't apply in a spangap workspace (you flash via `spangap
-# flash`), so we replace the banner with the spangap invocation and drop
+# idf.py's "all done" banner. Both modes suppress it: idf.py's own multi-line
+# flash hints are wrong here (the right command differs inside vs. outside the
+# container), so we replace the banner with a bare completion line and drop
 # whatever idf.py prints after it.
 _FLASH_MARKER = "Project build complete. To flash, run:"
 _TAIL = 3  # follow-up lines kept after each diagnostic in quiet mode
@@ -1381,14 +1399,14 @@ def run_build_idf(args: list[str], cwd: Path, quiet: bool, env: dict[str, str] |
 
     quiet=True keeps only real diagnostics (+ a few lines of trailing context,
     with `[...]` between non-adjacent blocks); quiet=False is pass-through.
-    Both modes rewrite idf.py's flash banner to `spangap flash <port>`, where
-    <port> is $SPANGAP_PORT (the host's sticky serial port, forwarded by
-    spangap-outside) or the literal `<serial port>` placeholder.
+    Both modes drop idf.py's flash banner entirely — the right invocation
+    differs inside vs. outside the container (`idf.py flash` vs `spangap flash`),
+    so rather than print a half-right one we print a bare completion line and let
+    the user flash however they flash.
     """
     cmd = ["idf.py", *args]
     if not quiet:
         print(f"+ {' '.join(cmd)}  (in {cwd})", file=sys.stderr)
-    port = os.environ.get("SPANGAP_PORT") or "<serial port>"
     proc = subprocess.Popen(
         cmd, cwd=cwd, env={**os.environ, **(env or {})},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1401,8 +1419,7 @@ def run_build_idf(args: list[str], cwd: Path, quiet: bool, env: dict[str, str] |
         for raw in proc.stdout:
             line = raw.rstrip("\n")
             if _FLASH_MARKER in line:
-                out.write("build: done. To flash, run:\n")
-                out.write(f"  spangap flash {port}\n")
+                out.write("build: done.\n")
                 out.flush()
                 for _ in proc.stdout:  # drop idf.py's own flash instructions
                     pass
@@ -1540,7 +1557,11 @@ def cmd_menuconfig(args: argparse.Namespace) -> int:
     """Stage the buildable's components, then run idf.py menuconfig on it
     interactively. With --save, persist the result into the straddle's
     sdkconfig.defaults via idf.py save-defconfig (the 'save as hw-whatever'
-    step)."""
+    step).
+
+    Drops the .spangap-manual-kconfig marker so later builds won't reseed
+    sdkconfig from changed sdkconfig.defaults and clobber what you just tuned by
+    hand (see bootstrap.cmake). `spangap autoconfig` clears it."""
     proj = find_project()
     if not proj.has_firmware:
         die(f"{proj.name}: firmware dir {proj.firmware_dir} has no CMakeLists.txt")
@@ -1554,11 +1575,44 @@ def cmd_menuconfig(args: argparse.Namespace) -> int:
     write_sdkconfig_overrides(proj, None)
 
     rc = run_idf(["menuconfig"], cwd=proj.firmware_dir)
-    if rc != 0 or not args.save:
+    if rc != 0:
+        return rc
+    # menuconfig exited cleanly — from here on sdkconfig is hand-managed.
+    MANUAL_KCONFIG_FILE.touch()
+    print(f"spangap: manual kconfig mode ON (created {MANUAL_KCONFIG_FILE.name}) — "
+          "sdkconfig.defaults changes won't reseed sdkconfig until `spangap autoconfig`.",
+          file=sys.stderr)
+    if not args.save:
         return rc
     print("spangap: writing minimal sdkconfig.defaults (idf.py save-defconfig)",
           file=sys.stderr)
     return run_idf(["save-defconfig"], cwd=proj.firmware_dir)
+
+
+def cmd_autoconfig(args: argparse.Namespace) -> int:
+    """Leave manual-kconfig mode: remove the .spangap-manual-kconfig marker and
+    delete the project's sdkconfig so the next build reseeds it from the current
+    (layered) sdkconfig.defaults. The inverse of `spangap menuconfig`."""
+    had_marker = MANUAL_KCONFIG_FILE.exists()
+    MANUAL_KCONFIG_FILE.unlink(missing_ok=True)
+
+    proj = find_project()
+    if not proj.has_firmware:
+        die(f"{proj.name}: firmware dir {proj.firmware_dir} has no CMakeLists.txt")
+    sdkconfig = proj.firmware_dir / "sdkconfig"
+    removed_sdkconfig = sdkconfig.exists()
+    if removed_sdkconfig:
+        sdkconfig.unlink()
+
+    if not had_marker:
+        print("spangap: manual kconfig mode was already off.", file=sys.stderr)
+    else:
+        print(f"spangap: manual kconfig mode OFF (removed {MANUAL_KCONFIG_FILE.name}).",
+              file=sys.stderr)
+    if removed_sdkconfig:
+        print(f"spangap: removed {proj.name} sdkconfig — next build reseeds it "
+              "from sdkconfig.defaults.", file=sys.stderr)
+    return 0
 
 
 def cmd_build(args: argparse.Namespace) -> int:
@@ -2101,21 +2155,23 @@ def cmd_claude(claude_args: list[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# `spangap cli [<cmd and args>]` — reach the device, preferring ssh.
+# `spangap cli [<cmd and args>]` — reach the device, foolproof.
 #
-#   .spangap-ssh present  → exec `ssh -p <port> <host> [<cmd and args>]` (the
-#                           sshd straddle; one-shot exec with args, shell without)
-#   .spangap-tcp present  → the legacy TCP CLI socket client (port 2323 default)
-#   neither               → bootstrap: generate an ed25519 key (if missing), ask
-#                           for the device host, write .spangap-ssh, and print the
-#                           `sshd add <pubkey>` line to run in the serial monitor.
+# One address (.spangap-tcp, a bare host) drives every transport. The flow makes
+# a working connection out of nothing, in order:
+#   1. ensure a local ed25519 key (ssh-keygen on first use).
+#   2. ssh in (port 22) — one-shot `exec` with args, an interactive shell without.
+#   3. ssh failed → the legacy TCP CLI (port 2323) if that socket answers.
+#   4. ssh port open but our key refused → print the `sshd add <pubkey>` line.
+#   5. nothing answers → the device is unreachable: ask for its IP/host and retry.
 #
-# Both endpoints are fronted by the host-side bridge that `spangap monitor` owns
-# (spangap-outside) — inside the container we can't route to the device's LAN, so
-# we dial host.docker.internal and the bridge splices to the real device. On a
-# native-Linux host host.docker.internal isn't injected and the bridge network
-# reaches the LAN directly, so we fall back to dialing the device host itself.
-# A `-h <host[:port]>` flag is a convenience that (re)writes .spangap-ssh.
+# Inside the container we can't route to the device's LAN, so every probe goes
+# through host.docker.internal and the bridge `spangap monitor` owns splices to
+# the device (it forwards 22 and 2323 only — so those two ports are all we can
+# probe here). On a native-Linux host host.docker.internal isn't injected and the
+# bridge network reaches the LAN directly, so we dial the device host itself.
+# `-h <host>` (re)writes .spangap-tcp; the port belongs to the transport, not the
+# address, so a stray ":port" is tolerated on read but never stored.
 # ---------------------------------------------------------------------------
 PROMPT = b"$ "
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
@@ -2146,39 +2202,95 @@ def _connect_host(host: str, port: int) -> str:
         return host
 
 
-def _cli_bootstrap() -> int:
+def _default_device_host() -> str:
+    """The project's `<default_hostname>.local` — the device's out-of-the-box
+    mDNS name, used when .spangap-tcp was never set."""
+    m = default_project()
+    if m is None:
+        # find_project walks up from cwd; it die()s when nothing resolves, which
+        # is fine to absorb here — a missing default just yields a bare guess.
+        try:
+            m = find_project()
+        except SystemExit:
+            m = None
+    return f"{m.default_hostname}.local" if m is not None else "device.local"
+
+
+def device_host(set_to: str | None = None) -> str:
+    """The active device address. With `set_to`, persist it (bare host) first.
+    Otherwise read .spangap-tcp, falling back to the project default — which is
+    written through so the monitor's bridge and the web UI see the same address."""
+    if set_to is not None:
+        host = parse_endpoint(set_to, SSH_PORT)[0]
+        # Constrain to the hostname / IPv4 / IPv6-literal grammar (brackets are
+        # already unwrapped by parse_endpoint). Not because anything evaluates it
+        # — every consumer passes it as argv — but so the file can't hold spaces
+        # or glob chars that would split/expand in the host bridge's `$specs`.
+        if not re.fullmatch(r"[A-Za-z0-9._:%-]+", host):
+            die(f"invalid device address {set_to!r} — expected a hostname or IP")
+        TCP_FILE.write_text(f"{host}\n")
+        return host
+    if TCP_FILE.is_file():
+        host = parse_endpoint(TCP_FILE.read_text(), SSH_PORT)[0]
+        if host:
+            return host
+    host = _default_device_host()
+    TCP_FILE.write_text(f"{host}\n")
+    return host
+
+
+def _ensure_ssh_key() -> Path:
     key = Path.home() / ".ssh" / "id_ed25519"
     if not key.is_file():
         key.parent.mkdir(mode=0o700, exist_ok=True)
         subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key), "-q"],
                        check=True)
+    return key
+
+
+def _ssh_argv(host: str, rest: list[str]) -> list[str]:
+    ssh = shutil.which("ssh") or "ssh"
+    return [ssh, "-p", str(SSH_PORT), *SSH_OPTS, _connect_host(host, SSH_PORT), *rest]
+
+
+def _ssh_auth_ok(host: str) -> bool:
+    """Can we ssh in non-interactively right now? Probe with a no-op remote."""
     try:
-        host = input("spangap cli: device hostname or IP: ").strip()
-    except EOFError:
-        die("spangap cli: no device configured — run interactively, or write "
-            f"{SSH_FILE.name} (or {TCP_FILE.name}) with <host>:<port>")
-    if not host:
-        die("spangap cli: no host entered")
-    SSH_FILE.write_text(f"{host}:22\n")
-    pub = (key.with_suffix(".pub")).read_text().strip()
-    print(f"\nWrote {SSH_FILE.name} → {host}:22\n")
-    print("Now, in the device serial monitor, authorize this key:\n")
+        r = subprocess.run(_ssh_argv(host, ["true"]),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=15)
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _tcp_open(host: str, port: int, timeout: float = 5.0) -> bool:
+    try:
+        socket.create_connection((_connect_host(host, port), port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def _print_authorize(host: str, key: Path) -> None:
+    pub = key.with_suffix(".pub").read_text().strip()
+    print(f"\nReached {host}, but its sshd won't accept this key. In the device "
+          f"serial monitor, authorize it:\n")
     print(f"    sshd add {pub}\n")
-    print("sshd is enabled by default; on an older build also run: sshd enable")
+    print("sshd ships enabled; on an older build also run: sshd enable")
     print("If sshd isn't in your build, rebuild with: spangap build --with spangap/sshd")
-    print("\nThen re-run `spangap cli` to connect over ssh.")
-    return 0
+    print("\nThen re-run `spangap cli`.")
 
 
 def cmd_cli(argv: list[str]) -> int:
+    override: str | None = None
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "-h":
             if i + 1 >= len(argv):
                 die("spangap cli: -h needs a hostname")
-            ehost, eport = parse_endpoint(argv[i + 1], 22)
-            SSH_FILE.write_text(f"{ehost}:{eport}\n")
+            override = argv[i + 1]
             i += 2
         elif a == "--":
             i += 1
@@ -2187,19 +2299,35 @@ def cmd_cli(argv: list[str]) -> int:
             break
     rest = argv[i:]
 
-    # ssh first, then the legacy TCP CLI, else bootstrap.
-    if SSH_FILE.is_file():
-        host, port = parse_endpoint(SSH_FILE.read_text(), 22)
-        ssh = shutil.which("ssh") or "ssh"
-        cmd = [ssh, "-p", str(port), *SSH_OPTS, _connect_host(host, port), *rest]
-        os.execvp(cmd[0], cmd)
-        return 1  # unreachable
-    if not TCP_FILE.is_file():
-        return _cli_bootstrap()
+    host = device_host(set_to=override)
+    key = _ensure_ssh_key()
 
-    host, port = parse_endpoint(TCP_FILE.read_text(), 2323)
-    if "SPANGAP_CLI_PORT" in os.environ:
-        port = int(os.environ["SPANGAP_CLI_PORT"])
+    while True:
+        if _ssh_auth_ok(host):                       # 2. ssh in
+            argv2 = _ssh_argv(host, rest)
+            os.execvp(argv2[0], argv2)               # replaces this process
+        if _tcp_open(host, TCP_CLI_PORT):            # 3. legacy TCP CLI
+            return _tcp_cli_client(host, rest)
+        if _tcp_open(host, SSH_PORT):                # 4. sshd up, key not trusted
+            _print_authorize(host, key)
+            return 1
+        # 5. nothing answers — the device is unreachable from here.
+        print(f"spangap cli: can't reach {host} on ssh ({SSH_PORT}) or the TCP "
+              f"CLI ({TCP_CLI_PORT}).", file=sys.stderr)
+        print("If this is a Mac, make sure `spangap monitor` is running on the "
+              "host — it bridges the container to the device.", file=sys.stderr)
+        try:
+            entry = input("Device IP or hostname (blank to give up): ").strip()
+        except EOFError:
+            entry = ""
+        if not entry:
+            return 1
+        host = device_host(set_to=entry)
+
+
+def _tcp_cli_client(host: str, rest: list[str]) -> int:
+    """Legacy line-oriented TCP CLI (builds without the sshd straddle)."""
+    port = int(os.environ.get("SPANGAP_CLI_PORT", TCP_CLI_PORT))
     connect_host = _connect_host(host, port)
     try:
         s = socket.create_connection((connect_host, port), timeout=10)
@@ -2252,13 +2380,90 @@ def cmd_cli(argv: list[str]) -> int:
         return 0
 
 
+# ---------------------------------------------------------------------------
+# `spangap dev [-h <host>]` — run the project's Quasar dev server, reachable
+# from outside the container.
+#
+# The buildable's `browser:` dir (reticulous → web-interface/) is the Quasar SPA.
+# We bind 0.0.0.0:DEV_PORT inside; the container publishes that port to an
+# ephemeral host port (see spangap-outside ensure_container), and the host-side
+# `spangap dev` passes the resulting URL in SPANGAP_DEV_URL. The SPA dials wss to
+# whatever ?host= names — the
+# active device address — so the hot-served dev UI drives the real device. Runs
+# in the foreground: Quasar's console streams until you quit it (Ctrl-C). The URL
+# is printed here; the host-side `spangap dev` also opens it in the OS browser.
+# ---------------------------------------------------------------------------
+def cmd_dev(argv: list[str]) -> int:
+    override: str | None = None
+    i = 0
+    while i < len(argv):
+        if argv[i] == "-h":
+            if i + 1 >= len(argv):
+                die("spangap dev: -h needs a hostname")
+            override = argv[i + 1]
+            i += 2
+        elif argv[i] == "--":
+            i += 1
+            break
+        else:
+            break
+    rest = argv[i:]
+
+    proj = find_project()
+    if not proj.has_browser:
+        die(f"spangap dev: {proj.name} has no web SPA "
+            f"({proj.browser_dir.name}/package.json missing)")
+    web = proj.browser_dir
+    if not (web / "node_modules").is_dir():
+        print(f"spangap dev: installing {web.name} deps (first run)…", file=sys.stderr)
+        if subprocess.run(["npm", "install"], cwd=web).returncode != 0:
+            die("spangap dev: npm install failed")
+
+    host = device_host(set_to=override)
+    # The dev server's proxy runs in the container, which can't route to the
+    # device's LAN — so, exactly like `spangap cli`, it goes through the monitor's
+    # bridge at host.docker.internal (which forwards 80/443 → the device). On a
+    # native-Linux host there's no bridge and the container reaches the LAN
+    # directly, so _connect_host hands back the device address itself.
+    proxy_target = _connect_host(host, WSS_PORT)
+    # The host publishes our DEV_PORT to an ephemeral host port and passes the
+    # resulting browser URL in SPANGAP_DEV_URL — we bind 0.0.0.0:DEV_PORT inside
+    # and can't see the host mapping ourselves. Fall back to the in-container
+    # port for a bare `spangap dev` run straight inside the container.
+    url = os.environ.get("SPANGAP_DEV_URL") or f"http://localhost:{DEV_PORT}/"
+    print(f"\nspangap dev: serving {proj.name}, proxying the device ({host}) "
+          f"via {proxy_target}. Browse to:\n\n    {url}\n", file=sys.stderr)
+    if proxy_target != host:
+        print("(reached through the `spangap monitor` bridge — make sure a "
+              "monitor is running)\n", file=sys.stderr)
+
+    # SPANGAP_DEVICE tells quasar.config.ts what to proxy /auth, /state and the
+    # /webrtc signaling to, so the dev origin is same-origin with the device and
+    # the session cookie / login flow work unchanged. The device https port (443)
+    # is implied; the bridge splices host.docker.internal:443 → device:443.
+    env = {**os.environ, "SPANGAP_DEVICE": proxy_target}
+    cmd = ["npm", "run", "dev", "--", "-H", "0.0.0.0", "-p", str(DEV_PORT), *rest]
+    proc = subprocess.Popen(cmd, cwd=web, env=env)
+    # Ctrl-C reaches quasar directly (it's in our foreground process group); don't
+    # let the SIGINT we also catch surface as a traceback — just wait quasar out
+    # and hand back its exit code.
+    while True:
+        try:
+            return proc.wait()
+        except KeyboardInterrupt:
+            continue
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = sys.argv[1:] if argv is None else argv
-    # Pass-through subcommands whose own flag parsing would clash with argparse.
+    # Pass-through subcommands whose own flag parsing would clash with argparse
+    # (their own -h is a hostname, not argparse's --help).
     if raw and raw[0] == "claude":
         return cmd_claude(raw[1:])
     if raw and raw[0] == "cli":
         return cmd_cli(raw[1:])
+    if raw and raw[0] == "dev":
+        return cmd_dev(raw[1:])
 
     p = argparse.ArgumentParser(prog="spangap", description="spangap straddles CLI (in-container)")
     # Bare `spangap` (no subcommand) lists the project + deps + environment —
@@ -2323,6 +2528,12 @@ def main(argv: list[str] | None = None) -> int:
              "(the 'clone a board straddle, configure, save as hw-whatever' step).",
     )
     p_mc.set_defaults(func=cmd_menuconfig)
+
+    sub.add_parser(
+        "autoconfig",
+        help="leave manual kconfig mode (drop .spangap-manual-kconfig) and reseed "
+             "sdkconfig from sdkconfig.defaults on the next build",
+    ).set_defaults(func=cmd_autoconfig)
 
     sub.add_parser(
         "flash",

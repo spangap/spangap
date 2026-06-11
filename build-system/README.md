@@ -172,36 +172,47 @@ It's truncated on each flash, so it reflects the **current** boot.
 the host `spangap monitor` **owns the bridge** that fronts it (the container can't route
 to the device's LAN, so on Docker Desktop it dials `host.docker.internal` and the monitor
 splices to the real device; native Linux reaches the LAN directly). The monitor opens the
-bridge on start from whatever endpoints are configured and closes it on exit, so the bridge
-only lives while a monitor is running. Two workspace-root files name the device:
+bridge on start from the configured device address and closes it on exit, so the bridge
+only lives while a monitor is running. One workspace-root file names the device:
 
-- **`.spangap-ssh`** — `<host-or-ip>:<port>` (ssh; default 22). `spangap cli` **prefers this.**
-- **`.spangap-tcp`** — `<host-or-ip>:<port>` (TCP CLI; default 2323).
+- **`.spangap-tcp`** — a bare `<host-or-ip>`: the **device address**. One address, many
+  ports — ssh on 22, the legacy TCP CLI on 2323, the device's TLS/wss on 443. The port
+  belongs to the transport, not the address, so it's never stored. Defaults to the
+  project's `<default_hostname>.local` (e.g. `reticulous.local`) until set.
 
-**First-time SSH setup** (the default path): run `spangap cli` with neither file present.
-It generates `~/.ssh/id_ed25519` if missing, asks for the device IP (from `.spangap-log`),
-writes `.spangap-ssh`, and prints a `sshd add <pubkey>` line. Have the user paste that line
-**in the monitor window** (a live serial CLI to the device) to authorize the key. `sshd` is
-enabled by default and admits no one without an authorized key; if it isn't in the build,
-add it with `spangap build --with spangap/sshd`. Then, from inside this container:
+**`spangap cli` is foolproof** — it makes a working connection out of nothing, in order:
+generate `~/.ssh/id_ed25519` if missing → ssh in (port 22) → fall back to the legacy TCP
+CLI (2323) if that answers → if ssh is up but the key is refused, print a `sshd add
+<pubkey>` line to paste **in the monitor window** (the live serial CLI) to authorize it →
+if nothing answers, report whether the device pings and ask for its IP/host, then retry.
+`sshd` ships enabled and admits no one without an authorized key; if it isn't in the build,
+add it with `spangap build --with spangap/sshd`. `-h <host>` (re)writes `.spangap-tcp`.
 
 ```sh
 spangap cli get s.net                     # over ssh; one-shot exec, prints and exits
-spangap cli set s.some.key value          # subsequent calls reuse .spangap-ssh
+spangap cli set s.some.key value          # subsequent calls reuse .spangap-tcp
 spangap cli                               # no args → interactive shell
+spangap cli -h 192.168.1.50               # point at a specific device, then connect
 ```
 
 **TCP CLI alternative:** have the user type `set s.net.cli_port=2323` in the monitor window
-(opens the device's TCP CLI; `s.` persists it to flash) and write `.spangap-tcp` with
-`<device-ip>:2323`. With no `.spangap-ssh` present, `spangap cli` then uses that socket.
+(opens the device's TCP CLI; `s.` persists it to flash). When ssh isn't available, `spangap
+cli` automatically uses that socket on the same `.spangap-tcp` address.
+
+**`spangap dev`** runs the project's Quasar web SPA (`web-interface/`) hot from Vite,
+reachable from outside the container: it starts the dev server (published to an ephemeral
+host port, so concurrent workspaces never collide) and opens it in the OS browser at the
+URL it prints, pointed at the active device address over
+wss (`?host=<addr>&port=443`). It streams the dev console until you quit it. `-h <host>`
+sets the device address first, same as `spangap cli`.
 
 **Device CLI commands are silent on success** (`set` / `unset` / `save` print nothing when
 they work) — no output means it worked, not that it hung.
 
 **Iteration tips.**
 
-- **Sticky state:** the serial port (`.spangap-port-<os>-<arch>`) and the device endpoint
-  (`.spangap-ssh` / `.spangap-tcp`) are remembered — set each once, omit thereafter.
+- **Sticky state:** the serial port (`.spangap-port-<os>-<arch>`) and the device address
+  (`.spangap-tcp`) are remembered — set each once, omit thereafter.
 - **One terminal, both jobs:** the single host `spangap monitor` gives the *user* the
   live console *and* gives *you* the flash signal + the `.spangap-log` to read. Once it's
   running, a normal cycle needs no user action: you build, you `spangap flash`, you read

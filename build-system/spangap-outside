@@ -16,11 +16,14 @@
 #   probe [<dev>]    run esptool flash_id and print chip + flash size, plus
 #                    the matching `spangap build --flash-size <MB>` invocation.
 #                    Useful for generic builds against unknown hardware.
-#   cli [-h host[:port]] [cmd...]
-#                    talk to the device. Prefers ssh (.spangap-ssh), else the
-#                    TCP CLI (.spangap-tcp); with neither, bootstraps an ed25519
-#                    key + writes .spangap-ssh. -h persists the ssh endpoint to
-#                    ./.spangap-ssh in the workspace root; subsequent calls omit it.
+#   cli [-h host] [cmd...]
+#                    talk to the device, foolproof: keygen → ssh → legacy TCP CLI
+#                    → print the `sshd add` line if the key's refused → ask for an
+#                    address if nothing answers. -h persists the device address to
+#                    .spangap-tcp (a bare host); subsequent calls omit it.
+#   dev [-h host]    run the project's Quasar dev server in the container
+#                    (published to an ephemeral host port) and open it in the OS
+#                    browser, pointed at the device over wss. Streams until quit.
 #   get-deps         git-clone any missing transitive `requires:` siblings
 #                    (uses host github creds; container has none). Also runs
 #                    automatically as part of `build`.
@@ -50,10 +53,10 @@
 #
 # Everything else docker-exec's into spangap-inside unchanged.
 #
-# Serial-port and device-endpoint stickiness: explicit args overwrite
+# Serial-port and device-address stickiness: explicit args overwrite
 # $SPANGAP_WORKSPACE/.spangap-port-<os>-<arch> (per-host, since /dev paths
-# differ) and .spangap-ssh / .spangap-tcp (workspace-wide) respectively, and
-# bare invocations read whichever file's there.
+# differ) and .spangap-tcp (the workspace-wide device address) respectively, and
+# bare invocations read whichever file's there (or the project default).
 set -euo pipefail
 
 # Silence Docker CLI's "What's next:" hint footer, which the docker CLI prints
@@ -79,21 +82,22 @@ container_ws="/home/spangap/$(basename "$workspace")"
 # container by spangap-inside, which reads the same -v/--verbose flag off the
 # forwarded argv; this var only governs the host-side noise.)
 #
-# Quiet by default for `build` and `reset-workspace` (the noisy ones — dep
-# fetch, image rebuild). -v|--verbose turns the noise back on. `reset-workspace`
-# rebuilds the container itself, so it gets the same quiet treatment. Also
-# honoured if the caller sets it in the environment (used by `spangap init` to
-# gate the docker build noise behind -v/--verbose).
-SPANGAP_QUIET=${SPANGAP_QUIET:-}
-
-case "${1:-}" in
-    build|reset-workspace)
-        SPANGAP_QUIET=1
-        case "${2:-}" in
-            -v|--verbose) SPANGAP_QUIET= ;;
-        esac
-        ;;
-esac
+# Quiet by default for EVERY verb — image rebuild / container recreate / git
+# clone are host-side setup noise the user didn't ask to see, regardless of
+# whether they typed `build`, `dev`, `flash`, … (any of them can trigger an
+# image build). -v|--verbose anywhere in the args turns the full output back on.
+# An explicit SPANGAP_QUIET in the environment (set by `spangap init`, which
+# decides verbosity from its own -v) wins over this default but not over an
+# in-args -v. ${name+set} distinguishes "unset" from "set but empty", so an
+# init-forced verbose (SPANGAP_QUIET=) survives.
+if [ -z "${SPANGAP_QUIET+set}" ]; then
+    SPANGAP_QUIET=1
+fi
+for _arg in "$@"; do
+    case $_arg in
+        -v|--verbose) SPANGAP_QUIET= ; break ;;
+    esac
+done
 
 # Host-side flash/monitor venv. Lives entirely inside the workspace so
 # `spangap init` keeps its promise of touching nothing outside it. Pins
@@ -320,11 +324,19 @@ resolve_firmware_dir() {
 # file per host.
 PORT_FILE="$workspace/.spangap-port-$(uname -s)-$(uname -m)"
 
-# Device endpoints, workspace-wide (the device address is the same from
-# anywhere). `spangap cli` prefers ssh, then the TCP CLI; `spangap monitor`
-# owns the host-side bridge that fronts these. Each holds "<host-or-ip>:<port>".
-SSH_FILE="$workspace/.spangap-ssh"   # ssh, default port 22
-TCP_FILE="$workspace/.spangap-tcp"   # TCP CLI, default port 2323
+# The active device's address, workspace-wide: a bare "<host-or-ip>" — the last
+# one explicitly set (via `spangap cli -h` / `spangap dev -h`), or the project's
+# <default_hostname>.local mDNS name when never set. One address, many ports: ssh
+# on 22, the legacy TCP CLI on 2323, the device's TLS/wss on 443 — each verb
+# brings its own port, so the file never stores one. `spangap monitor` owns the
+# host-side bridge that fronts the address.
+TCP_FILE="$workspace/.spangap-tcp"   # bare "<host-or-ip>" (the device address)
+SSH_PORT=22         # device sshd (the spangap/sshd straddle)
+TCP_CLI_PORT=2323   # legacy TCP CLI socket (builds without sshd)
+HTTP_PORT=80        # device web (plain HTTP)
+WSS_PORT=443        # device web — TLS/wss (https), what `spangap dev` proxies to
+DEV_PORT=9000       # `spangap dev` quasar dev server bind port inside the container
+                    # (mapped to an ephemeral host port — see ensure_container)
 
 # Host-side LAN bridge (see start_bridge). Script is workspace-wide (static
 # content); pid/log are per-host since the bridge is a host-local process — a
@@ -383,6 +395,78 @@ parse_endpoint() {
     EP_HOST=$host; EP_PORT=$port
 }
 
+# The project's out-of-the-box device address: <default_hostname>.local, read
+# straight from the resolved straddle.yaml (one grep beats spinning up the
+# container just for a name). Falls back to the straddle dir's basename, then a
+# bare "device" if we're nowhere near a straddle.
+default_device_host() {
+    local proj hn=""
+    if proj=$(require_straddle cli 2>/dev/null); then
+        hn=$(sed -n 's/^[[:space:]]*default_hostname:[[:space:]]*//p' \
+                 "$proj/straddle.yaml" 2>/dev/null | head -1 | tr -d "\"' \r")
+    fi
+    [ -n "$hn" ] || hn=$(basename "${proj:-device}")
+    printf '%s.local\n' "$hn"
+}
+
+# The active device address: .spangap-tcp's bare host (a stray ":port" is
+# tolerated on read but the port belongs to the transport, not the address), or
+# the project default when never set.
+device_host() {
+    if [ -s "$TCP_FILE" ]; then
+        parse_endpoint "$(cat "$TCP_FILE")" "$SSH_PORT"
+        printf '%s\n' "$EP_HOST"
+        return 0
+    fi
+    default_device_host
+}
+
+# Persist the device address (bare host) so the bridge, `spangap cli`, and the
+# web UI all agree on which device is "active".
+set_device_host() {
+    parse_endpoint "$1" "$SSH_PORT"
+    # Constrain to the hostname / IPv4 / IPv6-literal grammar (parse_endpoint has
+    # already unwrapped any [..]). Nothing evaluates the address — every consumer
+    # quotes it or passes it as argv — but this keeps spaces and glob chars out of
+    # the file so the host bridge's unquoted `$specs` can't split or expand.
+    case $EP_HOST in
+        ""|*[!A-Za-z0-9._:%-]*)
+            die "invalid device address '$1' — expected a hostname or IP" ;;
+    esac
+    printf '%s\n' "$EP_HOST" > "$TCP_FILE"
+}
+
+# TCP reachability of <host>:<port> with a short timeout. python3 is already a
+# host dependency (the legacy TCP CLI client + the LAN bridge both use it), so
+# lean on it rather than the non-portable `nc`/bash-/dev/tcp timeout dance.
+host_port_open() {
+    python3 - "$1" "$2" 2>/dev/null <<'PY'
+import socket, sys
+try:
+    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5).close()
+except OSError:
+    sys.exit(1)
+PY
+}
+
+# Is the device answering ICMP at all? Used only to tell "device down / wrong
+# address" (→ ask for a new one) apart from "device up but no CLI service" (→
+# explain how to bring sshd up). The timeout flag differs by platform.
+device_up() {
+    case $(uname -s 2>/dev/null) in
+        Darwin) ping -c 1 -t 5 "$1" >/dev/null 2>&1 ;;
+        *)      ping -c 1 -W 5 "$1" >/dev/null 2>&1 ;;
+    esac
+}
+
+# Open a URL in the OS default browser (best-effort; quiet if neither opener is
+# present, e.g. a headless host — the URL is printed regardless).
+open_url() {
+    if command -v open >/dev/null 2>&1; then open "$1" >/dev/null 2>&1
+    elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$1" >/dev/null 2>&1
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Host-side LAN bridge, owned by `spangap monitor` (defined here, above the
 # command dispatch, because the monitor path runs before the docker section).
@@ -418,6 +502,12 @@ def handle(client, dhost, dport):
         print(f"spangap-forward: {dhost}:{dport}: {e}", flush=True)
         client.close()
         return
+    # create_connection's timeout was only for the CONNECT — but Python leaves it
+    # on the socket, so recv() would raise after 10s idle and tear the splice
+    # down. Long-lived streams that legitimately idle (the webrtc signaling WS
+    # once the session is P2P, an idle ssh shell) must not be killed: clear it.
+    up.settimeout(None)
+    client.settimeout(None)
     t = threading.Thread(target=pipe, args=(client, up), daemon=True)
     t.start()
     pipe(up, client)
@@ -457,18 +547,23 @@ PY
 # the host's local subnet (see the docker run comment). So the in-container
 # `spangap cli` reaches the device by connecting to host.docker.internal:<port>,
 # where this bridge — running on the Mac, the one machine actually on that LAN —
-# accepts and splices to the device. It forwards whatever endpoints are
-# configured in .spangap-ssh (ssh) and .spangap-tcp (TCP CLI). Darwin-only — on a
-# native Linux host the bridge network reaches the LAN directly, so it's a no-op.
+# accepts and splices to the device. It fronts the one device address
+# (.spangap-tcp) on both CLI ports — ssh (22) and the legacy TCP CLI (2323).
+# Darwin-only — on a native Linux host the bridge network reaches the LAN
+# directly, so it's a no-op.
 
-# bridge_specs: emit one "<dhost>:<port>" line per configured endpoint.
+# bridge_specs: emit a "<dhost>:<port>" line for each device port the container
+# needs to reach through the bridge — the two CLI ports (ssh, legacy TCP CLI) and
+# the two web ports (http, https/wss) that `spangap dev`'s in-container proxy
+# dials at host.docker.internal.
 bridge_specs() {
-    local f
-    for f in "$SSH_FILE" "$TCP_FILE"; do
-        [ -f "$f" ] || continue
-        case $f in *-ssh) parse_endpoint "$(cat "$f")" 22 ;; *) parse_endpoint "$(cat "$f")" 2323 ;; esac
-        printf '%s:%s\n' "$EP_HOST" "$EP_PORT"
-    done
+    local host
+    host=$(device_host) || return 0
+    [ -n "$host" ] || return 0
+    printf '%s:%s\n' "$host" "$SSH_PORT"
+    printf '%s:%s\n' "$host" "$TCP_CLI_PORT"
+    printf '%s:%s\n' "$host" "$HTTP_PORT"
+    printf '%s:%s\n' "$host" "$WSS_PORT"
 }
 
 # start_bridge: bring up (or refresh) the forwarder for the configured endpoints.
@@ -500,7 +595,13 @@ start_bridge() {
     nohup python3 "$FORWARD_SCRIPT" $specs >"$FORWARD_LOG" 2>&1 &
     local pid=$!
     printf '%s\n%s\n' "$pid" "$want" > "$FORWARD_PID"
-    log "LAN bridge up (pid $pid): host.docker.internal → $specs"
+    # Human-readable port list in numeric order: "22, 80, 443 and 2323".
+    local ports
+    # shellcheck disable=SC2086
+    ports=$(printf '%s\n' $specs | sed 's/.*://' | sort -n | awk '
+        {p[NR]=$0}
+        END {for (i=1;i<=NR;i++) s = s (i==1 ? "" : i==NR ? " and " : ", ") p[i]; print s}')
+    log "LAN bridge up, ports $ports forwarded to device"
 }
 
 # stop_bridge: tear the forwarder down (called on `spangap monitor` exit).
@@ -669,6 +770,26 @@ run_monitor() {
             [ -f "$e" ] && { elf=$e; break; }
         done
     fi
+    # esp-idf-monitor's Ctrl-T Ctrl-F ("Build & flash project") shells out to
+    # `<make> flash`, and Ctrl-T Ctrl-A to `<make> app-flash` — there's no
+    # `make` here. Point --make at a shim that requests a spangap reflash
+    # instead. The monitor holds the serial port, so a direct flash is
+    # impossible; the shim raises .spangap-flashme (exactly what `spangap flash`
+    # does against a busy port) and the monitor loop kills the monitor, flashes,
+    # and re-attaches. The build target esp-idf-monitor appends ('flash' /
+    # 'app-flash') is ignored — both mean "reflash" here.
+    local flash_shim="$SHIM_DIR/spangap-flash"
+    mkdir -p "$SHIM_DIR"
+    {
+        printf '%s\n' '#!/bin/bash'
+        printf '%s\n' '# AUTO-GENERATED by spangap-outside (run_monitor). esp-idf-monitor'
+        printf '%s\n' '# Ctrl-T Ctrl-F / Ctrl-T Ctrl-A -> request a spangap reflash. Runs on the'
+        printf '%s\n' '# host while the monitor owns the port, so it only raises the flashme'
+        printf '%s\n' '# signal; the monitor loop does the actual flash + re-attach.'
+        printf 'touch %q\n' "$workspace/.spangap-flashme"
+        printf '%s\n' 'echo "spangap: reflash requested — monitor will flash and re-attach."'
+    } > "$flash_shim"
+    chmod +x "$flash_shim"
     (
         # esp-idf-monitor calls os.getcwd() at import time (config loader);
         # if the user's shell is sitting in a since-deleted dir, that raises
@@ -685,7 +806,18 @@ run_monitor() {
         # || true is moot under exec; kept on the outer subshell. 2>/dev/null
         # absorbs any residual job-control chatter on platforms that emit it
         # despite the exec.
-        exec script -q "$fifo" "$VENV/bin/python" -m esp_idf_monitor -p "$port" ${extra} ${elf:+"$elf"}
+        #
+        # The inner `bash -c` scrubs esp-idf-monitor's two startup banner lines
+        # (the "esp-idf-monitor <ver> on <port>" and "Quit: … | Menu: … | Help:"
+        # notes) from the live view. They're written to the monitor's stderr, so
+        # we splice only stderr through grep — the device's own output (stdout)
+        # is untouched, and every other --- note (panic decode, flash status…)
+        # still passes through. The final `exec` keeps the monitor as the leaf
+        # process so kill_monitor's pkill pattern still matches it.
+        exec script -q "$fifo" bash -c '
+            exec "$@" 2> >(grep --line-buffered -vaE \
+                "^.{0,8}--- (esp-idf-monitor [0-9]|Quit: Ctrl)" >&2)
+        ' _ "$VENV/bin/python" -m esp_idf_monitor -p "$port" --make "$flash_shim" ${extra} ${elf:+"$elf"}
     ) 2>/dev/null || true
     # `script` puts the tty in raw mode; if it's killed by signal (see
     # kill_monitor) it doesn't always restore ONLCR etc. Re-sanitise so the
@@ -831,15 +963,11 @@ monitor_loop() {
         ) &
         local watcher=$!
 
-        if [ -n "$reset_flags" ]; then
-            if [ -n "$fw" ]; then
-                log "passive monitor (--no-reset; Ctrl-] exits, \`spangap flash\` re-flashes)"
-            else
-                log "passive monitor (--no-reset; Ctrl-] exits)"
-            fi
-        else
-            log "monitor (Ctrl-] exits, \`spangap flash\` re-flashes)"
+        log "Serial log, simply start typing for CLI. Ctrl-] exits."
+        if [ -n "$fw" ]; then
+            log "Leave this running, and use 'spangap flash' and 'spangap reset' in other windows"
         fi
+        log "use 'spangap log [-f]' to see/process log output"
         # Start a fresh logfile on every monitor (re)start — initial attach,
         # post-flash, or post-reset — so .spangap-log always reflects only the
         # current boot. run_monitor's perl redirect also opens $log with `>`,
@@ -955,8 +1083,8 @@ monitor)
             notool)      log "note: no xtensa addr2line found in the build-env container — backtraces won't decode" ;;
         esac
     fi
-    # The monitor owns the host-side bridge: bring it up for whatever endpoints
-    # are configured (.spangap-ssh / .spangap-tcp), and tear it down on exit
+    # The monitor owns the host-side bridge: bring it up for the device address
+    # (.spangap-tcp, on both CLI ports), and tear it down on exit
     # (Ctrl-], INT/TERM via monitor_loop's `exit 0`, or normal return all fire
     # the EXIT trap). Darwin-only inside start_bridge/stop_bridge.
     trap stop_bridge EXIT
@@ -1000,55 +1128,43 @@ probe)
     ;;
 cli)
     shift
+    # -h <host> (re)writes the device address. The port belongs to the transport,
+    # not the address, so set_device_host stores only the bare host.
     while [ $# -gt 0 ]; do
         case $1 in
             -h) [ $# -ge 2 ] || die "-h needs a hostname"
-                parse_endpoint "$2" 22
-                printf '%s:%s\n' "$EP_HOST" "$EP_PORT" > "$SSH_FILE"
-                shift 2 ;;
+                set_device_host "$2"; shift 2 ;;
             --) shift; break ;;
             *)  break ;;
         esac
     done
 
-    # ssh first, then the legacy TCP CLI, else bootstrap. On the host we sit on
-    # the device's LAN, so dial it directly — no host.docker.internal bridge
-    # (that's the in-container path).
-    if [ -f "$SSH_FILE" ]; then
-        parse_endpoint "$(cat "$SSH_FILE")" 22
-        exec ssh -p "$EP_PORT" \
-            -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-            -o ConnectTimeout=10 "$EP_HOST" "$@"
-    fi
+    # Foolproof, in order: a key, then ssh, then the legacy TCP CLI, then
+    # instructions, then ask for a working address. On the host we sit on the
+    # device's LAN, so dial it directly — no host.docker.internal bridge (that's
+    # the in-container path).
+    key="$HOME/.ssh/id_ed25519"
+    [ -f "$key" ] || { mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+        ssh-keygen -t ed25519 -N "" -f "$key" -q; }
 
-    if [ ! -f "$TCP_FILE" ]; then
-        # Bootstrap: generate a key (no passphrase, no prompts), ask for the
-        # device, persist .spangap-ssh, and print the line to authorize the key
-        # in the device serial monitor.
-        key="$HOME/.ssh/id_ed25519"
-        [ -f "$key" ] || { mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-            ssh-keygen -t ed25519 -N "" -f "$key" -q; }
-        printf 'spangap cli: device hostname or IP: ' >&2
-        read -r dhost
-        [ -n "$dhost" ] || die "no host entered"
-        parse_endpoint "$dhost" 22
-        printf '%s:%s\n' "$EP_HOST" "$EP_PORT" > "$SSH_FILE"
-        printf '\nWrote %s → %s:%s\n\n' ".spangap-ssh" "$EP_HOST" "$EP_PORT"
-        printf 'Now, in the device serial monitor, authorize this key:\n\n'
-        printf '    sshd add %s\n\n' "$(cat "$key.pub")"
-        printf 'sshd is enabled by default; on an older build also run: sshd enable\n'
-        printf 'If sshd is not in your build, rebuild with: spangap build --with spangap/sshd\n'
-        printf '\nThen re-run `spangap cli` to connect over ssh.\n'
-        exit 0
-    fi
+    host=$(device_host)
+    while :; do
+        # ssh in — one-shot `exec` with args, an interactive shell without. Probe
+        # auth first (a no-op remote `true`) so a failure can fall through rather
+        # than replacing this process.
+        if ssh -p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+               -o ConnectTimeout=10 "$host" true >/dev/null 2>&1; then
+            exec ssh -p "$SSH_PORT" -o BatchMode=yes \
+                -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$host" "$@"
+        fi
 
-    parse_endpoint "$(cat "$TCP_FILE")" 2323
-    host=$EP_HOST
-    cli_port=${SPANGAP_CLI_PORT:-$EP_PORT}
-    # Pure-Python TCP CLI — no docker, no IDF, just a socket. Mirrors the
-    # in-container `spangap cli` so dev experience is the same from either
-    # side.
-    exec python3 - "$host" "$cli_port" "$@" <<'PY'
+        # Legacy TCP CLI, if that socket answers.
+        if host_port_open "$host" "$TCP_CLI_PORT"; then
+            cli_port=${SPANGAP_CLI_PORT:-$TCP_CLI_PORT}
+            # Pure-Python TCP CLI — no docker, no IDF, just a socket. Mirrors the
+            # in-container `spangap cli` so dev experience is the same from either
+            # side.
+            exec python3 - "$host" "$cli_port" "$@" <<'PY'
 import os, socket, sys, selectors
 PROMPT = b"$ "
 host = sys.argv[1]
@@ -1099,6 +1215,33 @@ try:
 except KeyboardInterrupt:
     pass
 PY
+        fi
+
+        # ssh port open but the key was refused → authorize it on the device.
+        if host_port_open "$host" "$SSH_PORT"; then
+            printf '\nReached %s, but its sshd refused this key. In the device serial monitor, authorize it:\n\n' "$host" >&2
+            printf '    sshd add %s\n\n' "$(cat "$key.pub")" >&2
+            printf 'sshd ships enabled; on an older build also run: sshd enable\n' >&2
+            printf "If sshd isn't in your build, rebuild with: spangap build --with spangap/sshd\n" >&2
+            printf '\nThen re-run `spangap cli`.\n' >&2
+            exit 1
+        fi
+
+        # Neither CLI service answers. If the device pings it just needs sshd; if
+        # it's unreachable we likely have the wrong address — ask and retry.
+        if device_up "$host"; then
+            printf '\n%s is up, but neither ssh (%s) nor the TCP CLI (%s) answers.\n' "$host" "$SSH_PORT" "$TCP_CLI_PORT" >&2
+            printf 'Bring sshd up on the device (it ships enabled; older builds: `sshd enable`),\n' >&2
+            printf 'or rebuild with: spangap build --with spangap/sshd\n' >&2
+            exit 1
+        fi
+        printf "\nspangap cli: can't reach %s.\n" "$host" >&2
+        printf 'Device IP or hostname (blank to give up): ' >&2
+        read -r entry
+        [ -n "$entry" ] || exit 1
+        set_device_host "$entry"
+        host=$(device_host)
+    done
     ;;
 esac
 
@@ -1139,6 +1282,29 @@ ensure_daemon() {
         Linux)  die "docker daemon not reachable. Start it: doas service docker start  (or: sudo systemctl start docker)" ;;
         *)      die "docker daemon not reachable. Start your docker daemon and retry." ;;
     esac
+}
+
+# True if the container publishes the `spangap dev` port to the host. The mapping
+# is fixed at `docker run` time, so a container created before it existed must be
+# recreated — cheap and lossless, since all state lives in bind mounts.
+container_publishes_dev_port() {
+    local b
+    b=$(docker inspect --format \
+        '{{ index .HostConfig.PortBindings "'"$DEV_PORT"'/tcp" }}' \
+        "$container" 2>/dev/null) || b=""
+    case $b in ""|"<no value>"|"[]") return 1 ;; *) return 0 ;; esac
+}
+
+# The fixed host port a legacy container baked into its dev-port mapping, or ""
+# for the current ephemeral form (which records an empty HostPort in
+# HostConfig — Docker fills the real port in at start time, in NetworkSettings,
+# not here). Used to spot — and recreate — containers created by an older
+# spangap that pinned the host side to $DEV_PORT and so blocks every sibling
+# workspace. Ephemeral containers return "" and are left alone.
+dev_fixed_host_port() {
+    docker inspect --format \
+        '{{ with (index .HostConfig.PortBindings "'"$DEV_PORT"'/tcp") }}{{ (index . 0).HostPort }}{{ end }}' \
+        "$container" 2>/dev/null
 }
 
 ensure_container() {
@@ -1194,16 +1360,28 @@ ensure_container() {
                 # Also recreate if .spangap-straddles changed since the
                 # container was started — the bind mount for the straddles
                 # checkout is baked in at `docker run` time.
-                local stored_sd
+                local stored_sd why=""
                 stored_sd=$(docker inspect --format \
                     '{{ index .Config.Labels "org.spangap.straddles" }}' \
                     "$container" 2>/dev/null) || stored_sd=""
-                if [ "$straddles" = "$stored_sd" ]; then
+                [ "$straddles" = "$stored_sd" ] \
+                    || why=".spangap-straddles changed since container start"
+                if ! container_publishes_dev_port; then
+                    [ -n "$why" ] && why="$why; the dev port is unpublished" \
+                                  || why="the dev port ($DEV_PORT) is unpublished"
+                elif [ "$(dev_fixed_host_port)" = "$DEV_PORT" ]; then
+                    # Legacy container pinned the host side to $DEV_PORT, which
+                    # blocks every other workspace. Recreate it onto an ephemeral
+                    # host port to release the fixed one.
+                    [ -n "$why" ] && why="$why; the dev port uses a fixed host mapping" \
+                                  || why="the dev port uses a fixed host mapping ($DEV_PORT)"
+                fi
+                if [ -z "$why" ]; then
                     return 0
                 fi
                 announce_container_setup
                 [ -z "$SPANGAP_QUIET" ] \
-                    && log ".spangap-straddles changed since container start — recreating"
+                    && log "recreating container: $why"
                 docker rm -f "$container" >/dev/null
             else
                 announce_container_setup
@@ -1271,7 +1449,22 @@ ensure_container() {
     # The workspace mounts UNDER the persistent home (/home/spangap) at its
     # basename; Docker orders nested bind mounts by depth, so /home/spangap
     # lands first and $container_ws on top of it regardless of -v order.
+    # Publish the `spangap dev` port to the host loopback so the Quasar dev
+    # server (bound 0.0.0.0:$DEV_PORT inside) is reachable from this machine's
+    # browser — the one host→container path Docker Desktop gives us without host
+    # networking. Loopback-only: the dev SPA is for this machine's browser; it
+    # reaches the device over the LAN itself via the ?host= address.
+    #
+    # Empty host port (the `127.0.0.1::$DEV_PORT` form, note the double colon) —
+    # Docker assigns a free ephemeral host port per container. The mapping lives
+    # for the container's whole life (sleep infinity), not just while `spangap
+    # dev` runs; a FIXED host port would therefore wedge every other workspace's
+    # container ("Bind for 127.0.0.1:$DEV_PORT failed: port is already
+    # allocated") for as long as this one idles. Ephemeral sidesteps that — each
+    # workspace gets its own port and they never collide. `spangap dev` reads the
+    # assigned port back (see the dev verb) to build the browser URL.
     docker run -d --name "$container" \
+        -p "127.0.0.1::$DEV_PORT" \
         -v "$spangap_home:/home/spangap" \
         -v "$workspace:$container_ws" \
         ${straddles_mount[@]+"${straddles_mount[@]}"} \
@@ -1575,6 +1768,40 @@ build)
     rc=$?
     set -e
     exit "$rc"
+    ;;
+dev)
+    # Run the project's Quasar dev server inside the container (published to an
+    # ephemeral host port) and open it in the OS browser. The page is served hot
+    # by Vite; it drives the real device over wss via the ?host= address. Streams
+    # the dev console here until you quit it.
+    shift
+    # Peek a leading `-h <host>` so the browser URL and the persisted address
+    # match what the in-container `spangap dev` resolves; forward args unchanged.
+    if [ "${1:-}" = "-h" ] && [ -n "${2:-}" ]; then
+        set_device_host "$2"
+    fi
+    # Same-origin URL — the dev server reverse-proxies the device (see
+    # quasar.config.ts), so there's no ?host= to pass; the page IS the device as
+    # far as the browser's cookie/auth are concerned. The host port is ephemeral
+    # (see ensure_container's docker run), so ask Docker which one this
+    # container landed on; fall back to $DEV_PORT only if the lookup comes up
+    # empty (e.g. an unexpectedly old container).
+    dev_port=$(docker port "$container" "$DEV_PORT/tcp" 2>/dev/null \
+                 | awk -F: 'NR==1 {print $NF; exit}')
+    [ -n "$dev_port" ] || dev_port=$DEV_PORT
+    url="http://localhost:$dev_port/"
+    log "opening $url shortly"
+    # Dead simple: give the dev server a couple seconds, then open. No port probe
+    # — on a cold first compile the page may be briefly blank, and Vite reloads
+    # to the ready app on its own. The opener exits fast, so nothing lingers.
+    ( sleep 2; open_url "$url" ) &
+    # Hand the in-container `spangap dev` the real host-facing URL (it binds
+    # 0.0.0.0:$DEV_PORT inside and can't see the host's ephemeral mapping) so its
+    # "Browse to: …" line matches what we actually open.
+    # shellcheck disable=SC2086
+    exec docker exec $exec_flags -e SPANGAP_WORKSPACE="$container_ws" \
+        -e SPANGAP_DEV_URL="$url" \
+        --workdir "$container_cwd" "$container" spangap dev "$@"
     ;;
 shell)
     # Synonym for `spangap docker bash` — an interactive bash in the

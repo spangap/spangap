@@ -1883,9 +1883,22 @@ def cmd_list_deps(args: argparse.Namespace) -> int:
 
     One spec per line; nothing else on stdout — parsed by host-side
     `spangap get-deps` orchestrator in spangap-outside.
+
+    --with/--without mirror the build's selection so the walk resolves the same
+    closure the build will. The --with seeds matter most: a --with straddle's
+    additional_installs are only reachable when that straddle is a walk root,
+    so without them the loop never clones e.g. hw-tdeck's spangap-lcd and the
+    build silently drops it (soft + absent). Slash-form --with names may not be
+    in the workspace yet on the first pass — the host pre-clones them before
+    list-deps runs, but a bare-form name that's still absent resolves to itself.
     """
     proj = find_project()
-    _, missing = resolve_requires(proj, scan_workspace_straddles(), missing_ok=True)
+    all_straddles = scan_workspace_straddles()
+    included = {_resolve_org_repo(r, all_straddles, "--with") for r in (args.include or [])}
+    excluded = {_resolve_org_repo(r, all_straddles, "--without") for r in (args.exclude or [])}
+    _, missing = resolve_requires(
+        proj, all_straddles, missing_ok=True, included=included, excluded=excluded
+    )
     for spec in missing:
         print(spec)
     return 0
@@ -2560,10 +2573,27 @@ def main(argv: list[str] | None = None) -> int:
         help="list the project straddle and its dependencies in initialization order",
     ).set_defaults(func=cmd_show)
 
-    sub.add_parser(
+    p_ld = sub.add_parser(
         "list-deps",
         help="print transitive requires: not yet present as workspace siblings (used by host-side `spangap get-deps`)",
-    ).set_defaults(func=cmd_list_deps)
+    )
+    # The host fetch loop forwards the build's selection so the missing-walk
+    # sees what the build will: a --with straddle's additional_installs are
+    # only reachable when that straddle seeds the walk as a root. Without this,
+    # `build --with hw-tdeck` never clones hw-tdeck's additional_installs (e.g.
+    # spangap-lcd) — the build then silently drops them as soft-and-absent.
+    p_ld.add_argument(
+        "-w", "--with", dest="include", action="append", default=[], metavar="STRADDLE",
+        help="seed the missing-walk with an extra --with straddle (repeatable; "
+             "<org>/<repo> or bare <repo>), so its additional_installs are "
+             "reported for cloning too.",
+    )
+    p_ld.add_argument(
+        "-x", "--without", dest="exclude", action="append", default=[], metavar="STRADDLE",
+        help="mirror the build's --without so the missing-walk matches what the "
+             "build will resolve (repeatable).",
+    )
+    p_ld.set_defaults(func=cmd_list_deps)
 
     sub.add_parser(
         "list-requires",

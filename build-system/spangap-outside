@@ -1555,8 +1555,28 @@ prefetch_explicit_includes() {
     done
 }
 
+# emit_selection_flags ARGS...: echo the --with/--without flags from a build
+# argv (one token per line), so they can be forwarded to `list-deps`. Only the
+# selection flags matter to the missing-walk; the target/idf-args are dropped.
+# A --with straddle's additional_installs are reachable by list-deps ONLY when
+# the straddle seeds the walk, so these MUST reach list-deps or transitive
+# soft deps (e.g. hw-tdeck's spangap-lcd) never get cloned.
+emit_selection_flags() {
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -w|--with|-x|--without)
+                [ $# -ge 2 ] && { printf '%s\n%s\n' "$1" "$2"; shift; } ;;
+            -w=*|--with=*) printf '%s\n%s\n' "--with" "${1#*=}" ;;
+            -x=*|--without=*) printf '%s\n%s\n' "--without" "${1#*=}" ;;
+        esac
+        shift
+    done
+}
+
+# fetch_missing_deps CONTAINER_CWD [list-deps selection flags...]: trailing args
+# are forwarded verbatim to `spangap list-deps` (its --with/--without).
 fetch_missing_deps() {
-    local container_cwd=$1
+    local container_cwd=$1; shift
     while :; do
         local missing
         # set -e silently swallows `x=$(failing_cmd)` failures, so we
@@ -1564,7 +1584,7 @@ fetch_missing_deps() {
         # docker exec's own stderr is left alone so the user sees the
         # actual failure (e.g. OCI "container breakout" from a stale mount)
         # before the die line below.
-        missing=$(docker exec -e SPANGAP_WORKSPACE="$container_ws" --workdir "$container_cwd" "$container" spangap list-deps) \
+        missing=$(docker exec -e SPANGAP_WORKSPACE="$container_ws" --workdir "$container_cwd" "$container" spangap list-deps "$@") \
             || die "spangap list-deps failed in container $container (see error above)"
         [ -z "$missing" ] && return 0
         for spec in $missing; do
@@ -1669,7 +1689,18 @@ get-deps)
     # works from the workspace root, resolving the cwd straddle or the last
     # build's target (.spangap-build) via require_straddle.
     container_cwd=$(host_to_container "$proj")
-    fetch_missing_deps "$container_cwd"
+    # Standalone get-deps has no argv selection — the last build's --with set
+    # lives in .spangap-build, so feed it to list-deps the same way the build
+    # path does (else a remembered --with straddle's additional_installs, e.g.
+    # hw-tdeck's spangap-lcd, are never fetched).
+    gd_flags=""
+    for inc in $(remembered_build_includes); do
+        gd_flags="$gd_flags
+--with
+$inc"
+    done
+    # shellcheck disable=SC2086  # tokens are simple org/repo names + flags
+    fetch_missing_deps "$container_cwd" $gd_flags
     log "get-deps done — all requires: present"
     exit 0
     ;;
@@ -1737,7 +1768,20 @@ build)
         container_cwd="$container_ws"
     fi
 
-    fetch_missing_deps "$container_cwd"
+    # Forward this build's selection to list-deps so its missing-walk sees the
+    # same closure the build will resolve — crucially the --with straddles,
+    # whose additional_installs are otherwise unreachable (and so never cloned).
+    # On a bare replay the selection lives in .spangap-build, not argv.
+    sel_flags=$(emit_selection_flags "$@")
+    if [ -n "$use_remembered" ]; then
+        for inc in $(remembered_build_includes); do
+            sel_flags="$sel_flags
+--with
+$inc"
+        done
+    fi
+    # shellcheck disable=SC2086  # tokens are simple org/repo names + flags
+    fetch_missing_deps "$container_cwd" $sel_flags
     # Quiet-by-default + the -v|--verbose flag now live in spangap-inside, so
     # the in-container build behaves the same however it's reached. We just
     # forward argv unchanged (including -v) and hand the build the host's

@@ -1615,6 +1615,72 @@ def cmd_autoconfig(args: argparse.Namespace) -> int:
     return 0
 
 
+def measure_build_sizes(build_dir: Path) -> tuple[int, int]:
+    """(app_bytes, fixed_bytes) from a completed build, for shrink-wrapping.
+
+    A small headroom margin is added to each so ordinary build-to-build growth
+    doesn't overflow the (cached) partition before the next measure pass: app
+    rounds to 64 K with +128 K margin; fixed sums each file rounded up to a 4 K
+    LittleFS block + 64 K metadata/headroom. 0 = couldn't measure (skip shrink).
+    """
+    app_bytes = 0
+    pd = build_dir / "project_description.json"
+    if pd.exists():
+        try:
+            app_bin = json.loads(pd.read_text()).get("app_bin", "")
+            p = build_dir / app_bin if app_bin else None
+            if p and p.exists():
+                app_bytes = p.stat().st_size + 0x20000      # +128 K headroom
+        except (ValueError, OSError):
+            pass
+    fixed_bytes = 0
+    merged = build_dir / "data_merged"
+    if merged.is_dir():
+        total = 0
+        for f in merged.rglob("*"):
+            if f.is_file():
+                try:
+                    total += (f.stat().st_size + 0xFFF) & ~0xFFF   # round to 4 K
+                except OSError:
+                    pass
+        if total:
+            fixed_bytes = total + 0x10000                   # +64 K metadata/headroom
+    return app_bytes, fixed_bytes
+
+
+def print_partition_layout(csv_path: Path) -> None:
+    """Print the flash partition layout from a generated partitions.csv.
+
+    `state` is created at runtime (fs.cpp) in the upper half of flash, so it is
+    not in the table — this reports only what ships in the floor image.
+    """
+    if not csv_path.exists():
+        return
+    rows: list[tuple[str, str, int, int]] = []
+    for raw in csv_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        cols = [c.strip() for c in line.split(",")]
+        if len(cols) < 5:
+            continue
+        try:
+            rows.append((cols[0], cols[2], int(cols[3], 0), int(cols[4], 0)))
+        except ValueError:
+            continue
+    if not rows:
+        return
+
+    def human(n: int) -> str:
+        return f"{n/1024:.0f}K" if n < 1024 * 1024 else f"{n/1024/1024:.2f}M"
+
+    end = max(o + s for _, _, o, s in rows)
+    print("partitions (floor image; /state created at runtime):")
+    for name, sub, off, sz in rows:
+        print(f"  {name:<10} {sub:<8} {off:#010x} {sz:#010x}  {human(sz):>7}")
+    print(f"  {'image end':<10} {'':<8} {end:#010x}            {human(end):>7} used")
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     all_straddles = scan_workspace_straddles()
 
@@ -1731,9 +1797,36 @@ def cmd_build(args: argparse.Namespace) -> int:
         "SPANGAP_BUILD_VERSION": proj.version,
         "SPANGAP_BUILD_ARGS": getattr(args, "spangap_invocation", "") or "spangap build",
     }
-    return run_build_idf(
+    rc = run_build_idf(
         idf_args or ["build"], cwd=proj.firmware_dir, quiet=quiet, env=build_env
     )
+    # On a successful plain build, shrink-wrap app/fixed to the measured app .bin
+    # + data sizes: cache them in build/.spangap-sizes (read by bootstrap.cmake)
+    # and, if they differ from what this build was configured with, rebuild once
+    # so IDF regenerates the partition table, flash offsets, and littlefs image
+    # consistently for the real sizes. Steady-state rebuilds measure the same
+    # values and stay single-pass. Then print the resulting layout.
+    if rc == 0 and (not idf_args or idf_args == ["build"]):
+        build_dir = proj.firmware_dir / "build"
+        app_b, fixed_b = measure_build_sizes(build_dir)
+        if app_b:
+            sizes_file = build_dir / ".spangap-sizes"
+            new = f"app={app_b}\nfixed={fixed_b}\n"
+            old = sizes_file.read_text() if sizes_file.exists() else ""
+            if new != old:
+                sizes_file.write_text(new)
+                # Force a reconfigure so bootstrap.cmake re-reads the sizes:
+                # partitions.csv is a CMake configure-dependency (partition_table
+                # component), so bumping its mtime retriggers configure reliably
+                # even on the first build (where .spangap-sizes didn't yet exist).
+                (proj.firmware_dir / "partitions.csv").touch()
+                print("spangap: shrink-wrapping partitions to measured sizes "
+                      "— rebuilding once", file=sys.stderr)
+                rc = run_build_idf(idf_args or ["build"], cwd=proj.firmware_dir,
+                                   quiet=quiet, env=build_env)
+        if rc == 0:
+            print_partition_layout(proj.firmware_dir / "partitions.csv")
+    return rc
 
 
 def cmd_flash(args: argparse.Namespace) -> int:

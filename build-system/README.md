@@ -91,7 +91,7 @@ container these verbs work directly, with the IDF env already set up:
 | `spangap cli [-h host] [<cmd>]` | talk to a running device over the network (ssh, else TCP CLI) |
 | `spangap flash` | **signal only** — touches `.spangap-flashme` (workspace root) and waits ≤5s for a host monitor to consume it (see below) |
 | `spangap reset` | **signal only** — touches `.spangap-resetme` (workspace root) and waits ≤5s for a host monitor to consume it; the monitor restarts with a device reset (clean reboot + boot-log capture), no reflash |
-| `spangap log [-f]` | print the device serial log (`.spangap-log`), reading **past the stale bind-mount cache** (a plain `cat`/`tail` freezes — see below); `-f` follows like `tail -f` and survives flash/reset truncations |
+| `spangap log [-f]` | print the device serial log (`.spangap-log`); streamed from the host monitor's relay (`host.docker.internal:2324`) because the bind mount is stale inside the container (a plain `cat`/`tail` — and even `O_DIRECT` — freeze; see below); `-f` follows like `tail -f` and survives flash/reset truncations |
 
 **`spangap flash` / `spangap reset` / `spangap cli` from in here don't touch hardware
 directly** — the
@@ -150,14 +150,29 @@ it isn't up (or isn't in the project dir) — ask the user to (re)start it there
 the serial output to **`.spangap-log` at the workspace root** — it's on the bind mount
 (`<workspace>/.spangap-log` in here). **This is your only window into the device — use it.**
 
-⚠️ **Read it with `spangap log` (or `spangap log -f`), NOT `cat`/`tail -f`.** The host
-holds the file open and appends to it; the bind mount serves the container a **stale
-cached snapshot** of an open-and-appended file, so `cat`/`tail`/`stat`/`wc` freeze at an
-old size and silently miss the newest lines (even `stat` reports the stale size — this is
-not a flush delay, it does not catch up). `spangap log` reads with `O_DIRECT` to bypass
-that cache and always yields the true current contents; `-f` follows it and survives the
-truncation on flash/reset. (Dentry ops like `.spangap-flashme` propagate fine; only
-growing-content does not — so only the log is affected.)
+⚠️ **Read it with `spangap log` (or `spangap log -f`), NOT `cat`/`tail -f`.** The file
+itself is **unreadable from inside the container** on Docker Desktop: the host holds it open
+and appends, but the bind mount is **virtiofs with `keep_cache`**, so the container's cached
+inode freezes at the size the file had when the monitor truncated it (0). Every in-container
+reader — `cat`/`tail`/`stat`/`wc` and even `O_DIRECT`, `statx(FORCE_SYNC)`, `fadvise`,
+`readdir`, and a `remount` — serves that stale size and stops reading at it, so the log
+looks empty even though the bytes are on disk (`stat` shows `Size: 0` but nonzero
+`Blocks:`). It is **not a flush delay and does not catch up**, and there is no way to bust
+the cache from inside the container.
+
+So `spangap log` doesn't read the file from in here — it streams the log over the network
+instead. `spangap monitor` runs a small **serial-log relay** on the host (a TCP server in
+the same host-side bridge that forwards the device ports — see `start_bridge`/`serve_log` in
+`spangap-outside`, bound to `:2324`, `$SPANGAP_LOG_PORT`). In-container `spangap log`
+connects to it at `host.docker.internal:2324`, sends `ONCE` (dump) or `FOLLOW` (`-f`,
+`tail -f` style, survives the flash/reset truncation with a `--- log reset ---` marker), and
+prints what the host reads natively (always fresh). This works **the same from the host and
+from inside the container** — both go through the relay. If the relay is unreachable
+(`spangap monitor` not running, or a native-Linux host with no relay), `spangap log` falls
+back to a direct read of the bind-mounted file: authoritative on native Linux (the mount is
+coherent there), and on Docker Desktop it prints a "relay unreachable — is monitor running?"
+note since that read will be stale. (Dentry ops like `.spangap-flashme` propagate fine; only
+growing-content does not — so only the log needs the relay.)
 
 In particular `spangap log` is where you check:
 

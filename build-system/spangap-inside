@@ -73,6 +73,10 @@ SSH_PORT = 22         # device sshd (the spangap/sshd straddle)
 TCP_CLI_PORT = 2323   # legacy TCP CLI socket (builds without sshd)
 WSS_PORT = 443        # device TLS — what the browser SPA dials (?port= default)
 DEV_PORT = 9000       # `spangap dev` quasar dev server (published by the container)
+# Host-side serial-log relay served by the monitor's bridge (see cmd_log). Not
+# a device port; reached at host.docker.internal:LOG_PORT. Must match the host
+# LOG_PORT — spangap-outside passes it through on every docker exec.
+LOG_PORT = int(os.environ.get("SPANGAP_LOG_PORT", "2324"))
 # Canonical assistant-instructions file, baked into the image (Dockerfile) and
 # seeded into the workspace as CLAUDE.md on first `spangap claude`.
 README_PATH = Path("/usr/local/share/spangap/README.md")
@@ -1916,16 +1920,75 @@ def _read_direct(path: Path) -> bytes:
         os.close(fd)
 
 
+def _log_from_relay(follow: bool) -> bool:
+    """Stream the serial log from the host monitor's relay at
+    host.docker.internal:LOG_PORT (see serve_log in spangap-outside's bridge).
+
+    Returns True once it has connected and streamed (the normal path on Docker
+    Desktop). Returns False without emitting if the relay can't be reached —
+    host.docker.internal doesn't resolve (native-Linux host, where the bind
+    mount is coherent and a direct read works), or it resolves but nothing is
+    listening (no `spangap monitor` running) — so the caller can fall back.
+    """
+    try:
+        socket.getaddrinfo("host.docker.internal", LOG_PORT)
+    except OSError:
+        return False  # not Docker Desktop — no relay; caller reads the file
+    try:
+        s = socket.create_connection(("host.docker.internal", LOG_PORT),
+                                      timeout=5)
+    except OSError:
+        return False  # relay down (no monitor) — caller reads the file
+    try:
+        s.settimeout(None)
+        s.sendall(b"FOLLOW\n" if follow else b"ONCE\n")
+        out = sys.stdout.buffer
+        while True:
+            data = s.recv(65536)
+            if not data:
+                break
+            out.write(data)
+            out.flush()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        s.close()
+    return True
+
+
 def cmd_log(args: argparse.Namespace) -> int:
     """Print the device serial log captured by the host `spangap monitor`.
 
-    Reads $workspace/.spangap-log with O_DIRECT so it reflects the host's
-    latest appends — a plain cat/tail freezes on the bind mount's stale cache
-    (see _read_direct). With -f, follows the file (re-reading fresh each poll),
-    emitting new bytes until interrupted; resets cleanly when the host
-    truncates/recreates the file on flash/reset.
+    The monitor appends the live log to $workspace/.spangap-log on the host. On
+    Docker Desktop that file is UNREADABLE from inside the container: the bind
+    mount is virtiofs with keep_cache, so while the host holds the file open and
+    appends, the container's cached inode freezes at the size it had when
+    monitor truncated it (0). No in-container read — cat/tail/stat, O_DIRECT,
+    statx(FORCE_SYNC), fadvise, readdir, remount — gets past that stale size.
+
+    So we don't read the file here; we connect to the host monitor's serial-log
+    relay (host.docker.internal:LOG_PORT, served by the same bridge that
+    forwards the device ports) and stream the real bytes. Only if the relay is
+    unreachable do we fall back to a direct read — correct on a native-Linux
+    host (coherent bind mount), and on Docker Desktop a clear signal that the
+    monitor isn't running.
     """
+    if _log_from_relay(args.follow):
+        return 0
+
     path = WORKSPACE / ".spangap-log"
+    # Relay unreachable. On Docker Desktop (host.docker.internal resolves) that
+    # means no monitor is running and the direct read below will be stale/empty,
+    # so say so; on native Linux the relay simply doesn't exist and the read is
+    # authoritative, so stay quiet.
+    try:
+        socket.getaddrinfo("host.docker.internal", LOG_PORT)
+        print(f"spangap: serial-log relay (host.docker.internal:{LOG_PORT}) "
+              "unreachable — is `spangap monitor` running on the host? "
+              "Showing the (stale) bind-mounted file.", file=sys.stderr)
+    except OSError:
+        pass
+
     if not args.follow:
         sys.stdout.buffer.write(_read_direct(path))
         sys.stdout.flush()
@@ -2653,7 +2716,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_log = sub.add_parser(
         "log",
-        help="print the device serial log ($workspace/.spangap-log), reading past the stale bind-mount cache (-f to follow)",
+        help="print the device serial log captured by `spangap monitor` (streamed from the host relay; -f to follow)",
     )
     p_log.add_argument(
         "-f", "--follow", action="store_true",

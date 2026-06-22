@@ -337,6 +337,13 @@ HTTP_PORT=80        # device web (plain HTTP)
 WSS_PORT=443        # device web — TLS/wss (https), what `spangap dev` proxies to
 DEV_PORT=9000       # `spangap dev` quasar dev server bind port inside the container
                     # (mapped to an ephemeral host port — see ensure_container)
+# Host-side serial-log relay (see serve_log in the bridge). NOT a device port: a
+# host-local TCP server the bridge runs so the in-container `spangap log` can
+# read the live log over host.docker.internal — the workspace bind mount is
+# stale inside the container (Docker Desktop virtiofs+keep_cache freezes the
+# .spangap-log inode at 0 bytes). Overridable to dodge a host port clash; the
+# in-container side reads the same SPANGAP_LOG_PORT (passed on every docker exec).
+LOG_PORT=${SPANGAP_LOG_PORT:-2324}
 
 # Host-side LAN bridge (see start_bridge). Script is workspace-wide (static
 # content); pid/log are per-host since the bridge is a host-local process — a
@@ -480,7 +487,7 @@ open_url() {
 # relay to a device already on the LAN, so it widens nothing. Threads, no deps.
 write_forward_script() {
     cat > "$FORWARD_SCRIPT" <<'PY'
-import socket, sys, threading, signal
+import os, socket, sys, threading, signal, time
 
 def pipe(src, dst):
     try:
@@ -530,6 +537,68 @@ def serve(lport, dhost, dport):
         threading.Thread(target=handle, args=(client, dhost, dport),
                          daemon=True).start()
 
+# Serial-log relay. The host monitor appends the live serial log to `path`
+# (native FS = always fresh here); the container can't read it through the
+# stale virtiofs bind mount, so it connects here instead. Protocol: the client
+# sends one line — "FOLLOW" to stream forever (tail -f), anything else for a
+# one-shot dump — then we write the file contents and (if following) keep
+# emitting appended bytes. On truncation (flash/reset shrinks the file) we
+# restart from 0 and inject a reset marker, mirroring in-container cmd_log.
+def serve_log_client(client, path):
+    try:
+        client.settimeout(10)
+        req = b""
+        while b"\n" not in req and len(req) < 64:
+            d = client.recv(64)
+            if not d:
+                break
+            req += d
+        follow = req.strip().upper().startswith(b"FOLLOW")
+        client.settimeout(None)
+        emitted = 0
+        while True:
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                data = b""
+            if len(data) < emitted:                      # truncated on flash/reset
+                emitted = 0
+                client.sendall(b"spangap: --- log reset (device reflashed/reset) ---\n")
+            if len(data) > emitted:
+                client.sendall(data[emitted:])
+                emitted = len(data)
+            if not follow:
+                break
+            time.sleep(0.5)
+    except OSError:
+        pass
+    finally:
+        try: client.close()
+        except OSError: pass
+
+def serve_log(lport, path):
+    # 0.0.0.0 for the same reason the device relays bind it: Docker Desktop's
+    # host.docker.internal gateway can't reach a loopback-only listener. Same
+    # LAN exposure as those relays — the serial log is now readable by anything
+    # on the dev LAN while monitor runs. Acceptable for a dev tool on a trusted
+    # network; if that ever matters, front it with a token.
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("0.0.0.0", lport))
+    except OSError as e:
+        print(f"spangap-forward: bind log :{lport}: {e}", flush=True)
+        return
+    srv.listen(16)
+    while True:
+        try:
+            client, _ = srv.accept()
+        except OSError:
+            return
+        threading.Thread(target=serve_log_client, args=(client, path),
+                         daemon=True).start()
+
 # Each arg is "<dhost>:<port>" — listen on :port, splice to dhost:port.
 specs = []
 for a in sys.argv[1:]:
@@ -537,7 +606,11 @@ for a in sys.argv[1:]:
     specs.append((dhost, int(p)))
 for dhost, p in specs:
     threading.Thread(target=serve, args=(p, dhost, p), daemon=True).start()
-print(f"spangap-forward: relaying {specs}", flush=True)
+log_port = int(os.environ.get("SPANGAP_LOG_PORT", "0"))
+log_file = os.environ.get("SPANGAP_LOG_FILE", "")
+if log_port and log_file:
+    threading.Thread(target=serve_log, args=(log_port, log_file), daemon=True).start()
+print(f"spangap-forward: relaying {specs}, log :{log_port}", flush=True)
 signal.pause()
 PY
 }
@@ -573,8 +646,11 @@ start_bridge() {
     [ "$(uname -s 2>/dev/null)" = Darwin ] || return 0
     local specs want
     specs=$(bridge_specs | tr '\n' ' '); specs=${specs% }
-    [ -z "$specs" ] && return 0          # nothing configured yet
-    want=$specs
+    # Unlike the device forwards (which need a configured address), the
+    # serial-log relay always runs — it's how the in-container `spangap log`
+    # reads the log monitor is producing right now — so we launch even with an
+    # empty spec set. want folds in the log port so a change there restarts too.
+    want="$specs|log:$LOG_PORT"
 
     if [ -f "$FORWARD_PID" ]; then
         local pid have
@@ -592,16 +668,21 @@ start_bridge() {
     }
     write_forward_script
     # shellcheck disable=SC2086
-    nohup python3 "$FORWARD_SCRIPT" $specs >"$FORWARD_LOG" 2>&1 &
+    SPANGAP_LOG_PORT="$LOG_PORT" SPANGAP_LOG_FILE="$workspace/.spangap-log" \
+        nohup python3 "$FORWARD_SCRIPT" $specs >"$FORWARD_LOG" 2>&1 &
     local pid=$!
     printf '%s\n%s\n' "$pid" "$want" > "$FORWARD_PID"
-    # Human-readable port list in numeric order: "22, 80, 443 and 2323".
-    local ports
-    # shellcheck disable=SC2086
-    ports=$(printf '%s\n' $specs | sed 's/.*://' | sort -n | awk '
-        {p[NR]=$0}
-        END {for (i=1;i<=NR;i++) s = s (i==1 ? "" : i==NR ? " and " : ", ") p[i]; print s}')
-    log "LAN bridge up, ports $ports forwarded to device"
+    if [ -n "$specs" ]; then
+        # Human-readable port list in numeric order: "22, 80, 443 and 2323".
+        local ports
+        # shellcheck disable=SC2086
+        ports=$(printf '%s\n' $specs | sed 's/.*://' | sort -n | awk '
+            {p[NR]=$0}
+            END {for (i=1;i<=NR;i++) s = s (i==1 ? "" : i==NR ? " and " : ", ") p[i]; print s}')
+        log "LAN bridge up, ports $ports forwarded to device; serial log on :$LOG_PORT"
+    else
+        log "serial-log relay up on :$LOG_PORT for in-container \`spangap log\`"
+    fi
 }
 
 # stop_bridge: tear the forwarder down (called on `spangap monitor` exit).
@@ -1867,6 +1948,9 @@ esac
 
 # Anything outside doesn't understand goes through the in-container spangap
 # wrapper, which sources IDF env then dispatches via the Python CLI.
+# SPANGAP_LOG_PORT lets the in-container `spangap log` find the host monitor's
+# serial-log relay (it must match the port start_bridge bound on the host).
 # shellcheck disable=SC2086
 exec docker exec $exec_flags -e SPANGAP_WORKSPACE="$container_ws" \
+    -e SPANGAP_LOG_PORT="$LOG_PORT" \
     --workdir "$container_cwd" "$container" spangap "$@"

@@ -4,9 +4,9 @@ This is a spangap workspace directory. It's where spangap projects get assembled
 can't do without the host, and how to help with the real job — **writing and
 maintaining straddles**.
 
-The firmware/browser code map is [`../spangap-core/CLAUDE.md`](../spangap-core/CLAUDE.md);
-the design *why* + full gotcha list is [`INTERNALS.md`](INTERNALS.md). This file is
-the container-side map.
+The firmware/browser code map is [`../spangap-core/README.md`](../spangap-core/README.md)
+and its [`docs/`](../spangap-core/docs/); the design *why* + full gotcha list is
+[`INTERNALS.md`](INTERNALS.md). This file is the container-side map.
 
 ## Where you are
 
@@ -431,7 +431,7 @@ DRAM.
 
 - [INTERNALS.md](INTERNALS.md) — staging/gating internals, the rejected alternatives,
   ITS/storage/recipes, full gotcha list.
-- [../spangap-core/CLAUDE.md](../spangap-core/CLAUDE.md) + [../spangap-core/docs/](../spangap-core/docs/)
+- [../spangap-core/README.md](../spangap-core/README.md) + [../spangap-core/docs/](../spangap-core/docs/)
   — firmware/browser code map and subsystem deep-dives.
 - [README.md](README.md) / [CONTRIBUTING.md](CONTRIBUTING.md) — host install story; DCO sign-off
   (`git commit -s`, enforced by `.github/workflows/dco.yml`).

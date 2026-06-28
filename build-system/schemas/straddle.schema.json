@@ -156,6 +156,155 @@
         "pattern": "^(CONFIG_[A-Z0-9_]+=.+|# CONFIG_[A-Z0-9_]+ is not set)$"
       },
       "default": []
+    },
+    "settings": {
+      "description": "Declarative settings panels — one descriptor per settings pane. spangap-inside lowers each panel into THREE generated surfaces from this single source: (1) the on-device LCD pane (lcdRegisterSettings + lcdSetting* calls, gated on spangap-lcd being staged), (2) the browser panel (serialized as a JSON descriptor inlined into straddles.gen.ts and rendered at runtime by spangap-web's GeneratedPanel.vue, registered through the menu store), and (3) the persisted storage defaults (storageDefault() for every row carrying a `default:` whose key starts with `s.`). This replaces the three-way hand-duplication of a setting across a *_lcd.cpp pane fn, a *Panel.vue, and scattered storageDefault() calls. A straddle declaring a settings: block deletes those three copies. Custom interaction flows, computed/conditional rows, and rich live-status panels stay hand-written (register a pane the old way) — the descriptor is for the static rows. The default-seeding is emitted into the firmware init band (runs on headless/web-only builds too), the LCD pane only when spangap-lcd is staged.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/settingsPanel" },
+      "default": []
+    }
+  },
+  "$defs": {
+    "settingsPanel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["menu", "rows"],
+      "properties": {
+        "web": {
+          "type": "boolean",
+          "description": "Whether to generate the browser-side GeneratedPanel for this block (default true). Set false when the straddle ships a hand-written *Panel.vue at the same menu leaf — rich custom UI (array editors, secret fields, computed status, autocomplete) a static descriptor can't express. With web:false the LCD pane and storage defaults are still generated from this block; only the web surface is opted out, so the hand-written panel keeps owning the leaf and is not overwritten."
+        },
+        "menu": {
+          "description": "The panel's location, as an ordered list of path segments from the Settings root to the leaf (the last segment is the leaf, the rest are containers). A single segment is a top-level pane sitting at the Settings root (no container), matching a hand-written lcdRegisterSettings(\"Maps\", ...). Each segment carries an `id` (the stable lowercase slug, used to build the web menu path 'settings/<id>/<id>/...' and to merge with containers other straddles register at the same id) and a `label` (the human title — joined with '/' to form the LCD lcdRegisterSettings path, e.g. 'Mesh Network/RNS Interfaces/LoRa'). This dual representation is required because the two surfaces genuinely differ: the web menu store keys containers by lowercase id and overrides their labels via setMenu, while the LCD settings tree keys by the human label directly.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "label"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[a-z0-9_-]+$" },
+              "label": { "type": "string" },
+              "placement": { "type": "integer" }
+            }
+          }
+        },
+        "rows": {
+          "description": "The pane's rows, top to bottom. Each row is a single-key object whose key is the row kind (section/caption/switch/slider/text/dropdown/value/button/list).",
+          "type": "array",
+          "items": { "$ref": "#/$defs/settingsRow" }
+        }
+      }
+    },
+    "settingsRow": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "section": { "type": "string" },
+        "caption": { "type": "string" },
+        "switch": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["label", "key"],
+          "properties": {
+            "label": { "type": "string" },
+            "key": { "type": "string" },
+            "default": { "type": ["integer", "boolean"] }
+          }
+        },
+        "slider": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["label", "key", "min", "max"],
+          "properties": {
+            "label": { "type": "string" },
+            "key": { "type": "string" },
+            "min": { "type": "integer" },
+            "max": { "type": "integer" },
+            "default": { "type": "integer" }
+          }
+        },
+        "text": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["label", "key"],
+          "properties": {
+            "label": { "type": "string" },
+            "key": { "type": "string" },
+            "default": { "type": ["string", "integer"] },
+            "secret": { "type": "boolean" }
+          }
+        },
+        "dropdown": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["label", "key", "options"],
+          "properties": {
+            "label": { "type": "string" },
+            "key": { "type": "string" },
+            "default": { "type": ["string", "integer"] },
+            "options": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["v", "l"],
+                "properties": {
+                  "v": { "type": ["string", "integer"] },
+                  "l": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "value": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["label", "key"],
+          "properties": {
+            "label": { "type": "string" },
+            "key": { "type": "string" }
+          }
+        },
+        "button": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["label", "cmd"],
+          "properties": {
+            "label": { "type": "string" },
+            "cmd": { "type": "string" },
+            "payload": { "type": "string" }
+          }
+        },
+        "list": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["key", "item_label"],
+          "properties": {
+            "key": { "type": "string" },
+            "item_label": { "type": "string" },
+            "add": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["cmd"],
+              "properties": { "cmd": { "type": "string" } }
+            },
+            "remove": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["cmd"],
+              "properties": { "cmd": { "type": "string" } }
+            },
+            "fields": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/settingsRow" }
+            }
+          }
+        }
+      }
     }
   }
 }

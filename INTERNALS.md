@@ -648,14 +648,10 @@ it*. Cross-cutting docs that still live in `spangap-core`:
 
 - [docs/its.md](../spangap-core/docs/its.md) — ITS architecture
 - [docs/storage.md](../spangap-core/docs/storage.md)
-- [docs/unified-fs-api.md](../spangap-core/docs/unified-fs-api.md)
+- [docs/fs.md](../spangap-core/docs/fs.md) — unified filesystem API
 - [docs/cron.md](../spangap-core/docs/cron.md)
 - [docs/power-management.md](../spangap-core/docs/power-management.md)
 - [docs/logging.md](../spangap-core/docs/logging.md)
-- [docs/getting-started.md](../spangap-core/docs/getting-started.md)
-- [docs/development.md](../spangap-core/docs/development.md)
-- [docs/key-fixes.md](../spangap-core/docs/key-fixes.md) — hard-won bug
-  fixes by subsystem
 - [docs/idf-tweaks.md](../spangap-core/docs/idf-tweaks.md) — local IDF
   workarounds
 

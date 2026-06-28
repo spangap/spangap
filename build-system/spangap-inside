@@ -23,7 +23,11 @@ from typing import Any
 import yaml
 from jsonschema import Draft202012Validator
 
-SCHEMA_PATH = Path("/usr/local/share/spangap/straddle.schema.json")
+# Baked into the image at /usr/local/share/spangap/. Overridable via
+# SPANGAP_SCHEMA_PATH so the source copy can be exercised in-container against an
+# edited schema before the host rebuilds the image (production leaves it unset).
+SCHEMA_PATH = Path(os.environ.get(
+    "SPANGAP_SCHEMA_PATH", "/usr/local/share/spangap/straddle.schema.json"))
 # Straddles live under one of two flat, container-native roots — no symlinks,
 # no host paths inside:
 #   /straddles/<repo>  the flat --straddles checkout, bind-mounted here whole
@@ -173,6 +177,12 @@ class Manifest:
     @property
     def kconfig(self) -> list[str]:
         return list(self.data.get("kconfig", []))
+    @property
+    def settings(self) -> list[dict[str, Any]]:
+        """Declarative settings panels (see schema `settings:`). Each panel is
+        lowered into the LCD pane, the web descriptor, and the storage defaults
+        by the settings codegen (write_init_dispatch / write_browser_dispatch)."""
+        return list(self.data.get("settings", []))
     @property
     def identity_kconfig(self) -> list[str]:
         """Desugar the immutable-identity root keys (stub/display_name/banner)
@@ -965,6 +975,206 @@ def init_order(deps: list[Manifest]) -> list[Manifest]:
     return ordered
 
 
+# ---------------------------------------------------------------------------
+# Declarative settings codegen (straddle.yaml `settings:`).
+#
+# One descriptor per pane is lowered into THREE surfaces, all from the same
+# block: the on-device LCD pane (lcdRegisterSettings + lcdSetting* calls, only
+# when spangap-lcd is staged), the persisted storage defaults (storageDefault()
+# for every `default:` whose key starts with `s.`), and the browser panel (a
+# JSON descriptor inlined into straddles.gen.ts, rendered by GeneratedPanel.vue).
+# The firmware halves (panes + defaults) ride in the generated init dispatch
+# (write_init_dispatch); the web half rides in the browser dispatch
+# (write_browser_dispatch). This kills the old three-way hand-duplication.
+# ---------------------------------------------------------------------------
+
+# Row kinds that bind a config key (carry a `default:` worth seeding).
+_SETTINGS_BINDING_KINDS = {"switch", "slider", "text", "dropdown"}
+
+
+def _cstr(s: str) -> str:
+    """A C/JS string literal for `s` (quotes + backslash escaping)."""
+    esc = str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{esc}"'
+
+
+def collect_settings(proj: Manifest, deps: list[Manifest]) -> list[tuple[Manifest, dict]]:
+    """Every settings panel across the staged set, in init order (buildable
+    last). A panel is gated purely by its straddle being staged — there is no
+    per-panel `when:`; the LCD lowering is gated globally on spangap-lcd."""
+    ordered = init_order(deps) + [proj]
+    out: list[tuple[Manifest, dict]] = []
+    for m in ordered:
+        for panel in m.settings:
+            out.append((m, panel))
+    return out
+
+
+def _panel_lcd_path(panel: dict) -> tuple[str, str, int]:
+    """(slash-joined LCD path of segment labels, leaf label, leaf placement)."""
+    menu = panel["menu"]
+    path = "/".join(seg["label"] for seg in menu)
+    leaf = menu[-1]
+    return path, leaf["label"], int(leaf.get("placement", 0))
+
+
+def _settings_lcd_cpp(panels: list[tuple[Manifest, dict]]) -> tuple[str, str]:
+    """(pane builder function defs, body of spangapSettingsGenRegister) for the
+    LCD half. Each pane becomes a `static void spangapGenPane_N(void*)` filled
+    with lcdSetting* calls; the register fn wires them via lcdRegisterSettings.
+    Buttons emit a tiny storageSet callback each."""
+    defs: list[str] = []
+    reg: list[str] = []
+    for idx, (_m, panel) in enumerate(panels):
+        path, label, placement = _panel_lcd_path(panel)
+        btn_defs: list[str] = []
+        lines = [f"static void spangapGenPane_{idx}(void* arg) {{",
+                 "    lv_obj_t* p = static_cast<lv_obj_t*>(arg);"]
+        bidx = 0
+        for row in panel["rows"]:
+            kind, spec = next(iter(row.items()))
+            if kind == "section":
+                lines.append(f"    lcdSettingSection(p, {_cstr(spec)});")
+            elif kind == "caption":
+                lines.append(f"    lcdSettingCaption(p, {_cstr(spec)});")
+            elif kind == "switch":
+                lines.append(f"    lcdSettingSwitch(p, {_cstr(spec['label'])}, {_cstr(spec['key'])});")
+            elif kind == "slider":
+                lines.append(f"    lcdSettingSlider(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}, "
+                             f"{int(spec['min'])}, {int(spec['max'])});")
+            elif kind == "text":
+                secret = ", true" if spec.get("secret") else ""
+                lines.append(f"    lcdSettingText(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}{secret});")
+            elif kind == "dropdown":
+                csv = ",".join(str(o["v"]) for o in spec["options"])
+                lines.append(f"    lcdSettingDropdown(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}, {_cstr(csv)});")
+            elif kind == "value":
+                lines.append(f"    lcdSettingValue(p, {_cstr(spec['label'])}, {_cstr(spec['key'])});")
+            elif kind == "button":
+                fn = f"spangapGenBtn_{idx}_{bidx}"
+                bidx += 1
+                payload = _cstr(spec.get("payload", "1"))
+                btn_defs.append(
+                    f"static void {fn}(void*) {{ storageSet({_cstr(spec['cmd'])}, {payload}); }}")
+                lines.append(f"    lcdSettingButton(p, {_cstr(spec['label'])}, {fn});")
+            elif kind == "list":
+                # A `list` (array-of-objects in storage) is add/remove-edited on
+                # the web side (GeneratedListRow). The LCD shows a note rather
+                # than the editor — matching the existing TCP-peers pane ("edit
+                # peers in web UI"); the core storage API exposes no array reader
+                # to the LCD, and a small keypad is a poor array editor anyway.
+                # A straddle can still surface live per-item status via `value`
+                # rows alongside this list.
+                lines.append('    lcdSettingCaption(p, "Manage this list in the web UI.");')
+        lines.append("}")
+        defs.extend(btn_defs)
+        defs.append("\n".join(lines))
+        if placement:
+            reg.append(f"    lcdRegisterSettings({_cstr(path)}, {_cstr(label)}, spangapGenPane_{idx}, {placement});")
+        else:
+            reg.append(f"    lcdRegisterSettings({_cstr(path)}, {_cstr(label)}, spangapGenPane_{idx});")
+    return "\n\n".join(defs), "\n".join(reg)
+
+
+def _settings_defaults_cpp(panels: list[tuple[Manifest, dict]]) -> str:
+    """Body of spangapSettingsGenDefaults — one storageDefault() per binding row
+    that carries a `default:` and whose key is persisted config (`s.` prefix).
+    Bare/ephemeral keys (value rows) and secrets are never seeded here."""
+    lines: list[str] = []
+
+    def walk(rows: list[dict]) -> None:
+        for row in rows:
+            kind, spec = next(iter(row.items()))
+            if kind == "list":
+                walk(spec.get("fields", []))
+                continue
+            if kind not in _SETTINGS_BINDING_KINDS or not isinstance(spec, dict):
+                continue
+            if "default" not in spec:
+                continue
+            key = spec["key"]
+            if not key.startswith("s."):
+                continue
+            dv = spec["default"]
+            if isinstance(dv, bool):
+                lit = "1" if dv else "0"
+            elif isinstance(dv, int):
+                lit = str(dv)
+            else:
+                lit = _cstr(str(dv))
+            lines.append(f"    storageDefault({_cstr(key)}, {lit});")
+
+    for _m, panel in panels:
+        walk(panel["rows"])
+    return "\n".join(lines)
+
+
+def _settings_web_descriptors(panels: list[tuple[Manifest, dict]]) -> list[dict]:
+    """The browser-side descriptor objects (serialized into straddles.gen.ts).
+    Carries the web menu path/containers and normalized rows the GeneratedPanel
+    interprets at runtime."""
+    def web_row(row: dict) -> dict:
+        kind, spec = next(iter(row.items()))
+        if kind in ("section", "caption"):
+            return {"kind": kind, "text": spec}
+        if kind == "switch":
+            return {"kind": "switch", "label": spec["label"], "k": spec["key"]}
+        if kind == "slider":
+            return {"kind": "slider", "label": spec["label"], "k": spec["key"],
+                    "min": int(spec["min"]), "max": int(spec["max"])}
+        if kind == "text":
+            r = {"kind": "text", "label": spec["label"], "k": spec["key"]}
+            if spec.get("secret"):
+                r["secret"] = True
+            return r
+        if kind == "dropdown":
+            return {"kind": "dropdown", "label": spec["label"], "k": spec["key"],
+                    "options": [{"value": str(o["v"]), "label": o["l"]} for o in spec["options"]]}
+        if kind == "value":
+            return {"kind": "value", "label": spec["label"], "k": spec["key"]}
+        if kind == "button":
+            r = {"kind": "button", "label": spec["label"], "cmd": spec["cmd"]}
+            if "payload" in spec:
+                r["payload"] = spec["payload"]
+            return r
+        if kind == "list":
+            return {"kind": "list", "k": spec["key"], "itemLabel": spec["item_label"],
+                    "add": spec.get("add", {}).get("cmd", ""),
+                    "remove": spec.get("remove", {}).get("cmd", ""),
+                    "fields": [web_row(f) for f in spec.get("fields", [])]}
+        return {"kind": kind}
+
+    out: list[dict] = []
+    for _m, panel in panels:
+        # web: false suppresses the generated web panel — the straddle keeps a
+        # hand-written *Panel.vue at the same menu leaf (rich custom UI a static
+        # descriptor can't express). The LCD pane + storage defaults are still
+        # generated from this same block; only the web surface is opted out.
+        if not panel.get("web", True):
+            continue
+        menu = panel["menu"]
+        ids = [seg["id"] for seg in menu]
+        leaf = menu[-1]
+        containers = []
+        for i, seg in enumerate(menu[:-1]):
+            c = {"path": "settings/" + "/".join(ids[:i + 1]), "label": seg["label"]}
+            # Only carry placement when the descriptor sets it — otherwise we'd
+            # clobber a container's placement that another straddle established.
+            if "placement" in seg:
+                c["placement"] = int(seg["placement"])
+            containers.append(c)
+        entry = {
+            "id": "settings/" + "/".join(ids),
+            "label": leaf["label"],
+            "containers": containers,
+            "rows": [web_row(r) for r in panel["rows"]],
+        }
+        if "placement" in leaf:
+            entry["placement"] = int(leaf["placement"])
+        out.append(entry)
+    return out
+
+
 def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
     """For a buildable, generate staging/spangap_init_dispatch.gen.cpp — the
     buildable's ENTIRE entry point: a generated app_main() plus the two phase
@@ -1059,24 +1269,57 @@ def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
         body_calls = "".join(f"    {c}();\n" for c in calls)
         return f'extern "C" void {name}(void) {{\n{body_calls}}}\n'
 
+    # Declarative settings (straddle.yaml `settings:`). Two firmware halves:
+    #   spangapSettingsGenDefaults() — storageDefault() seeding, ALWAYS emitted
+    #     (web-only/headless builds seed defaults too); called after spangapInit()
+    #     so the values exist before any straddle init reads them.
+    #   spangapSettingsGenRegister() — the LCD panes (lcdRegisterSettings + the
+    #     lcdSetting* calls), emitted with a body ONLY when spangap-lcd is staged
+    #     (else an empty stub); called after spangapInitStraddles() so the lcd
+    #     task and the "Internet"/"Mesh Network" submenus already exist.
+    panels = collect_settings(proj, deps)
+    lcd_staged = "spangap/spangap-lcd" in staged_names
+    defaults_body = _settings_defaults_cpp(panels)
+    if lcd_staged:
+        pane_defs, register_body = _settings_lcd_cpp(panels)
+        lcd_include = '#include \"lcd.h\"\n'
+    else:
+        pane_defs, register_body = "", ""
+        lcd_include = ""
+    settings_block = (
+        (pane_defs + "\n\n" if pane_defs else "")
+        + 'extern \"C\" void spangapSettingsGenDefaults(void) {\n'
+        + (defaults_body + "\n" if defaults_body else "")
+        + "}\n\n"
+        + 'extern \"C\" void spangapSettingsGenRegister(void) {\n'
+        + (register_body + "\n" if register_body else "")
+        + "}\n"
+    )
+
     body = (
         "/* AUTO-GENERATED by spangap-inside. Do not edit; regenerated each build.\n"
         " * The buildable's ENTIRE entry point: a generated app_main() plus the two\n"
         " * phase dispatchers it calls. The buildable ships NO main.cpp — this IS\n"
-        " * its main. app_main is the universal four-call skeleton:\n"
+        " * its main. app_main is the universal skeleton:\n"
         " *   spangapStartStraddles() — FIRST, before spangapInit(): bare-hardware\n"
         " *     board bring-up (power rails, HAL register) the platform depends on.\n"
         " *   spangapInit()           — platform core foundations.\n"
+        " *   spangapSettingsGenDefaults() — declarative `settings:` storage defaults.\n"
         " *   spangapInitStraddles()  — every staged straddle's init: hook, platform\n"
         " *     band (core/net/web/lcd) then dependency-topo.\n"
+        " *   spangapSettingsGenRegister() — declarative `settings:` LCD panes (only\n"
+        " *     when spangap-lcd is staged).\n"
         " *   spangapPostAppInit()    — finalise.\n"
         " * Adding a straddle that declares start:/init: is enough to have it run —\n"
         " * no edit here. `when:`-gated hooks appear only when their straddle is\n"
         " * staged. Hook forward decls use default (C++) linkage (no extern \"C\");\n"
         " * spangap.h is included for the four platform prototypes. */\n"
         '#include \"spangap.h\"\n'
+        f"{lcd_include}"
         "\n"
         f"{externs}"
+        "\n"
+        f"{settings_block}"
         "\n"
         f"{fn('spangapStartStraddles', start_calls)}"
         "\n"
@@ -1085,7 +1328,9 @@ def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
         'extern \"C\" void app_main(void) {\n'
         "    spangapStartStraddles();\n"
         "    spangapInit();\n"
+        "    spangapSettingsGenDefaults();\n"
         "    spangapInitStraddles();\n"
+        "    spangapSettingsGenRegister();\n"
         "    spangapPostAppInit();\n"
         "}\n"
     )
@@ -1105,6 +1350,38 @@ def _browser_pkg_name(m: Manifest) -> str:
     if not name:
         die(f"{m.name}: browser/package.json has no \"name\" — can't wire browser_register")
     return name
+
+
+def stage_web_icons(proj: Manifest, deps: list[Manifest]) -> None:
+    """Surface every staged straddle's launcher SVGs to the web build, parallel
+    to how spangap_lcd_icons() collects them for the firmware. Each straddle's
+    assets/lcd-icons/*.svg (at the straddle root or under its firmware half) is
+    copied into the buildable's web src/app-icons/, where straddles.gen.ts
+    import.meta.glob's them as raw strings INTO app.js — the device webroot ships
+    only app.js/style.css/index.html (see web-interface/deploy.sh), so a separate
+    public/ asset would never reach the device. The Dock renders them inline. One
+    icon source of truth for both the LCD launcher tiles and the web dock.
+
+    Buildable last so its icons win on a basename collision (same precedence as
+    the init order / sdkconfig fragments). The dir is rebuilt each run, so a
+    dropped straddle's icon disappears."""
+    if not proj.has_browser:
+        return
+    out = proj.browser_dir / "src" / "app-icons"
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
+    # Drop a legacy public/app-icons from the earlier public-asset approach.
+    legacy = proj.browser_dir / "public" / "app-icons"
+    if legacy.exists():
+        shutil.rmtree(legacy)
+    for m in init_order(deps) + [proj]:
+        for base in (m.dir, m.firmware_dir):
+            d = base / "assets" / "lcd-icons"
+            if not d.is_dir():
+                continue
+            for svg in sorted(d.glob("*.svg")):
+                shutil.copyfile(svg, out / svg.name)
 
 
 def write_browser_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
@@ -1162,6 +1439,30 @@ def write_browser_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
     imports = "".join(f"import {{ {call} }} from '{pkg}/{module}'\n"
                       for pkg, module, call in regs)
     body_calls = "".join(f"  {call}()\n" for _, _, call in regs)
+
+    # Declarative settings (straddle.yaml `settings:`) web half: the panel
+    # descriptors, serialized as a JS object literal and registered at runtime
+    # by spangap-web's GeneratedPanel renderer. No separate asset, no YAML parser
+    # in the SPA — it tree-shakes with the module. Registered LAST so the
+    # containers other straddles' register* hooks set up already exist.
+    panels = _settings_web_descriptors(collect_settings(proj, deps))
+    gen_import = ""
+    gen_decl = ""
+    gen_call = ""
+    if panels:
+        gen_import = "import { registerGeneratedPanels } from 'spangap-browser/lib/generatedPanels'\n"
+        gen_decl = ("\nconst GENERATED_PANELS = "
+                    + json.dumps(panels, indent=2) + "\n")
+        gen_call = "  registerGeneratedPanels(GENERATED_PANELS)\n"
+
+    # Dock app icons: glob the staged src/app-icons/*.svg as raw strings so they
+    # bundle INTO app.js (the only thing the device webroot ships) and register
+    # them for the Dock to render inline. eager so they're plain strings, not
+    # import promises.
+    icon_import = "import { registerAppIcons } from 'spangap-browser/lib/apps'\n"
+    icon_decl = ("\nconst APP_ICONS = import.meta.glob('../app-icons/*.svg', "
+                 "{ query: '?raw', import: 'default', eager: true }) as Record<string, string>\n")
+
     body = (
         "/* AUTO-GENERATED by spangap-inside. Do not edit; regenerated each build.\n"
         " * Transitive browser registration — the browser-half parallel to the\n"
@@ -1172,16 +1473,26 @@ def write_browser_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
         " *   ... registerStraddles()\n"
         " * Staging a browser_register straddle is enough to surface its pane — no\n"
         " * edit here, no modules.ts edit. `when:`-gated hooks appear only when\n"
-        " * their gating straddle is staged. */\n"
+        " * their gating straddle is staged. GENERATED_PANELS holds the declarative\n"
+        " * `settings:` descriptors, rendered at runtime by GeneratedPanel.vue;\n"
+        " * APP_ICONS are the launcher SVGs bundled for the bottom Dock. */\n"
         f"{imports}"
+        f"{gen_import}"
+        f"{icon_import}"
+        f"{gen_decl}"
+        f"{icon_decl}"
         "\n"
         "export default function registerStraddles(): void {\n"
+        f"  registerAppIcons(APP_ICONS)\n"
         f"{body_calls}"
+        f"{gen_call}"
         "}\n"
     )
     boot_dir = proj.browser_dir / "src" / "boot"
     boot_dir.mkdir(parents=True, exist_ok=True)
     (boot_dir / "straddles.gen.ts").write_text(body)
+
+    stage_web_icons(proj, deps)
 
     # Inject/refresh the file: deps so the imports resolve. A spangap-managed
     # straddle dep is recognised by its self-referential value

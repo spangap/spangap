@@ -1935,8 +1935,9 @@ def measure_build_sizes(build_dir: Path) -> tuple[int, int]:
 
     A small headroom margin is added to each so ordinary build-to-build growth
     doesn't overflow the (cached) partition before the next measure pass: app
-    rounds to 64 K with +128 K margin; fixed sums each file rounded up to a 4 K
-    LittleFS block + 64 K metadata/headroom. 0 = couldn't measure (skip shrink).
+    rounds to 64 K with +128 K margin; fixed models the LittleFS image the way
+    it actually packs (per-file data blocks + per-directory metadata pairs +
+    superblock, plus an 8-block cushion). 0 = couldn't measure (skip shrink).
     """
     app_bytes = 0
     pd = build_dir / "project_description.json"
@@ -1951,15 +1952,26 @@ def measure_build_sizes(build_dir: Path) -> tuple[int, int]:
     fixed_bytes = 0
     merged = build_dir / "data_merged"
     if merged.is_dir():
-        total = 0
+        BLK = 0x1000
+        # Size the image the way LittleFS packs it, not as a bare sum of file
+        # bytes. The byte-sum misses real per-image overhead: a 2-block
+        # superblock pair and a 2-block metadata pair for every directory
+        # (root included). Omitting the directories — there can be many in a
+        # webroot/icon tree — undersizes the partition and the littlefs image
+        # overflows it at pack time (LFS_ERR_NOSPC).
+        blocks = 2 + 2                                  # superblock + root dir
         for f in merged.rglob("*"):
-            if f.is_file():
-                try:
-                    total += (f.stat().st_size + 0xFFF) & ~0xFFF   # round to 4 K
-                except OSError:
-                    pass
-        if total:
-            fixed_bytes = total + 0x10000                   # +64 K metadata/headroom
+            try:
+                if f.is_dir():
+                    blocks += 2                         # directory metadata pair
+                elif f.is_file():
+                    blocks += max((f.stat().st_size + BLK - 1) // BLK, 1)
+            except OSError:
+                pass
+        if blocks > 4:
+            # +8 blocks: CTZ skip-list back-pointers ride inside multi-block
+            # files (usable bytes/block < BLK) and littlefs won't pack to 100 %.
+            fixed_bytes = (blocks + 8) * BLK
     return app_bytes, fixed_bytes
 
 

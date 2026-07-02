@@ -1111,12 +1111,12 @@ flash)
     flashme="$workspace/.spangap-flashme"
     if port_busy "$port"; then
         touch "$flashme"
-        log "$port busy — signaled $flashme; waiting for a monitor to pick it up..."
+        log "$port busy — signaled monitor"
         for _ in 1 2 3 4 5; do
             sleep 1
-            [ -f "$flashme" ] || { log "flashing."; exit 0; }
+            [ -f "$flashme" ] || { log "monitor is flashing."; exit 0; }
         done
-        die "$port was busy but nobody is flashing when I signal to. Start \`spangap monitor\` on a host with the port."
+        die "$port was busy but monitor not responding. Start \`spangap monitor\` on host."
     fi
     ensure_venv
     # Flash once and exit. To watch the device afterwards, chain a monitor:

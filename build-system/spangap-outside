@@ -99,6 +99,14 @@ for _arg in "$@"; do
     esac
 done
 
+# Dependency HEAD-tracking. There are no releases yet, so everyone builds
+# main@HEAD: a dep git-cloned once would otherwise never move again (clone_spec
+# skips a present dir). By default a build refreshes each already-cloned dep to
+# its tracked upstream first (clone mode only — a --straddles checkout is a
+# pinned working tree and is never auto-moved). `--no-pull`, or SPANGAP_NO_PULL
+# in the environment, turns the refresh off.
+: "${SPANGAP_NO_PULL:=}"
+
 # Host-side flash/monitor venv. Lives entirely inside the workspace so
 # `spangap init` keeps its promise of touching nothing outside it. Pins
 # are exact so a working workspace stays working; ensure_venv re-runs pip
@@ -1580,6 +1588,37 @@ ensure_container() {
 # Without --straddles, git-clone into $workspace/<repo> (a real dir the scan
 # picks up). Honours SPANGAP_QUIET (single rollup line instead of one per
 # repo). Used by both the explicit --with pre-fetch and the list-deps loop.
+# Refresh an already-present dependency clone to its tracked upstream before the
+# build reads it (see the SPANGAP_NO_PULL note near the top). Deliberately
+# conservative and ALWAYS non-fatal: a pull problem must never fail a build that
+# could proceed against the checkout already on disk. Leaves the checkout
+# untouched when:
+#   - --no-pull / SPANGAP_NO_PULL is set;
+#   - we're in --straddles mode (a pinned local checkout is never auto-moved);
+#   - a specific @<ref> was requested (a pin means that exact commit — it was
+#     checked out at clone time and must not drift);
+#   - the dir isn't a git repo, HEAD is detached, or there is no upstream;
+#   - the worktree is dirty (never disturb local edits).
+# On fetch/merge failure it warns and returns; the build proceeds offline
+# against whatever is already checked out.
+pull_dep() {
+    local bare=$1 dest=$2 ref=$3
+    [ -n "$SPANGAP_NO_PULL" ] && return 0
+    [ -n "$ref" ] && return 0
+    [ -n "$(read_straddles)" ] && return 0
+    [ -d "$dest/.git" ] || return 0
+    git -C "$dest" symbolic-ref -q HEAD >/dev/null 2>&1 || return 0          # on a branch?
+    git -C "$dest" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1 || return 0  # tracks a remote?
+    if [ -n "$(git -C "$dest" status --porcelain 2>/dev/null)" ]; then
+        [ -z "$SPANGAP_QUIET" ] && log "not updating $bare — $dest has local changes"
+        return 0
+    fi
+    [ -z "$SPANGAP_QUIET" ] && log "updating $bare"
+    git -C "$dest" pull --ff-only --quiet >/dev/null 2>&1 \
+        || log "warning: could not update $bare — building against the existing checkout"
+    return 0
+}
+
 __clone_announced=0
 clone_spec() {
     local spec=$1
@@ -1587,7 +1626,10 @@ clone_spec() {
     case $spec in *@*) ref=${spec#*@} ;; esac
     local repo=${bare#*/}
     local dest="$workspace/$repo"
-    [ -e "$dest" ] && return 0
+    if [ -e "$dest" ]; then
+        pull_dep "$bare" "$dest" "$ref"
+        return 0
+    fi
     local sd; sd=$(read_straddles)
     if [ -n "$sd" ]; then
         [ -d "$sd/$repo" ] && return 0   # already in the checkout → on /straddles
@@ -1788,6 +1830,18 @@ $inc"
 build)
     command -v git >/dev/null 2>&1 || die "git required on host PATH (for auto-clone + get-deps)"
     shift   # drop 'build'; "$@" is now the build args
+
+    # --no-pull is a host-only flag (governs dep HEAD-tracking, done here before
+    # the container runs). Strip it from argv so it never reaches the in-container
+    # `spangap build`, which wouldn't recognise it.
+    _build_args=()
+    for a in "$@"; do
+        case $a in
+            --no-pull) SPANGAP_NO_PULL=1 ;;
+            *) _build_args+=("$a") ;;
+        esac
+    done
+    set -- ${_build_args[@]+"${_build_args[@]}"}
 
     # The cwd straddle (a straddle.yaml at/above cwd, under the workspace), if
     # any — it outranks the remembered default, so `cd <straddle> && build`

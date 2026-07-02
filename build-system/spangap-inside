@@ -1709,6 +1709,82 @@ _KEEP_RE = re.compile(
 )
 
 
+def _git_identity(d: Path) -> dict[str, Any]:
+    """Best-effort git identity for a straddle checkout. Never raises — a
+    non-repo / git-less dir yields empty fields, reported as 'unknown'."""
+    def g(*a: str) -> str:
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(d), *a],
+                capture_output=True, text=True, check=False,
+            )
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            return ""
+    return {
+        "short":  g("rev-parse", "--short", "HEAD"),
+        "date":   g("log", "-1", "--format=%cs"),        # committer date, YYYY-MM-DD
+        "branch": g("rev-parse", "--abbrev-ref", "HEAD"),
+        "dirty":  bool(g("status", "--porcelain")),
+    }
+
+
+def write_build_manifest(proj: Manifest, deps: list[Manifest], invocation: str) -> None:
+    """Emit build/spangap-build-manifest.md — the per-build provenance record.
+
+    There are no releases yet (every straddle is version 0.0.0), so the real
+    identity of what shipped is the git commit of each staged straddle. This
+    records that: buildable + every staged dep, alphabetical, with short hash,
+    commit date, and a `(dirty)` marker when the worktree had uncommitted changes
+    (so the hash never claims a reproducibility it doesn't have). Branch is
+    shown only when it isn't `main` — pre-release everything tracks main, so it's
+    noise except exactly when it isn't.
+
+    Rendered as a flat bulleted list, NOT a markdown table: the on-device viewer
+    has no table support, and four columns don't fit the 320px LCD anyway. Plain
+    text + bold + inline code wrap gracefully at that width.
+
+    spangap_create_factory_image() copies this into the device webroot as
+    /BUILD.md, so the on-device viewer can show it. Best-effort + never fatal:
+    a failure here must not fail the build."""
+    try:
+        staged: list[Manifest] = [proj, *deps]
+        uniq: dict[str, Manifest] = {}
+        for m in staged:
+            uniq.setdefault(m.name, m)
+        rows = sorted(uniq.values(), key=lambda m: m.name)
+
+        out = ["# Build manifest", ""]
+        out.append(f"- **Image:** {proj.name}")
+        out.append(f"- **Built:** {time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        bs = _git_identity(Path(__file__).resolve().parent)
+        out.append(
+            "- **Build system:** "
+            + (f"{bs['short']}{' (dirty)' if bs['dirty'] else ''}"
+               if bs["short"] else "baked image")
+        )
+        # Invocation as plain text (no inline code): it can be long and inline
+        # code doesn't wrap — it'd overflow the 320px LCD.
+        out += ["", f"Built by: {invocation}",
+                "", "## Straddles", ""]
+        for m in rows:
+            gi = _git_identity(m.dir)
+            parts = [f"- **{m.name}**", f"`{gi['short'] or 'unknown'}`"]
+            if gi["dirty"]:
+                parts.append("*(dirty)*")
+            if gi["branch"] and gi["branch"] != "main":
+                parts.append(f"on {gi['branch']}")
+            parts.append(f"— {gi['date'] or '—'}")
+            out.append(" ".join(parts))
+        out.append("")
+
+        dst = proj.firmware_dir / "build" / "spangap-build-manifest.md"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text("\n".join(out))
+    except Exception as e:  # provenance is a nicety — never break a build over it
+        print(f"spangap: could not write build manifest ({e})", file=sys.stderr)
+
+
 def run_build_idf(args: list[str], cwd: Path, quiet: bool, env: dict[str, str] | None = None) -> int:
     """Run `idf.py <args>` for a build, streaming output through the filter.
 
@@ -2124,6 +2200,10 @@ def cmd_build(args: argparse.Namespace) -> int:
         "SPANGAP_BUILD_VERSION": proj.version,
         "SPANGAP_BUILD_ARGS": getattr(args, "spangap_invocation", "") or "spangap build",
     }
+    # Provenance manifest → device webroot as /BUILD.md. Written before the IDF
+    # run so it's on disk when project_include.cmake's configure step picks it up
+    # (spangap_create_factory_image guards on its existence).
+    write_build_manifest(proj, deps, build_env["SPANGAP_BUILD_ARGS"])
     rc = run_build_idf(
         idf_args or ["build"], cwd=proj.firmware_dir, quiet=quiet, env=build_env
     )

@@ -14,7 +14,7 @@ Drop [`./spangap`](https://raw.githubusercontent.com/spangap/spangap/spangap) (t
 
 ## Getting started
 
-Spangap works for Linux, Mac and probably also Window (untested for now). Let's say you are in your homedir on a Mac and want to install the Reticulous mesh networking software built with Spangap and run it on the LilyGo T-Deck Plus device connected to port `/dev/cu.usbmodem1101` on your Mac. Let's say you want to install the spangap command line tool in ~/bin which is in your `$PATH` and you'd like the workspace directory to be called `tdeck` directly below your homedir.
+Spangap works for Linux, Mac and probably also Windows (Windows is untested for now). Let's say you are in your homedir on a Mac and want to install the Reticulous mesh networking software built with Spangap and run it on the LilyGo T-Deck Plus device connected to port `/dev/cu.usbmodem1101` on your Mac. Let's say you want to install the spangap command line tool in ~/bin which is in your `$PATH` and you'd like the workspace directory to be called `tdeck` directly below your homedir.
 
 ```sh
 curl -o ~/bin/spangap https://raw.githubusercontent.com/spangap/spangap/spangap)&& \

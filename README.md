@@ -30,7 +30,7 @@ Now open a new terminal window and do:
 
 ```sh
 cd tdeck && \
-spangap build reticulous/reticulous --with reticulous/hw-tdeck && \
+spangap build reticulous/reticulous --with spangap/hw-tdeck && \
 spangap flash
 ```
 

@@ -32,7 +32,7 @@ resolved project + its deps + the toolchain/environment. Running 'spangap' and l
   straddle is where the project's identity *and its target hardware* live — the board
   HAL, pin map, partition layout, and OTA key are all owned there — so its README tells
   you what's being built and **which board it compiles for**. The `--with` line often
-  names that board straddle (e.g. `--with reticulous/hw-tdeck`). If `.spangap-build` is
+  names that board straddle (e.g. `--with spangap/hw-tdeck`). If `.spangap-build` is
   absent (nothing built yet), the user names a target with `spangap build <org>/<repo>`
   (cloned + remembered on first build) or `cd`s into a straddle dir.
 - `.spangap-port-<os>-<arch>` (sticky serial port) and `.spangap-venv-<os>-<arch>/`

@@ -342,7 +342,7 @@ def resolve_target_straddle(
     dir (or relying on .spangap-build) — handy under --straddles, where the
     straddles live at /straddles/<repo>, not inside the workspace. Matches:
 
-      - the full <org>/<repo> name        (reticulous/hw-tdeck)
+      - the full <org>/<repo> name        (spangap/hw-tdeck)
       - the straddle's directory basename  (hw-tdeck)
 
     Returns the Manifest, or None if the token names no straddle at all (so the
@@ -917,7 +917,7 @@ def write_main_requires(proj: Manifest, staged_repos: set[str]) -> None:
     main is special: it hosts the generated start/init dispatcher, which can
     call a hook from ANY staged straddle — including a board pulled in with
     --with that this buildable never names in requires:/additional_installs:
-    (the `reticulous/reticulous --with reticulous/hw-tdeck` shape). So main
+    (the `reticulous/reticulous --with spangap/hw-tdeck` shape). So main
     REQUIRES the FULL staged set, not just this straddle's declared deps:
     staging a straddle has to be enough to link and activate it. (Per-component
     REQUIRES stay narrow — effective_requires() — so only main is the catch-all.)

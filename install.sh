@@ -2,7 +2,7 @@
 # spangap installer. Fetches the single `spangap` launcher, checks host
 # prerequisites, and drops it somewhere on your PATH.
 #
-#   curl -fsSL https://raw.githubusercontent.com/spangap/spangap/spangap/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/spangap/spangap/refs/heads/main/install.sh | sh
 #
 # Everything else spangap needs (the build container, the flash/monitor venv,
 # straddle checkouts) is pulled in on demand by `spangap init` / `spangap build`
@@ -19,12 +19,12 @@
 #   -h, --help      this help
 #
 # Env:
-#   SPANGAP_INSTALL_BASE   raw base URL to fetch from (default: the spangap
-#                          branch on github). The launcher is <base>/spangap and
-#                          its checksum <base>/spangap.sha256.
+#   SPANGAP_INSTALL_BASE   raw base URL to fetch from (default: the main branch
+#                          on github). The launcher is <base>/spangap and its
+#                          checksum <base>/spangap.sha256.
 set -eu
 
-BASE="${SPANGAP_INSTALL_BASE:-https://raw.githubusercontent.com/spangap/spangap/spangap}"
+BASE="${SPANGAP_INSTALL_BASE:-https://raw.githubusercontent.com/spangap/spangap/refs/heads/main}"
 LAUNCHER_URL="$BASE/spangap"
 SHA_URL="$BASE/spangap.sha256"
 
@@ -200,6 +200,14 @@ if ! in_path "$target_dir"; then
     printf '    export PATH="%s:$PATH"\n' "$target_dir" >&2
     say "(put that line in your shell rc — ~/.bashrc, ~/.zshrc, …)"
 fi
+
+# Forget any cached path to a previous spangap so a re-install/upgrade is picked
+# up immediately. This only touches THIS (sub)shell — the piped-from-curl case
+# can't reach the parent shell's hash table — so we also print how to do it
+# there. Harmless if the shell has no such cache.
+hash -r 2>/dev/null || true
+say "if your shell can't find spangap yet (or runs an old copy), run:  hash -r"
+say "  (on zsh/csh: rehash) — or just open a new shell."
 
 cat >&2 <<'EOF'
 install: done. Next:

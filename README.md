@@ -7,10 +7,10 @@ Spangap builds ESP32 device firmware using a host of software that never needs t
 The easiest install is the one-liner, which checks your prerequisites, finds (or asks for) a directory on your `$PATH`, and drops the launcher there:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/spangap/spangap/spangap/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/spangap/spangap/refs/heads/main/install.sh | sh
 ```
 
-Or do it by hand — the launcher is a single file. Drop [`./spangap`](https://raw.githubusercontent.com/spangap/spangap/spangap) (the only file at the root of this repo) somewhere on your `$PATH` and make it executable. Either way that's the entire install: everything else — dependency resolution, the Docker image we use for building, the small Python venv we use for flashing and the serial monitor — is pulled in on demand.
+Or do it by hand — the launcher is a single file. Drop [`./spangap`](https://raw.githubusercontent.com/spangap/spangap/refs/heads/main/spangap) (the only file at the root of this repo) somewhere on your `$PATH` and make it executable. Either way that's the entire install: everything else — dependency resolution, the Docker image we use for building, the small Python venv we use for flashing and the serial monitor — is pulled in on demand.
 
 The launcher stays a thin dispatcher; the real build system lives in the per-workspace `spangap/` skeleton that `spangap init` sets up. Because of that, a workspace can keep your launcher current on its own: when it ships a newer launcher than the one on your `$PATH`, it upgrades that file in place (printing `spangap: auto-upgraded <path>`), or tells you a newer one is available if the file isn't writeable. So you rarely need to re-install.
 
@@ -25,7 +25,7 @@ The launcher stays a thin dispatcher; the real build system lives in the per-wor
 Spangap works for Linux, Mac and probably also Windows (Windows is untested for now). Let's say you are in your homedir on a Mac and want to install the Reticulous mesh networking software built with Spangap and run it on the LilyGo T-Deck Plus device connected to port `/dev/cu.usbmodem1101` on your Mac. Let's say you want to install the spangap command line tool in ~/bin which is in your `$PATH` and you'd like the workspace directory to be called `tdeck` directly below your homedir.
 
 ```sh
-curl -o ~/bin/spangap https://raw.githubusercontent.com/spangap/spangap/spangap && \
+curl -o ~/bin/spangap https://raw.githubusercontent.com/spangap/spangap/refs/heads/main/spangap && \
 chmod a+x ~/bin/spangap && \
 spangap init tdeck && \
 cd tdeck && \

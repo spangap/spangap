@@ -199,14 +199,45 @@ positional or cwd — never on a pure replay (bare `build`, or passthrough like
 The host reads `.spangap-build` to clone the target/includes on a bare replay
 and to pick the workspace-root default.
 
-**No-workspace fallback** — `spangap cli` and `spangap probe` also run with no
-`spangap.workspace.yaml` at/above cwd. The entry script resolves its own real
-path (chasing symlinks through `/usr/local/bin/…`) to find
-`build-system/spangap-outside`, sets `SPANGAP_WORKSPACE=$HOME` so the venv +
-sticky `.spangap-port-<os>-<arch>`/`.spangap-host` files land there. `monitor`
-is **not** in this set: it logs to `.spangap-log` and watches the
-`.spangap-flashme`/`.spangap-resetme` signal files at the workspace root, so it
-only runs in/under a workspace. Everything else still requires `spangap init`.
+**Everything except `init` needs a workspace.** The entry script only handles
+two things without a `spangap.workspace.yaml` at/above cwd: `init` (which
+creates one) and `--help`. Every other verb — including `cli` and `probe`,
+which read/write sticky state files (`.spangap-port-<os>-<arch>`, `.spangap-tcp`)
+in the workspace — dispatches through the workspace skeleton's
+`spangap-outside`, so with no workspace they error out and point you at
+`spangap init`. (An earlier design let `cli`/`probe` run outside a workspace by
+having the launcher resolve its own real path to a sibling `spangap-outside`;
+that only worked when the on-PATH launcher was the repo file or a symlink into
+it, not the single-file curl install the docs recommend, so it was dropped in
+favour of "one rule: everything is in a workspace.")
+
+**Launcher ↔ spangap-outside contract.** The on-PATH `spangap` is a thin,
+near-static dispatcher; all real work lives in the per-workspace skeleton's
+`build-system/spangap-outside`, so the launcher rarely changes. Two seams keep
+it that way:
+
+- **`init` handoff.** `spangap init` does only the irreducible bootstrap —
+  parse args, create/enter the workspace dir (arming a cleanup trap that
+  `rm -rf`s a dir *it* created on failure), run the cheap pre-clone guards, and
+  obtain a skeleton (clone `./spangap`, or point at `<straddles>/spangap`). It
+  then runs `spangap-outside init-continue` (**not** `exec`, so the trap
+  survives) for the rest: seed `README.md`, build the venv + container, and
+  write `spangap.workspace.yaml` **last** as the success barrier. Those steps
+  version with the skeleton, not the launcher. On success the launcher disarms
+  the trap; on failure the trap fires and the half-built workspace is removed.
+- **Auto-upgrade.** The launcher carries `SPANGAP_LAUNCHER_VERSION` (bumped only
+  when its own dispatch/bootstrap contract changes) and exports it on every
+  exec. On any normal verb (not the init-time internal verbs), `spangap-outside`
+  compares that against the `SPANGAP_LAUNCHER_VERSION` in its own skeleton's
+  `spangap` copy. If the skeleton is newer it replaces the on-PATH file in place
+  (`command -v spangap` → `cp` → `spangap: auto-upgraded <path>`), or reports it
+  isn't writeable. Forward-only — it never downgrades a newer on-PATH launcher.
+  A launcher that's a symlink into a clone shares that clone as its skeleton, so
+  the versions match and it no-ops; no symlink special-casing is needed.
+
+`monitor` still only runs in/under a workspace: it logs to `.spangap-log` and
+watches the `.spangap-flashme`/`.spangap-resetme` signal files at the workspace
+root.
 
 Common verbs:
 

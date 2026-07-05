@@ -68,6 +68,12 @@ export DOCKER_CLI_HINTS=false
 
 workspace="${SPANGAP_WORKSPACE:?spangap-outside: SPANGAP_WORKSPACE not set (invoke via the root \`spangap\` script)}"
 
+# Directory of the spangap skeleton this spangap-outside belongs to — one level
+# up from build-system/. In clone mode it's <workspace>/spangap; in --straddles
+# mode it's <straddles>/spangap. Used to seed README.md on `init-continue` and
+# to compare this skeleton's launcher against the on-PATH one for auto-upgrade.
+skel_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
 # In-container path of the workspace bind mount. The workspace is mounted UNDER
 # the persistent home (~ = /home/spangap) at its own basename, so the whole tree
 # the user works on lives under $HOME in the container (e.g. host
@@ -1011,6 +1017,10 @@ monitor_loop() {
     # $container_ws/...), and so the stripped-output log target always exists (the
     # workspace dir is always present, unlike a not-yet-built build/).
     #   .spangap-flashme  request a reflash
+    #   .spangap-flashack touched when we commit to a flash; a waiting `spangap
+    #                     flash` polls it to confirm its signal was picked up
+    #                     (flashme removal is deferred by grace, so it can't be
+    #                     the ack)
     #   .spangap-resetme  request a monitor restart that resets the device
     #   .spangap-ping     readiness probe — deleted on sight, nothing else; its
     #                     disappearance is how in-container `spangap show` learns
@@ -1020,6 +1030,7 @@ monitor_loop() {
     # and the live monitor both work without one.
     local flashme="$workspace/.spangap-flashme"
     local resetme="$workspace/.spangap-resetme"
+    local flashack="$workspace/.spangap-flashack"
     local ping="$workspace/.spangap-ping"
     local log="$workspace/.spangap-log"
 
@@ -1044,6 +1055,14 @@ monitor_loop() {
             rm -f "$resetme"
             reset_flags=""
         elif [ "$pending" = "1" ] || [ -f "$flashme" ]; then
+            # Ack the request the instant we commit to flashing — a waiting
+            # `spangap flash` polls .spangap-flashack to learn its signal was
+            # picked up. It must NOT wait on flashme removal instead: that's
+            # deferred by the 3s grace below (so other hosts can latch the same
+            # signal), which races and false-times-out the 5s flasher wait even
+            # though the flash is already underway. (Skip on the pending=1
+            # initial-flash path — no flasher is waiting there.)
+            [ -f "$flashme" ] && touch "$flashack"
             local rm_pid=""
             if [ -f "$flashme" ]; then
                 # Hand the 3s grace + removal to a detached shell so the flash
@@ -1109,11 +1128,62 @@ monitor_loop() {
     done
 }
 
+# Auto-upgrade the on-PATH `spangap` launcher from this workspace's skeleton
+# when the skeleton ships a newer one. Forward-only (never downgrade). If the
+# on-PATH file is writeable we replace it in place and report it; otherwise we
+# just report that a newer one exists. No prompts, no sudo, no symlink handling —
+# a launcher that's a symlink into a clone shares that clone as its skeleton, so
+# the versions match and this no-ops. Runs for normal verbs only (the init-time
+# internal verbs skip it — the launcher that drives them is fresh by definition).
+maybe_upgrade_launcher() {
+    local running skel_copy skel_ver path
+    running=${SPANGAP_LAUNCHER_VERSION:-0}
+    case $running in ''|*[!0-9]*) running=0 ;; esac
+    skel_copy="$skel_dir/spangap"
+    [ -f "$skel_copy" ] || return 0
+    skel_ver=$(sed -n 's/^SPANGAP_LAUNCHER_VERSION=\([0-9][0-9]*\).*/\1/p' "$skel_copy")
+    case $skel_ver in ''|*[!0-9]*) return 0 ;; esac
+    [ "$skel_ver" -gt "$running" ] || return 0
+    path=$(command -v spangap 2>/dev/null) || return 0
+    [ -n "$path" ] || return 0
+    if [ -w "$path" ]; then
+        if cp "$skel_copy" "$path" && chmod +x "$path"; then
+            printf 'spangap: auto-upgraded %s\n' "$path" >&2
+        fi
+    else
+        printf 'spangap: newer version available, but %s not writeable\n' "$path" >&2
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Command dispatch (outside).
 # ---------------------------------------------------------------------------
 
+case ${1:-} in init-continue|ensure-venv|ensure-container) ;; *) maybe_upgrade_launcher ;; esac
+
 case ${1:-} in
+init-continue)
+    # Second half of `spangap init`, handed off by the launcher once the
+    # skeleton exists and SPANGAP_WORKSPACE is set. These steps live here (not
+    # in the launcher) so they version with the skeleton the workspace was
+    # init'd with. The launcher holds a cleanup trap over this call: a non-zero
+    # exit here makes it rm -rf a freshly-created workspace dir, so we write the
+    # workspace marker LAST and only then return 0 (SPANGAP_PHASE=init from the
+    # launcher makes these lines read "init:").
+    if [ -f "$skel_dir/build-system/README.md" ]; then
+        cp "$skel_dir/build-system/README.md" "$workspace/README.md"
+        log "wrote README.md (container assistant instructions)"
+    fi
+    ensure_venv
+    log "building docker container (image build + container create)..."
+    ensure_container
+    # Marker written last: find_workspace keys off its presence, so a failure
+    # anywhere above must leave none behind.
+    : > "$workspace/spangap.workspace.yaml"
+    log "workspace initialized at $workspace"
+    exit 0
+    ;;
 ensure-venv)
     ensure_venv
     exit 0
@@ -1137,12 +1207,20 @@ flash)
     fw=$(resolve_firmware_dir "$proj") \
         || die "no CMakeLists.txt in $proj or its esp-idf/ subdir"
     flashme="$workspace/.spangap-flashme"
+    flashack="$workspace/.spangap-flashack"
     if port_busy "$port"; then
+        # A monitor owns the port. Signal it and wait for its ack — the monitor
+        # touches .spangap-flashack the moment it commits to the flash. Wait on
+        # THAT, not on flashme removal: removal is deferred 3s (grace for other
+        # hosts to latch the signal), which used to race this window and report a
+        # false "not responding" while the flash was already running. Clear any
+        # stale ack up front so we only ever see a fresh one.
+        rm -f "$flashack"
         touch "$flashme"
         log "$port busy — signaled monitor"
-        for _ in 1 2 3 4 5; do
+        for _ in 1 2 3 4 5 6 7 8; do
             sleep 1
-            [ -f "$flashme" ] || { log "monitor is flashing."; exit 0; }
+            [ -f "$flashack" ] && { rm -f "$flashack"; log "monitor is flashing."; exit 0; }
         done
         die "$port was busy but monitor not responding. Start \`spangap monitor\` on host."
     fi

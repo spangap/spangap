@@ -21,62 +21,61 @@ set -eu
 
 INIT_URL="${SPANGAP_INIT_URL:-https://github.com/spangap/spangap.git}"
 
+# Launcher contract version. Bumped ONLY when this script's dispatch/bootstrap
+# behaviour changes (the init handoff, the env it exports, how it locates
+# spangap-outside) — never for changes confined to spangap-outside. A workspace's
+# spangap-outside compares this against the copy in its own skeleton and, when
+# the skeleton is newer, upgrades the on-PATH launcher in place (or reports it
+# isn't writeable). Exported so the running value travels with every exec below.
+SPANGAP_LAUNCHER_VERSION=1
+export SPANGAP_LAUNCHER_VERSION
+
 die() { printf 'spangap: %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
-spangap — ESP-32 build system.
+spangap — ESP-32 build system. Assembles + builds "straddles" in a per-workspace
+Docker container; nothing but a small flash/monitor venv touches your host.
 
 Usage:
-  spangap init [--straddles DIR] [<dir>]
-  spangap <command> [args...]
+  spangap init [--straddles DIR] [-v] [<dir>]   bootstrap a workspace
+  spangap <command> [args...]                   run a command in a workspace
   spangap            (no command: same as `spangap show`)
   spangap --help | -h | help
 
-init  (run outside any workspace; creates an empty workspace):
-  <dir>              Optional workspace directory. Created if it doesn't exist;
-                     init then runs there. Without it, init uses the current
-                     dir. A project is NOT acquired at init — name one with
-                     `spangap build <org>/<repo>` and it's cloned (with its
-                     deps) on first build and remembered for bare `build`.
-  --straddles DIR    Use a local checkout of the spangap tree, laid out flat
-                     as <DIR>/<repo>/ (every straddle a direct child). The
-                     tree is bind-mounted into the build container (at
-                     /straddles) instead of straddles being cloned from github.
-  -v, --verbose      Show docker build / git clone output. Without it, init
-                     prints one status line per phase.
-
 Commands (run inside a workspace):
-  build [<org/repo>] [args...]   Build a straddle. Name it as <org>/<repo>
-                                 (cloned with its deps if missing), or omit to
-                                 reuse the cwd straddle / the last build. The
-                                 target + --with/--without are remembered, so a
-                                 bare `build` repeats the last one. -v shows the
-                                 full IDF / Vite output (quiet by default).
-  get-deps                       Fetch missing straddles without building.
-  flash [<port>]                 Flash the built firmware once and exit. Port
-                                 is sticky. Chain `&& spangap monitor` to watch
-                                 the board after flashing.
-  monitor [<port>]               Attach the serial monitor (must be in/under
-                                 a workspace).
-  probe [<port>]                 Print chip + flash size of a connected
-                                 board. Works outside a workspace.
-  cli [-h <host>] [args...]      Talk to a running device over the network.
-                                 Host is sticky like port.
-  show                           Show the last build invocation, its resolved
-                                 straddle, and its deps in initialization order.
-                                 (Bare `spangap` with no command does the same.)
-  reset                          Signal a running monitor to reset the device.
-  reset-workspace                Wipe the build state (container + image) and
-                                 start fresh.
-  docker <cmd> [args...]         Drop into a shell on the build container,
-                                 e.g. `spangap docker sh`.
+  build [<org/repo>] [args]  build a straddle (last target + --with/--without
+                             remembered, so a bare `build` repeats it; -v shows
+                             full IDF / Vite output)
+  get-deps                   fetch missing dependency straddles without building
+  flash [<port>]             flash the built firmware once (port is sticky)
+  monitor [<port>]           attach the serial monitor
+  probe [<port>]             print chip + flash size of a connected board
+  cli [-h host] [args]       talk to a running device over the network (host
+                             is sticky like port)
+  dev [-h host]              run the browser dev server against a device
+  show                       last build invocation + resolved straddle + deps
+  reset                      signal a running monitor to reset the device
+  reset-workspace            wipe build state (container + image) and rebuild
+  docker <cmd> [args]        run a command on the build container (e.g. sh)
+  shell                      interactive shell in the build container
+
+init  (run outside any workspace; creates one):
+  <dir>              workspace directory. Created if absent; else init uses cwd.
+                     A project is NOT acquired here — name one with
+                     `spangap build <org>/<repo>` and it's cloned (with deps)
+                     on first build and remembered for a bare `build`.
+  --straddles DIR    build from a local flat checkout (<DIR>/<repo>/) instead of
+                     cloning straddles from github; the tree is bind-mounted at
+                     /straddles in the build container.
+  -v, --verbose      show docker build / git clone output (one status line per
+                     phase otherwise).
 
 Environment:
-  SPANGAP_INIT_URL   Override the git URL cloned by `init` (default:
+  SPANGAP_INIT_URL   override the git URL cloned by `init` (default:
                      https://github.com/spangap/spangap.git).
 
-See INTERNALS.md for how this hangs together under the hood.
+Full docs: build-system/README.md. Internals: INTERNALS.md.
 EOF
 }
 
@@ -235,18 +234,6 @@ init)
         git clone --quiet "$INIT_URL" spangap
         skel_target="$PWD/spangap"
     fi
-    # Seed the workspace with the container assistant-instructions doc as
-    # README.md. An in-container `spangap claude` writes a CLAUDE.md that just
-    # points here, so this is the substantive file. Copied from the skeleton the
-    # workspace was init'd with, so it tracks that build system's version.
-    if [ -f "$skel_target/build-system/README.md" ]; then
-        cp "$skel_target/build-system/README.md" README.md
-        echo "init: wrote README.md (container assistant instructions)" >&2
-    fi
-    # Delegate venv setup to spangap-outside so the recipe lives in exactly
-    # one place (it's also called lazily on flash/monitor for robustness).
-    SPANGAP_WORKSPACE="$PWD" "$skel_target/build-system/spangap-outside" ensure-venv \
-        || die "host-side flash/monitor venv setup failed (see above)"
     # Quiet by default — collapse the docker build / git clone noise into one
     # status line per phase. -v|--verbose turns it all back on. SPANGAP_QUIET
     # propagates into spangap-outside via the env (see the ${SPANGAP_QUIET+set}
@@ -256,39 +243,22 @@ init)
     # than re-deriving it from argv that no longer carries init's -v.
     if [ -z "$verbose" ]; then export SPANGAP_QUIET=1; else export SPANGAP_QUIET=; fi
 
-    # Pre-build the container so the first real `spangap build` (or
-    # `spangap docker sh`, `spangap claude`, ...) doesn't pay the
-    # image-build + container-create latency. Init is when the user is
-    # already waiting for the workspace to come up, so the cost lands
-    # at the natural moment. The project itself (and its deps) is acquired
-    # later, by the first `spangap build <org/repo>`.
-    echo "init: building docker container (image build + container create)..." >&2
-    SPANGAP_WORKSPACE="$PWD" "$skel_target/build-system/spangap-outside" ensure-container \
-        || die "container setup failed (see above)"
-    # Everything succeeded — now drop the workspace marker. Written last so a
-    # failure anywhere above leaves no marker behind: a created-dir init is
-    # removed wholesale by the cleanup trap, and the cwd / pre-existing-dir form
-    # (no marker, no trap) can simply be re-run in place.
-    : > spangap.workspace.yaml
-    # Success — disarm the cleanup trap so the finished workspace survives exit.
+    # Hand the rest of init to spangap-outside's `init-continue`: seed README.md,
+    # build the host venv, pre-build the container, and drop the workspace marker
+    # last. Those steps live there (not here) so they version with the skeleton
+    # the workspace was init'd with, leaving this launcher as pure bootstrap.
+    #
+    # NOT exec'd: the cleanup trap armed above must survive to rm -rf a
+    # workspace dir WE created if init-continue fails partway. On success
+    # init-continue writes spangap.workspace.yaml as its final act and returns 0;
+    # we then disarm the trap so the finished workspace survives exit. The
+    # "marker written last" invariant is preserved across the handoff.
+    SPANGAP_WORKSPACE="$PWD" "$skel_target/build-system/spangap-outside" init-continue \
+        || die "workspace initialization failed (see above)"
     trap - EXIT INT TERM HUP
-    echo "init: workspace initialized at $PWD" >&2
     exit 0
     ;;
 esac
-
-# Resolve this script's real location so we can find spangap-outside when
-# the user runs `spangap cli` / `spangap probe` outside any workspace.
-self=$0
-while [ -L "$self" ]; do
-    link=$(readlink "$self")
-    case $link in
-        /*) self=$link ;;
-        *)  self=$(dirname "$self")/$link ;;
-    esac
-done
-self_dir=$(cd "$(dirname "$self")" && pwd)
-self_outside="$self_dir/build-system/spangap-outside"
 
 if ws=$(find_workspace); then
     # spangap-outside lives in the spangap build-system straddle: under the
@@ -307,20 +277,7 @@ if ws=$(find_workspace); then
     exec "$outside" "$@"
 fi
 
-# No workspace at/above cwd. A small set of commands (`cli`, `probe`) is still
-# useful — they only need the host venv + a serial port or a host:port, not a
-# built tree. `monitor` is deliberately NOT here: it logs and watches signal
-# files in the workspace, so it only runs in/under one. Everything else still
-# requires `spangap init`.
-case ${1:-} in
-    cli|probe)
-        [ -x "$self_outside" ] \
-            || die "spangap-outside not found at $self_outside — \`spangap $1\` outside a workspace needs the installed repo to remain intact"
-        # SPANGAP_WORKSPACE points at $HOME so .spangap-port and friends have
-        # somewhere to live; spangap-outside's no-straddle warning still fires.
-        export SPANGAP_WORKSPACE="${HOME:-/tmp}"
-        exec "$self_outside" "$@"
-        ;;
-esac
-
+# No workspace at/above cwd. Every command other than `init` (handled above)
+# needs one — including `cli`/`probe`, which read/write sticky state files in
+# the workspace. So there's nothing left to dispatch: point the user at `init`.
 die "not in a spangap workspace (no spangap.workspace.yaml at/above $PWD) — run \`spangap init\` to start one"

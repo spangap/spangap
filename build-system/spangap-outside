@@ -323,6 +323,26 @@ resolve_firmware_dir() {
     return 1
 }
 
+# monitor_fw: resolve the firmware dir for a running monitor — the cwd straddle
+# (must be under the workspace), else, at the workspace root, the last build's
+# remembered target (.spangap-build). Echoes the dir, or nothing if none
+# resolves *yet*. Silent and side-effect-free, so the monitor loop can call it
+# every pass: a monitor started in a fresh workspace before anything is built
+# picks up the build the moment it lands (gaining flash + stack decode) with no
+# restart. Same resolution the `monitor` case seeds with at startup.
+monitor_fw() {
+    local proj cand
+    if cand=$(find_straddle 2>/dev/null) \
+        && case $cand in "$workspace"|"$workspace"/*) true ;; *) false ;; esac; then
+        proj=$cand
+    elif cand=$(default_straddle 2>/dev/null); then
+        proj=$cand
+    else
+        return 0
+    fi
+    resolve_firmware_dir "$proj" 2>/dev/null || return 0
+}
+
 # ---------------------------------------------------------------------------
 # Sticky $SPANGAP_PORT + device endpoints via workspace-root state files.
 # ---------------------------------------------------------------------------
@@ -979,12 +999,13 @@ PY
     return 0
 }
 
-# monitor_loop <port> <fw> <initial_flash:1|0>: forever — passively monitor
+# monitor_loop <port> <initial_flash:1|0>: forever — passively monitor
 # until .spangap-flashme appears (then flash + re-monitor) or .spangap-resetme
-# appears (then restart the monitor with the device reset, no reflash).
-# Ctrl-C / TERM bails cleanly.
+# appears (then restart the monitor with the device reset, no reflash). The
+# firmware dir is re-resolved (monitor_fw) each pass, not taken as an arg, so a
+# build produced after the monitor started is honored. Ctrl-C / TERM bails.
 monitor_loop() {
-    local port=$1 fw=$2 do_initial=$3
+    local port=$1 do_initial=$2
     # Signal + log files live at the workspace root so the host and the
     # in-container `spangap flash` reach them identically ($workspace/... vs
     # $container_ws/...), and so the stripped-output log target always exists (the
@@ -1008,6 +1029,13 @@ monitor_loop() {
 
     local pending=$do_initial
     while true; do
+        # Re-resolve the firmware dir every pass (not once at startup) so a build
+        # that lands after this monitor started is honored — flashing and stack
+        # decode start working the instant `.spangap-build` (or a cwd straddle)
+        # appears, no monitor restart needed. Empty until then: the live log
+        # still streams, we just can't flash or symbolicate yet.
+        local fw
+        fw=$(monitor_fw)
         local reset_flags="--no-reset"
         if [ -f "$resetme" ]; then
             # Restart the monitor with the device reset (clean boot capture),
@@ -1028,7 +1056,7 @@ monitor_loop() {
                 reset_flags=""
                 sleep 2
             else
-                [ -n "$fw" ] || log "flashme seen but not in a straddle — can't flash (no build artifacts)"
+                [ -n "$fw" ] || log "Flash signalled but no build to flash. Build something first, then try again."
                 sleep 2
                 pending=0
                 continue
@@ -1132,29 +1160,16 @@ flash)
     ;;
 monitor)
     shift
-    # monitor stays useful outside a straddle: you lose stack decode + the
-    # flashme reflash signal, but the live log is still worth attaching to.
-    # Warn loudly so the user knows what they're giving up.
-    #
-    # Resolution order:
-    #   1. straddle.yaml at/above cwd (must be under workspace)
-    #   2. workspace-root invocation falls back to the last build's target
-    #      (.spangap-build; same default flash/build use via require_straddle)
-    #   3. neither → "no straddle context" warning, monitor still attaches
-    proj=""
-    if cand=$(find_straddle 2>/dev/null) \
-        && case $cand in "$workspace"|"$workspace"/*) true ;; *) false ;; esac; then
-        proj=$cand
-    elif cand=$(default_straddle 2>/dev/null); then
-        proj=$cand
-    fi
-    if [ -n "$proj" ]; then
-        fw=$(resolve_firmware_dir "$proj") \
-            || die "no CMakeLists.txt in $proj or its esp-idf/ subdir"
-    else
-        log "Warning: not in a straddle dir — cannot decode stack on crash, cannot be signalled to flash."
-        fw=""
-    fi
+    # The workspace itself is mandatory — the root `spangap` shim already refuses
+    # `monitor` outside one (it's not in the cli/probe outside-workspace set), so
+    # by the time we're here $workspace exists and the log/signal files have a
+    # home. A *straddle* is not mandatory: fw (for stack decode + the flashme
+    # reflash) is resolved lazily by monitor_loop every pass (cwd straddle, else
+    # the last build's remembered target), so a monitor started in a fresh
+    # workspace before anything is built gains flash + decode the moment the
+    # build lands — no restart, and no premature "not in a straddle" warning.
+    # Seed an initial value only to decide whether to probe for the toolchain.
+    fw=$(monitor_fw)
     if [ $# -gt 0 ]; then
         port=$1; shift
         sticky_set "$PORT_FILE" "$port"
@@ -1164,21 +1179,22 @@ monitor)
     port_busy "$port" && die "$port is busy — another monitor/flasher owns it"
     ensure_venv
     # Wire up panic-backtrace decode: a host `xtensa-esp32-elf-addr2line` shim
-    # that forwards to the build-env toolchain. Needs a straddle (for the ELF)
-    # and a running container; otherwise it's a graceful no-op.
-    if [ -n "$fw" ]; then
-        case $(ensure_addr2line_shim) in
-            nocontainer) log "note: build-env container not running — panic backtraces won't decode to file:line (run a build, or \`spangap ensure-container\`, first)" ;;
-            notool)      log "note: no xtensa addr2line found in the build-env container — backtraces won't decode" ;;
-        esac
-    fi
+    # that forwards to the build-env toolchain. The shim is straddle-agnostic (it
+    # only remaps ELF paths into the container mount), so install it regardless
+    # of whether fw has resolved yet — a build that lands later then decodes too;
+    # the ELF itself is picked up per-attach by run_monitor. Graceful no-op with
+    # no container / no toolchain.
+    case $(ensure_addr2line_shim) in
+        nocontainer) log "note: build-env container not running — panic backtraces won't decode to file:line (run a build, or \`spangap ensure-container\`, first)" ;;
+        notool)      log "note: no xtensa addr2line found in the build-env container — backtraces won't decode" ;;
+    esac
     # The monitor owns the host-side bridge: bring it up for the device address
     # (.spangap-tcp, on both CLI ports), and tear it down on exit
     # (Ctrl-], INT/TERM via monitor_loop's `exit 0`, or normal return all fire
     # the EXIT trap). Darwin-only inside start_bridge/stop_bridge.
     trap stop_bridge EXIT
     start_bridge
-    monitor_loop "$port" "$fw" 0
+    monitor_loop "$port" 0
     exit 0
     ;;
 probe)

@@ -1120,27 +1120,6 @@ maybe_upgrade_launcher() {
 case ${1:-} in init-continue|ensure-venv|ensure-container) ;; *) maybe_upgrade_launcher ;; esac
 
 case ${1:-} in
-init-continue)
-    # Second half of `spangap init`, handed off by the launcher once the
-    # skeleton exists and SPANGAP_WORKSPACE is set. These steps live here (not
-    # in the launcher) so they version with the skeleton the workspace was
-    # init'd with. The launcher holds a cleanup trap over this call: a non-zero
-    # exit here makes it rm -rf a freshly-created workspace dir, so we write the
-    # workspace marker LAST and only then return 0 (SPANGAP_PHASE=init from the
-    # launcher makes these lines read "init:").
-    if [ -f "$skel_dir/build-system/README.md" ]; then
-        cp "$skel_dir/build-system/README.md" "$workspace/README.md"
-        log "wrote README.md (container assistant instructions)"
-    fi
-    ensure_venv
-    log "building docker container (image build + container create)..."
-    ensure_container
-    # Marker written last: find_workspace keys off its presence, so a failure
-    # anywhere above must leave none behind.
-    : > "$workspace/spangap.workspace.yaml"
-    log "workspace initialized at $workspace"
-    exit 0
-    ;;
 ensure-venv)
     ensure_venv
     exit 0
@@ -1733,6 +1712,28 @@ fetch_missing_deps() {
 # Cheap commands that don't need docker. Anything not handled here falls
 # through to ensure_container + the main dispatch below.
 case ${1:-} in
+init-continue)
+    # Second half of `spangap init`, handed off by the launcher once the
+    # skeleton exists and SPANGAP_WORKSPACE is set. These steps live here (not
+    # in the launcher) so they version with the skeleton the workspace was
+    # init'd with. Must sit below the ensure_container definition — it's called
+    # here. The launcher holds a cleanup trap over this call: a non-zero exit
+    # here makes it rm -rf a freshly-created workspace dir, so we write the
+    # workspace marker LAST and only then return 0 (SPANGAP_PHASE=init from the
+    # launcher makes these lines read "init:").
+    if [ -f "$skel_dir/build-system/README.md" ]; then
+        cp "$skel_dir/build-system/README.md" "$workspace/README.md"
+        log "wrote README.md (container assistant instructions)"
+    fi
+    ensure_venv
+    log "building docker container (image build + container create)..."
+    ensure_container
+    # Marker written last: find_workspace keys off its presence, so a failure
+    # anywhere above must leave none behind.
+    : > "$workspace/spangap.workspace.yaml"
+    log "workspace initialized at $workspace"
+    exit 0
+    ;;
 ensure-container)
     # Pre-build the image + create the container without running a
     # straddle build. Used by `spangap init` so the user-facing setup

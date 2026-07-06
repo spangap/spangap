@@ -28,18 +28,14 @@ from jsonschema import Draft202012Validator
 # edited schema before the host rebuilds the image (production leaves it unset).
 SCHEMA_PATH = Path(os.environ.get(
     "SPANGAP_SCHEMA_PATH", "/usr/local/share/spangap/straddle.schema.json"))
-# Straddles live under one of two flat, container-native roots — no symlinks,
-# no host paths inside:
-#   /straddles/<repo>  the flat --straddles checkout, bind-mounted here whole
-#                      when `init --straddles` was used (one mount, every
-#                      straddle a direct child). Because it's flat, the browser
-#                      `file:../../<sibling>` deps resolve straight through.
-#   <workspace>/<repo> git clones (the no-straddles case), plus any dep cloned
-#                      because it wasn't present under --straddles.
-# The workspace dir itself also holds the marker, the dotfiles, and the per-host
-# venv; non-straddle entries have no straddle.yaml and are skipped. Builds bake
-# the container path (e.g. /straddles/<repo>) into CMakeCache, so it's stable
-# and host-independent.
+# Straddles live under one flat, container-native root — no symlinks, no host
+# paths inside: <workspace>/<repo>, git clones laid out flat as direct children
+# of the workspace. Because the layout is flat, the browser `file:../../<sibling>`
+# deps resolve straight through. The workspace dir itself also holds the marker,
+# the dotfiles, and the per-host venv; non-straddle entries have no straddle.yaml
+# and are skipped. Builds bake the container path (e.g.
+# /home/spangap/<ws>/<repo>) into CMakeCache; it's stable across a given
+# workspace and host-independent in layout.
 #
 # The workspace is bind-mounted at /home/spangap/<basename-of-host-workspace>
 # (nested under the persistent ~ = /home/spangap mount), not a fixed path — so
@@ -58,8 +54,6 @@ def _discover_workspace() -> Path:
 
 
 WORKSPACE = _discover_workspace()
-STRADDLES = Path("/straddles")
-STRADDLE_ROOTS = (STRADDLES, WORKSPACE)
 # The active device's address, workspace-wide: a bare "<host-or-ip>" — the last
 # one explicitly set (via `spangap cli -h` / `spangap dev -h`), or the project's
 # `<default_hostname>.local` mDNS name when never set. ONE address, many ports:
@@ -219,9 +213,9 @@ def find_project(start: Path | None = None) -> Manifest:
     """Resolve the project straddle for the current invocation.
 
     Walk up from cwd until straddle.yaml. Each straddle has one container-
-    native location (/straddles/<repo> or <workspace>/<repo>) — no symlinks, no
-    host paths — so the CMAKE_HOME_DIRECTORY baked into build/CMakeCache.txt is
-    stable and host-independent.
+    native location (<workspace>/<repo>) — no symlinks, no host paths — so the
+    CMAKE_HOME_DIRECTORY baked into build/CMakeCache.txt is stable and
+    host-independent.
 
     If nothing is found and we're at the workspace root, fall back to the
     target of the last build, recorded in .spangap-build — this mirrors
@@ -339,8 +333,7 @@ def resolve_target_straddle(
     """Resolve an explicit `spangap build <target>` token to a straddle.
 
     This is what lets you name the image to build instead of cd-ing into its
-    dir (or relying on .spangap-build) — handy under --straddles, where the
-    straddles live at /straddles/<repo>, not inside the workspace. Matches:
+    dir (or relying on .spangap-build). Matches:
 
       - the full <org>/<repo> name        (spangap/hw-tdeck)
       - the straddle's directory basename  (hw-tdeck)
@@ -386,35 +379,29 @@ def load_manifest(path: Path) -> Manifest:
 def scan_workspace_straddles() -> dict[str, Manifest]:
     """Every straddle.yaml visible to the container, indexed by name.
 
-    Walks the two flat straddle roots — /straddles (the --straddles mount) and
-    the workspace (git clones) — in that order. Both are plain directories of
-    real straddle dirs; non-straddle entries (dotfiles, the per-host venv,
-    the workspace marker) have no straddle.yaml and are skipped. A name seen
-    twice is an error: --straddles and clones are disjoint by construction (a
-    dep present under --straddles is never also cloned), so this only fires on
-    a mis-set `name:` in a straddle.yaml.
+    Walks the flat workspace root: git clones laid out as direct children of the
+    workspace. It's a plain directory of real straddle dirs; non-straddle entries
+    (dotfiles, the per-host venv, the workspace marker) have no straddle.yaml and
+    are skipped. A name seen twice is an error — it only fires on a mis-set
+    `name:` in a straddle.yaml.
     """
     found: dict[str, Manifest] = {}
     if not WORKSPACE.is_dir():
         die(
             f"{WORKSPACE} not mounted — is the container running with "
-            "-v <ws>:/home/spangap/<basename> (and -v <straddles>:/straddles "
-            "when --straddles is set)?"
+            "-v <ws>:/home/spangap/<basename>?"
         )
 
-    for root in STRADDLE_ROOTS:
-        if not root.is_dir():
+    for child in sorted(WORKSPACE.iterdir()):
+        if not child.is_dir():
             continue
-        for child in sorted(root.iterdir()):
-            if not child.is_dir():
-                continue
-            m_path = child / "straddle.yaml"
-            if not m_path.is_file():
-                continue
-            m = load_manifest(m_path)
-            if m.name in found:
-                die(f"two straddles claim the same name '{m.name}':\n  {found[m.name].path}\n  {m.path}")
-            found[m.name] = m
+        m_path = child / "straddle.yaml"
+        if not m_path.is_file():
+            continue
+        m = load_manifest(m_path)
+        if m.name in found:
+            die(f"two straddles claim the same name '{m.name}':\n  {found[m.name].path}\n  {m.path}")
+        found[m.name] = m
     return found
 
 
@@ -2207,9 +2194,7 @@ def cmd_build(args: argparse.Namespace) -> int:
     # If the first non-flag token names a known straddle (by <org>/<repo> or repo
     # dir), build THAT straddle regardless of cwd —
     # otherwise leave every token for idf.py (passthrough for `menuconfig`,
-    # build targets, -D…). The target frees you from cd-ing into the straddle,
-    # which matters under --straddles (straddles live at /straddles/<repo>, not
-    # in the workspace dir).
+    # build targets, -D…). The target frees you from cd-ing into the straddle.
     idf_args = list(args.idf_args or [])
     target: Manifest | None = None
     if idf_args and not idf_args[0].startswith("-"):
@@ -2628,20 +2613,10 @@ def cmd_show(args: argparse.Namespace) -> int:
     THE init order (init_order()) — the same order the generated
     spangapInitStraddles() dispatcher fires the straddles in, derived from the
     same resolve_requires() walk that get-deps and the build use. Paths are the
-    container-native straddle dirs (/straddles/<repo> for a --straddles
-    checkout, <workspace>/<repo> for a git clone).
+    container-native straddle dirs (<workspace>/<repo> for a git clone).
     """
     cwd_dir = straddle_at_or_above(Path.cwd())
     proj = load_manifest(cwd_dir / "straddle.yaml") if cwd_dir else default_project()
-
-    st_file = WORKSPACE / ".spangap-straddles"
-    straddles = st_file.read_text().strip() if st_file.is_file() else ""
-    if straddles:
-        print(
-            f"NOTE: This workspace was initialized with --straddles: {straddles}, "
-            "mounted as /straddles in container"
-        )
-        print()
 
     rb = remembered_build()
     print("Last build invocation:")
@@ -2724,8 +2699,8 @@ def cmd_reallyclean(args: argparse.Namespace) -> int:
     removed = 0
 
     def _rmtree(t: Path) -> None:
-        # /straddles is virtiofs with keep_cache (dir-entry caching), so
-        # shutil.rmtree's fd walk can rmdir a parent before the cache reflects
+        # The workspace bind mount is virtiofs with keep_cache (dir-entry
+        # caching), so shutil.rmtree's fd walk can rmdir a parent before the cache reflects
         # the just-unlinked children and bail with ENOTEMPTY (errno 39) on a
         # dir that really is now empty. Retrying re-reads the fresh listing and
         # converges; a short sleep lets the cache settle between passes.

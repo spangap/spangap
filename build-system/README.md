@@ -10,18 +10,15 @@ and its [`docs/`](../spangap-core/docs/); the design *why* + full gotcha list is
 
 ## Where you are
 
-You're `spangap`, cwd **`<workspace>`** and the container always carries at least the
+You're `spangap`, cwd **`<workspace>`** and the container carries the
 host bind mount **`/home/spangap`** (persistent home, with the workspace nested under it
-at `/home/spangap/<basename>`) — plus optionally **`/straddles`** (only when this workspace
-was init'd with `--straddles`; see below). On macOS Docker Desktop these mounts are `fakeowner`
+at `/home/spangap/<basename>`). On macOS Docker Desktop these mounts are `fakeowner`
 type, which drives a couple of gotchas at the end of this file.
 
 Don't assume the rest of your situation — **discover it.** Running bare `spangap` reports the
 resolved project + its deps + the toolchain/environment. Running 'spangap' and looking at the output should ALWAYS be the first order of business to get the lay of the land.
 
 - `<workspace>/spangap.workspace.yaml` — the workspace marker (always present).
-- `<workspace>/.spangap-straddles` — **present ⟺ `--straddles` mode** (its contents are
-  the host checkout path that's bind-mounted at `/straddles`). Absent ⟹ clone mode.
 - `<workspace>/.spangap-build` — the **last build invocation**, target first:
   `<org/repo> [--with …] [--without …] [--flash-size N]`. Written by `spangap build`
   whenever a target is named explicitly or resolved from cwd, so a bare `spangap build`
@@ -52,27 +49,17 @@ tree (see ["What `spangap build` does"](#what-spangap-build-does-under-the-hood)
 
 ### Where the straddles live
 
-`spangap-inside` scans **two** container-native roots, in this order, and a straddle in
-either is equally usable:
+`spangap-inside` scans one container-native root:
 
-- **`<workspace>/<repo>`** — git clones. This is the **default** mode (no `--straddles`),
-  and what most sessions see: `init` clones just the build-system skeleton (`spangap`);
-  the first `spangap build <org>/<repo>` then clones the project and every transitive
-  dep into the workspace as flat sibling dirs, where they stay pinned. **Look here
-  first.**
-- **`/straddles/<repo>`** — a **flat `--straddles` checkout** bind-mounted whole, *only* when
-  the workspace was init'd with `--straddles <dir>`. When this mode is in play, the
-  straddles are under `/straddles` and `<workspace>` holds just workspace state (marker,
-  dotfiles, host venv); `/straddles` isn't mounted at all otherwise.
+- **`<workspace>/<repo>`** — git clones, laid out flat as sibling dirs. `init` clones
+  just the build-system skeleton (`spangap`); the first `spangap build <org>/<repo>`
+  then clones the project and every transitive dep into the workspace as flat sibling
+  dirs, where they stay pinned. **Look here.**
 
-Quick check: `cat <workspace>/.spangap-straddles 2>/dev/null` — a path means look in
-`/straddles`, nothing means look in `<workspace>`. (The two roots are disjoint by
-construction: --straddles mode never clones into `<workspace>`.)
-
-Both roots are **host bind mounts**, so anything you write under a straddle's `build/`
-is read directly by the host flasher, and the container path (`<workspace>/<repo>` or
-`/straddles/<repo>`) is what gets baked into `build/CMakeCache.txt`'s `CMAKE_HOME_DIRECTORY`
-— stable and host-independent. **Never bake a host-absolute path into the build.**
+The workspace is a **host bind mount**, so anything you write under a straddle's `build/`
+is read directly by the host flasher, and the container path (`<workspace>/<repo>`) is
+what gets baked into `build/CMakeCache.txt`'s `CMAKE_HOME_DIRECTORY` — stable and
+host-independent. **Never bake a host-absolute path into the build.**
 
 ## `spangap` in here = the in-container CLI
 
@@ -239,9 +226,9 @@ they work) — no output means it worked, not that it hung.
 - **Stack decode** needs the build's ELF, which the monitor finds in `esp-idf/build/` —
   so flash a build you actually built here and panics in `.spangap-log` resolve to source.
 
-## The straddle tree (`<workspace>` or `/straddles`)
+## The straddle tree (`<workspace>`)
 
-Whichever root applies (above), it's a **flat** directory of straddle dirs. A fully
+The workspace root is a **flat** directory of straddle dirs. A fully
 populated checkout of the core platform plus a downstream project looks like:
 
 ```
@@ -258,7 +245,7 @@ populated checkout of the core platform plus a downstream project looks like:
 per-buildable subset into one flat tree.) The flat layout is **mandatory**: on macOS
 Docker Desktop a symlink resolves through to its host target, so the browser
 `file:../../<sibling>/browser` deps only resolve when straddle roots are flat siblings
-(INTERNALS → "Flat --straddles checkout"). Don't add an org/ layer.
+(INTERNALS → "Flat workspace layout"). Don't add an org/ layer.
 
 `straddle.yaml` keys (contract: `build-system/schemas/straddle.schema.json` — the
 **authoritative** list; the schema is local, read it before hand-writing a manifest):
@@ -289,11 +276,11 @@ gate, which keys off the **repo name**, not the prefix):
 | `maps` | `maps` | `nomad` | `nomad` |
 | | | `hw-tdeck` | `tdeck` |
 
-This table can go stale — `spangap-inside` reads the real values; `ls /straddles` +
-`grep -h '^prefix:' /straddles/*/straddle.yaml` is the source of truth. Note `sshd` and
+This table can go stale — `spangap-inside` reads the real values; `ls <workspace>` +
+`grep -h '^prefix:' <workspace>/*/straddle.yaml` is the source of truth. Note `sshd` and
 `maps` exist as straddles but are **absent from the org-README straddle tables and from
 the `CONFIG_SPANGAP_*` alias list** below — don't assume the documented set is complete;
-enumerate `/straddles`.
+enumerate the workspace.
 
 ## What `spangap build` does under the hood
 
@@ -340,8 +327,7 @@ diverged from the image's `org.spangap.buildsys-hash` LABEL and rebuilds on the 
 host command).
 
 To **test an edit to the in-container CLI without a rebuild**, run the source copy
-directly (use the spangap repo's actual path — `<workspace>/spangap` in clone mode,
-`/straddles/spangap` under `--straddles`):
+directly (the spangap repo lives at `<workspace>/spangap`):
 
 ```sh
 . "$IDF_PATH/export.sh"                              # only needed for build; not for validate/list-*
@@ -391,12 +377,10 @@ then `spangap list-requires`; a real `spangap build` confirms staging + linking.
   leave it; don't "fix" the mode noise or chmod to silence it.
 - **The running `spangap` is the image copy**, not the source tree (see "Editing"
   above). Don't expect source edits to take effect through `spangap …` without a rebuild.
-- **Under `--straddles`, `/straddles` is a pinned checkout** — nothing is ever cloned; a
-  missing required straddle is an error ("add it to the checkout"), not a fetch. In clone
-  mode, missing transitive deps are fetched host-side into `<workspace>`.
-- **`reallyclean` is workspace-wide** — it reaches across *every* straddle in the active
-  root (including into a `--straddles` checkout, since `/straddles` *is* that checkout), but
-  only removes gitignored, regenerable output.
+- **Missing transitive deps are fetched host-side** into `<workspace>` — a missing
+  required straddle triggers a git clone, not an error.
+- **`reallyclean` is workspace-wide** — it reaches across *every* straddle in the
+  workspace, but only removes gitignored, regenerable output.
 
 ## Stale-doc caveats (the sibling READMEs are mid-rewrite — don't trust these bits)
 
@@ -405,8 +389,8 @@ superseded per-straddle `CLAUDE.md` files. Four concrete traps when reading them
 
 - **The flat layout is real; the `s/` paths in docs are not.** Some READMEs (notably
   `hw-tdeck`) link siblings as `../../s/spangap/INTERNALS.md` or
-  `[…](../../s/)`. There is **no `s/` directory** — `/straddles` (or `<workspace>`) is flat,
-  as this file's tree shows. Resolve any `s/`-style link to `/straddles/<repo>/…` directly.
+  `[…](../../s/)`. There is **no `s/` directory** — `<workspace>` is flat,
+  as this file's tree shows. Resolve any `s/`-style link to `<workspace>/<repo>/…` directly.
 - **README file-layout boxes are partly aspirational.** The org-profile README and
   `spangap-core` README describe the spangap repo as `cli/spangap`, `install/spangap`,
   `scripts/`, etc. The **actual** tree is `build-system/{spangap-inside, spangap-outside,

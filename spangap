@@ -38,7 +38,7 @@ spangap — ESP-32 build system. Assembles + builds "straddles" in a per-workspa
 Docker container; nothing but a small flash/monitor venv touches your host.
 
 Usage:
-  spangap init [--straddles DIR] [-v] [<dir>]   bootstrap a workspace
+  spangap init [-v] [<dir>]                     bootstrap a workspace
   spangap <command> [args...]                   run a command in a workspace
   spangap            (no command: same as `spangap show`)
   spangap --help | -h | help
@@ -65,9 +65,6 @@ init  (run outside any workspace; creates one):
                      A project is NOT acquired here — name one with
                      `spangap build <org>/<repo>` and it's cloned (with deps)
                      on first build and remembered for a bare `build`.
-  --straddles DIR    build from a local flat checkout (<DIR>/<repo>/) instead of
-                     cloning straddles from github; the tree is bind-mounted at
-                     /straddles in the build container.
   -v, --verbose      show docker build / git clone output (one status line per
                      phase otherwise).
 
@@ -105,31 +102,16 @@ init)
     #                       init then runs there. Without it, init uses cwd.
     #                       No <project> arg — `spangap build <org/repo>`
     #                       acquires (clones + remembers) the project.
-    #   --straddles <dir>   local source-of-truth checkout laid out flat as
-    #                       <dir>/<repo>/. When given, the whole tree is
-    #                       bind-mounted to /straddles in the build container
-    #                       (no per-straddle symlinks or clones — including the
-    #                       skeleton, run from <dir>/spangap); the path is
-    #                       persisted to $workspace/.spangap-straddles so
-    #                       subsequent `spangap` commands find the same tree.
     #   -v|--verbose        show the docker build / git clone output. Without
     #                       it, init prints one status line per phase and
     #                       suppresses the underlying commands' output.
     shift
-    straddles_arg=
     target_dir=
     verbose=
     cleanup_dir=
     while [ $# -gt 0 ]; do
         case $1 in
             -v|--verbose) verbose=1; shift ;;
-            --straddles)
-                [ $# -ge 2 ] || die "spangap init: --straddles needs a directory"
-                straddles_arg=$2
-                shift 2 ;;
-            --straddles=*)
-                straddles_arg=${1#*=}
-                shift ;;
             --) shift; break ;;
             -*) die "spangap init: unknown flag '$1'" ;;
             *)
@@ -184,20 +166,12 @@ init)
     # Refuse to nest a workspace inside a straddle. A straddle is a unit of
     # distributable code (marked by straddle.yaml at its root); init creates a
     # *workspace* (the build-env that assembles straddles), not a straddle, so
-    # running it here is always a mistake (a flat --straddles checkout has no
-    # workspace marker up-tree, so find_workspace won't catch this).
+    # running it here is always a mistake.
     [ -e straddle.yaml ] && die "inside a straddle dir ($PWD) — \`spangap init\` creates a workspace, not a straddle; run it in an empty dir (or pass one: spangap init <dir>)"
     # Leftover ./spangap (e.g. a previous init's clone that failed mid-flow).
     [ -e spangap ] && die "./spangap already exists in $PWD"
     command -v git >/dev/null 2>&1 || die "git required for \`spangap init\` — install git and retry"
     command -v python3 >/dev/null 2>&1 || die "python3 required for \`spangap init\` (used to create the host-side flash/monitor venv) — install python3 (with the venv module) and retry"
-
-    straddles=
-    if [ -n "$straddles_arg" ]; then
-        [ -d "$straddles_arg" ] \
-            || die "spangap init --straddles: $straddles_arg is not a directory"
-        straddles=$(cd "$straddles_arg" && pwd)
-    fi
 
     # Tag every spangap-outside helper we shell out to below (ensure-venv,
     # ensure-container) so their status lines read "init:" rather than the
@@ -209,31 +183,14 @@ init)
     # only once every fallible step below (venv, container build) has
     # succeeded. Its presence is what `find_workspace` keys off and what this
     # `init` refuses to clobber, so writing it up front would brick a retry
-    # after a mid-flow failure ("spangap.workspace.yaml already exists"). The
-    # intermediate .spangap-straddles below is needed by the spangap-outside
-    # helpers we invoke *during* init, so it's written here and simply
-    # overwritten on a retry.
-    if [ -n "$straddles" ]; then
-        printf '%s\n' "$straddles" > .spangap-straddles
-        echo "init: wrote .spangap-straddles = $straddles" >&2
-    fi
+    # after a mid-flow failure ("spangap.workspace.yaml already exists").
 
-    # Skeleton: the spangap build-system straddle. With a flat --straddles
-    # checkout it's at <straddles>/spangap and reached there directly (the whole
-    # tree gets bind-mounted to /straddles in the container; the host-side
-    # dispatcher finds spangap-outside under the checkout) — nothing is dropped
-    # in the workspace. Without --straddles, git-clone it into ./spangap/ so the
-    # workspace carries its own build system. skel_target is just where init
-    # invokes the spangap-outside helpers from below.
-    skel_target=
-    if [ -n "$straddles" ] && [ -d "$straddles/spangap" ]; then
-        echo "init: using spangap skeleton from $straddles/spangap" >&2
-        skel_target="$straddles/spangap"
-    else
-        echo "init: cloning $INIT_URL into ./spangap/..." >&2
-        git clone --quiet "$INIT_URL" spangap
-        skel_target="$PWD/spangap"
-    fi
+    # Skeleton: the spangap build-system straddle. Git-clone it into ./spangap/
+    # so the workspace carries its own build system. skel_target is just where
+    # init invokes the spangap-outside helpers from below.
+    echo "init: cloning $INIT_URL into ./spangap/..." >&2
+    git clone --quiet "$INIT_URL" spangap
+    skel_target="$PWD/spangap"
     # Quiet by default — collapse the docker build / git clone noise into one
     # status line per phase. -v|--verbose turns it all back on. SPANGAP_QUIET
     # propagates into spangap-outside via the env (see the ${SPANGAP_QUIET+set}
@@ -261,18 +218,11 @@ init)
 esac
 
 if ws=$(find_workspace); then
-    # spangap-outside lives in the spangap build-system straddle: under the
-    # straddles checkout at <straddles>/spangap when init was given --straddles
-    # (nothing is dropped in the workspace), else the ./spangap clone.
-    sd=
-    [ -f "$ws/.spangap-straddles" ] && sd=$(head -1 "$ws/.spangap-straddles" 2>/dev/null)
-    if [ -n "$sd" ] && [ -x "$sd/spangap/build-system/spangap-outside" ]; then
-        outside="$sd/spangap/build-system/spangap-outside"
-    else
-        outside="$ws/spangap/build-system/spangap-outside"
-    fi
+    # spangap-outside lives in the spangap build-system straddle, cloned into
+    # the workspace at <ws>/spangap.
+    outside="$ws/spangap/build-system/spangap-outside"
     [ -x "$outside" ] \
-        || die "spangap-outside not found ($outside) — re-clone or update the workspace skeleton, or check .spangap-straddles"
+        || die "spangap-outside not found ($outside) — re-clone or update the workspace skeleton"
     export SPANGAP_WORKSPACE="$ws"
     exec "$outside" "$@"
 fi

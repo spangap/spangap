@@ -69,9 +69,9 @@ export DOCKER_CLI_HINTS=false
 workspace="${SPANGAP_WORKSPACE:?spangap-outside: SPANGAP_WORKSPACE not set (invoke via the root \`spangap\` script)}"
 
 # Directory of the spangap skeleton this spangap-outside belongs to — one level
-# up from build-system/. In clone mode it's <workspace>/spangap; in --straddles
-# mode it's <straddles>/spangap. Used to seed README.md on `init-continue` and
-# to compare this skeleton's launcher against the on-PATH one for auto-upgrade.
+# up from build-system/ (<workspace>/spangap). Used to seed README.md on
+# `init-continue` and to compare this skeleton's launcher against the on-PATH
+# one for auto-upgrade.
 skel_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 # In-container path of the workspace bind mount. The workspace is mounted UNDER
@@ -108,9 +108,8 @@ done
 # Dependency HEAD-tracking. There are no releases yet, so everyone builds
 # main@HEAD: a dep git-cloned once would otherwise never move again (clone_spec
 # skips a present dir). By default a build refreshes each already-cloned dep to
-# its tracked upstream first (clone mode only — a --straddles checkout is a
-# pinned working tree and is never auto-moved). `--no-pull`, or SPANGAP_NO_PULL
-# in the environment, turns the refresh off.
+# its tracked upstream first. `--no-pull`, or SPANGAP_NO_PULL in the
+# environment, turns the refresh off.
 : "${SPANGAP_NO_PULL:=}"
 
 # Host-side flash/monitor venv. Lives entirely inside the workspace so
@@ -212,16 +211,12 @@ find_straddle() {
 
 # project_host_dir <name>: host dir of straddle <name>, or return 1. <name>
 # may be an <org>/<repo> or a bare repo — the flat layout names the dir by the
-# repo basename either way, so we strip any org/ prefix. A straddle is either
-# git-cloned at $workspace/<repo> or lives in the flat --straddles checkout at
-# <straddles>/<repo> (the latter is what gets bind-mounted to /straddles inside
-# the container). Checks the clone first.
+# repo basename either way, so we strip any org/ prefix. A straddle is
+# git-cloned at $workspace/<repo>.
 project_host_dir() {
-    local name=$1 repo sd
+    local name=$1 repo
     repo=${name##*/}
     [ -f "$workspace/$repo/straddle.yaml" ] && { printf '%s\n' "$workspace/$repo"; return 0; }
-    sd=$(read_straddles)
-    [ -n "$sd" ] && [ -f "$sd/$repo/straddle.yaml" ] && { printf '%s\n' "$sd/$repo"; return 0; }
     return 1
 }
 
@@ -307,7 +302,7 @@ require_straddle() {
         local t dir
         if t=$(remembered_build_target); then
             dir=$(project_host_dir "$t") \
-                || die ".spangap-build names target '$t' but no straddle.yaml for it under $workspace or <straddles> — \`spangap build $t\` to (re)acquire it"
+                || die ".spangap-build names target '$t' but no straddle.yaml for it under $workspace — \`spangap build $t\` to (re)acquire it"
             printf '%s\n' "$dir"
             return 0
         fi
@@ -385,26 +380,6 @@ LOG_PORT=${SPANGAP_LOG_PORT:-2324}
 FORWARD_SCRIPT="$workspace/.spangap-forward.py"
 FORWARD_PID="$workspace/.spangap-forward-$(uname -s)-$(uname -m).pid"
 FORWARD_LOG="$workspace/.spangap-forward-$(uname -s)-$(uname -m).log"
-
-# Local straddles override: $workspace/.spangap-straddles holds one host path —
-# a flat checkout whose <repo>/ children are the straddles. Instead of
-# git-cloning, the whole tree is bind-mounted to /straddles inside the container,
-# so the build runs against your working tree without round-tripping through
-# github. Written by `spangap init --straddles <dir>`; empty/missing file or
-# a path that no longer exists ⇒ silently disabled (fall through to git
-# clone as before).
-STRADDLES_FILE="$workspace/.spangap-straddles"
-read_straddles() {
-    [ -f "$STRADDLES_FILE" ] || return 0
-    local p
-    p=$(head -1 "$STRADDLES_FILE" 2>/dev/null)
-    # Trim surrounding whitespace.
-    p=${p#"${p%%[![:space:]]*}"}
-    p=${p%"${p##*[![:space:]]}"}
-    [ -z "$p" ] && return 0
-    [ -d "$p" ] || return 0
-    printf '%s\n' "$p"
-}
 
 # read_or_die <file> <env-var-name> <cmd> <thing>: explicit env wins, else
 # state file, else die.
@@ -808,17 +783,6 @@ ensure_addr2line_shim() {
         rm -f "$shim" 2>/dev/null || true
         printf 'notool\n'; return 0
     fi
-    # Translate against what the *container* actually has mounted, not the
-    # current .spangap-straddles. The /straddles bind mount is fixed when the
-    # container is created and recorded in its org.spangap.straddles label;
-    # the .spangap-straddles file can drift from it (toggling --straddles on/off,
-    # or comparing both modes, without `spangap reset-workspace`). Translating against the
-    # file instead of the live mount would hand the container a path that isn't
-    # mounted there → addr2line can't open the ELF → silent no-decode. The label
-    # is the source of truth.
-    local sd
-    sd=$(docker inspect -f '{{ index .Config.Labels "org.spangap.straddles" }}' \
-        "$container" 2>/dev/null) || sd=""
     mkdir -p "$SHIM_DIR"
     {
         printf '%s\n' '#!/bin/bash'
@@ -830,23 +794,16 @@ ensure_addr2line_shim() {
         printf 'a2l=%q\n' "$a2l"
         printf 'workspace=%q\n' "$workspace"
         printf 'container_ws=%q\n' "$container_ws"
-        printf 'straddles=%q\n' "$sd"
         cat <<'SHIM'
 # addr2line's only path argument is the ELF (-e <path>); bare addresses pass
-# through untouched. Rewrite any arg that lives under the workspace / straddles
-# checkout to its container mount ($container_ws/... or /straddles/...).
+# through untouched. Rewrite any arg that lives under the workspace to its
+# container mount ($container_ws/...).
 args=()
 for a in "$@"; do
     case $a in
         "$workspace")   args+=("$container_ws") ;;
         "$workspace"/*) args+=("$container_ws/${a#"$workspace"/}") ;;
-        *)
-            if [ -n "$straddles" ] && { [ "$a" = "$straddles" ] || case $a in "$straddles"/*) true ;; *) false ;; esac; }; then
-                [ "$a" = "$straddles" ] && args+=(/straddles) || args+=("/straddles/${a#"$straddles"/}")
-            else
-                args+=("$a")
-            fi
-            ;;
+        *)              args+=("$a") ;;
     esac
 done
 exec docker exec -i "$container" "$a2l" "${args[@]}"
@@ -1494,13 +1451,8 @@ ensure_container() {
     ensure_daemon
 
     # The spangap build-system straddle (Dockerfile + build-system/) is the
-    # build context. With a flat --straddles checkout it lives at
-    # <straddles>/spangap; without one it's git-cloned into $workspace/spangap.
-    # No symlink either way — the checkout itself is the source of truth.
-    local straddles
-    straddles=$(read_straddles)
+    # build context, git-cloned into $workspace/spangap.
     local ctx="$workspace/spangap"
-    [ -n "$straddles" ] && [ -d "$straddles/spangap" ] && ctx="$straddles/spangap"
     local local_hash=""
     [ -f "$ctx/build-system/Dockerfile" ] && local_hash=$(buildsys_hash "$ctx")
 
@@ -1540,15 +1492,7 @@ ensure_container() {
             # "container breakout" error before `test` ever runs.
             if docker exec --workdir / "$container" \
                     test -f "$container_ws/spangap.workspace.yaml" >/dev/null 2>&1; then
-                # Also recreate if .spangap-straddles changed since the
-                # container was started — the bind mount for the straddles
-                # checkout is baked in at `docker run` time.
-                local stored_sd why=""
-                stored_sd=$(docker inspect --format \
-                    '{{ index .Config.Labels "org.spangap.straddles" }}' \
-                    "$container" 2>/dev/null) || stored_sd=""
-                [ "$straddles" = "$stored_sd" ] \
-                    || why=".spangap-straddles changed since container start"
+                local why=""
                 if ! container_publishes_dev_port; then
                     [ -n "$why" ] && why="$why; the dev port is unpublished" \
                                   || why="the dev port ($DEV_PORT) is unpublished"
@@ -1604,21 +1548,8 @@ ensure_container() {
     announce_container_setup
     mkdir -p "$spangap_home"
 
-    # Bind-mount the flat --straddles checkout at /straddles — one whole-tree
-    # mount, so every straddle shows up at /straddles/<repo> as a real,
-    # container-native dir. No symlinks and no host paths inside the container:
-    # the build navigates /straddles/<repo>, and `file:../../<sibling>` resolves
-    # to /straddles/<sibling> because the tree is flat. Adding/removing a straddle
-    # under <straddles> needs no `spangap reset-workspace` — the whole-tree mount
-    # picks it up live. (No --straddles → straddles are git-cloned as real flat
-    # dirs in the workspace, covered by the workspace mount.)
-    local straddles_mount=()
-    [ -n "$straddles" ] && straddles_mount=(-v "$straddles:/straddles")
-
-    # macOS still ships bash 3.2 where `${empty_array[@]}` trips `set -u`
-    # with "unbound variable" — only bash 4+ treats it as zero words.
-    # The `${name[@]+"${name[@]}"}` idiom expands to nothing when the
-    # array is empty and to the elements otherwise, on both versions.
+    # Straddles are git-cloned as real flat dirs in the workspace, covered by the
+    # workspace mount below — no symlinks and no host paths inside the container.
     #
     # No --network=host. On Docker Desktop (Mac/Windows) it's a no-op for our
     # purposes: "host" is the Linux VM's namespace, not the Mac's, so it never
@@ -1650,10 +1581,8 @@ ensure_container() {
         -p "127.0.0.1::$DEV_PORT" \
         -v "$spangap_home:/home/spangap" \
         -v "$workspace:$container_ws" \
-        ${straddles_mount[@]+"${straddles_mount[@]}"} \
         --workdir "$container_ws" \
         --label spangap.workspace="$workspace" \
-        --label org.spangap.straddles="$straddles" \
         "$IMAGE" sleep infinity >/dev/null
 
     # Pre-create the npm prefix dir (Dockerfile sets NPM_CONFIG_PREFIX
@@ -1670,25 +1599,16 @@ ensure_container() {
 # (so host github auth is used — the container has no creds). Loops because
 # this iteration's siblings may add their own requires:.
 # Shared one-spec acquire: <org>/<repo>[@<ref>] → $workspace/<repo>. Only
-# ever called for genuinely-missing deps — anything present under the
-# --straddles checkout already shows up at /straddles/<repo> inside the
-# container, so list-deps never reports it.
-#
-# --straddles mode is local-only and **never clones**: a --straddles checkout is
-# a pinned set of straddles you always build against, so reaching out to github
-# for a missing one would silently mix in a different copy. If the repo is in the
-# checkout it's already on /straddles (no-op here); if it isn't, that's an error
-# telling you to add it to your checkout — we don't fall back to a clone.
-# Without --straddles, git-clone into $workspace/<repo> (a real dir the scan
-# picks up). Honours SPANGAP_QUIET (single rollup line instead of one per
-# repo). Used by both the explicit --with pre-fetch and the list-deps loop.
+# ever called for genuinely-missing deps. git-clone into $workspace/<repo> (a
+# real dir the scan picks up). Honours SPANGAP_QUIET (single rollup line instead
+# of one per repo). Used by both the explicit --with pre-fetch and the list-deps
+# loop.
 # Refresh an already-present dependency clone to its tracked upstream before the
 # build reads it (see the SPANGAP_NO_PULL note near the top). Deliberately
 # conservative and ALWAYS non-fatal: a pull problem must never fail a build that
 # could proceed against the checkout already on disk. Leaves the checkout
 # untouched when:
 #   - --no-pull / SPANGAP_NO_PULL is set;
-#   - we're in --straddles mode (a pinned local checkout is never auto-moved);
 #   - a specific @<ref> was requested (a pin means that exact commit — it was
 #     checked out at clone time and must not drift);
 #   - the dir isn't a git repo, HEAD is detached, or there is no upstream;
@@ -1699,7 +1619,6 @@ pull_dep() {
     local bare=$1 dest=$2 ref=$3
     [ -n "$SPANGAP_NO_PULL" ] && return 0
     [ -n "$ref" ] && return 0
-    [ -n "$(read_straddles)" ] && return 0
     [ -d "$dest/.git" ] || return 0
     git -C "$dest" symbolic-ref -q HEAD >/dev/null 2>&1 || return 0          # on a branch?
     git -C "$dest" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1 || return 0  # tracks a remote?
@@ -1723,11 +1642,6 @@ clone_spec() {
     if [ -e "$dest" ]; then
         pull_dep "$bare" "$dest" "$ref"
         return 0
-    fi
-    local sd; sd=$(read_straddles)
-    if [ -n "$sd" ]; then
-        [ -d "$sd/$repo" ] && return 0   # already in the checkout → on /straddles
-        die "$bare is not in your --straddles checkout ($sd), and --straddles mode never clones — add it to $sd and retry (or fix its straddle.yaml 'name:' if it's there under another dir name)."
     fi
     if [ -n "$SPANGAP_QUIET" ]; then
         if [ "$__clone_announced" = "0" ]; then
@@ -1832,9 +1746,9 @@ reset-workspace)
     ensure_daemon
     # reallyclean first while the container is still alive: it sweeps every
     # straddle's build/, managed_components/, node_modules/, .quasar/, etc.
-    # Those artifacts live under the straddles (at /straddles/<repo> or
-    # <workspace>/<repo>), so removing the container without cleaning them
-    # first leaves source-realpath addresses baked into CMakeCache that
+    # Those artifacts live under the straddles (at <workspace>/<repo>), so
+    # removing the container without cleaning them first leaves source-realpath
+    # addresses baked into CMakeCache that
     # resurface on the next build. reallyclean is workspace-wide and needs no
     # project context, so any cwd works. Best-effort — if it fails we still
     # tear down.
@@ -1866,25 +1780,17 @@ esac
 ensure_container
 
 # host_to_container <host-path>: map an absolute host path to its in-container
-# equivalent. The two bind mounts are the workspace (at $container_ws =
-# /home/spangap/<basename>) and /straddles (the flat --straddles checkout, when
-# set), so a path under the workspace becomes $container_ws/<rel> and one under
-# the straddles checkout becomes /straddles/<rel>. Used to turn a resolved
-# straddle's host dir (which may live in either) into the --workdir for docker exec.
+# equivalent. The workspace bind mount (at $container_ws =
+# /home/spangap/<basename>) is the only relevant one, so a path under the
+# workspace becomes $container_ws/<rel>. Used to turn a resolved straddle's host
+# dir into the --workdir for docker exec.
 host_to_container() {
-    local h=$1 sd
+    local h=$1
     case $h in
         "$workspace")   printf '%s\n' "$container_ws"; return ;;
         "$workspace"/*) printf '%s/%s\n' "$container_ws" "${h#"$workspace"/}"; return ;;
     esac
-    sd=$(read_straddles)
-    if [ -n "$sd" ]; then
-        case $h in
-            "$sd")   printf '/straddles\n'; return ;;
-            "$sd"/*) printf '/straddles/%s\n' "${h#"$sd"/}"; return ;;
-        esac
-    fi
-    die "path $h is under neither the workspace ($workspace) nor the --straddles checkout"
+    die "path $h is not under the workspace ($workspace)"
 }
 
 # Container cwd = host cwd remapped. find_workspace guarantees cwd is under the
@@ -1961,8 +1867,7 @@ build)
         use_remembered=1
     fi
 
-    # Acquire the project (clone mode): an <org>/<repo> target not yet present.
-    # In --straddles mode clone_spec refuses and points at the checkout.
+    # Acquire the project: an <org>/<repo> target not yet present.
     case $target_tok in
         */*) project_host_dir "$target_tok" >/dev/null 2>&1 || clone_spec "$target_tok" ;;
     esac

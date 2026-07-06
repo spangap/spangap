@@ -153,35 +153,27 @@ reset-workspace) or docker-execs `spangap-inside` in the build-env container
 (`spangap-<hash7(workspace)>`).
 
 **Workspace layout.** No symlinks. Straddles reach the container through one
-of two flat, container-native roots:
+flat, container-native root:
 
-- `/straddles/<repo>` — the **flat** local checkout (`<straddles>/<repo>`, every
-  straddle a direct child) passed to `init --straddles`, bind-mounted *whole*
-  to `/straddles` (one mount). Adding/removing a straddle under it needs no
-  `spangap reset-workspace` — the whole-tree mount picks it up live. **--straddles mode is
-  local-only and never clones:** the checkout is a pinned set you always build
-  against, so a required straddle that isn't in it is an error (add it to the
-  checkout), never a silent github fetch of a possibly-different copy. Build a
-  workspace from scratch against it and nothing comes from github.
-- `<workspace>/<repo>` — git clones, used **only without `--straddles`**: the
-  host fetches missing transitive deps here, and they stay (pinned) until you
-  delete them. The workspace dir also holds the marker, the dotfiles, and the
-  per-host venv.
+- `<workspace>/<repo>` — git clones, every straddle a flat direct child of the
+  workspace: the host fetches missing transitive deps here, and they stay
+  (pinned) until you delete them. The workspace dir also holds the marker, the
+  dotfiles, and the per-host venv.
 
-`spangap-inside` scans both roots. Because each root is flat, the browser
+`spangap-inside` scans that root. Because it's flat, the browser
 `file:../../<sibling>/browser` deps — which assume straddle roots are flat
 siblings — resolve directly; there's no synthetic re-mount. (An earlier
 design used a separate `/work` mount plus a `.link` symlink suffix to paper
 over an *org-layered* checkout, where those `file:` deps dangled; flattening
 the checkout removed the need for both.) The container sees the persistent
-`/home/spangap` mount (with the workspace nested under it at
-`/home/spangap/<basename>`) and, under `--straddles`, the `/straddles` checkout mount.
+`/home/spangap` mount, with the workspace nested under it at
+`/home/spangap/<basename>`.
 
 **No host paths inside.** Because straddles are referenced at their container
-paths (`/straddles/<repo>`, `<workspace>/<repo>`) and never via a host-absolute
-symlink, the `CMAKE_HOME_DIRECTORY` baked into `build/CMakeCache.txt` is a
-container path — stable and host-independent. (Flash/monitor on the host read
-`build/` through the same inode: `/straddles` *is* `<straddles>` on the host.)
+paths (`<workspace>/<repo>`) and never via a host-absolute symlink, the
+`CMAKE_HOME_DIRECTORY` baked into `build/CMakeCache.txt` is a container path —
+stable and host-independent. (Flash/monitor on the host read `build/` through
+the same inode.)
 
 **Project resolution is symmetric across the two sides.** From the workspace
 root, both `spangap-outside` (`require_straddle`) and `spangap-inside`
@@ -189,9 +181,8 @@ root, both `spangap-outside` (`require_straddle`) and `spangap-inside`
 `.spangap-build` — so `build` / `flash` / `validate` / `show` work from the
 root, on the host and inside the container, not only from inside the straddle
 dir. A *different* straddle is named directly: `spangap build <org>/<repo>`
-resolves the target regardless of cwd (and, in clone mode, git-clones it +
-deps if missing), which is what makes targeting work under --straddles, where
-straddles live at `/straddles` outside the workspace tree. The container's
+resolves the target regardless of cwd (git-cloning it + deps if missing),
+which is what makes targeting work from anywhere in the workspace. The container's
 `cmd_build` writes `.spangap-build` (canonical `<org/repo>` + `--with` /
 `--without` / `--flash-size`) whenever the target came from an explicit
 positional or cwd — never on a pure replay (bare `build`, or passthrough like
@@ -219,7 +210,7 @@ it that way:
 - **`init` handoff.** `spangap init` does only the irreducible bootstrap —
   parse args, create/enter the workspace dir (arming a cleanup trap that
   `rm -rf`s a dir *it* created on failure), run the cheap pre-clone guards, and
-  obtain a skeleton (clone `./spangap`, or point at `<straddles>/spangap`). It
+  obtain a skeleton (clone `./spangap`). It
   then runs `spangap-outside init-continue` (**not** `exec`, so the trap
   survives) for the rest: seed `README.md`, build the venv + container, and
   write `spangap.workspace.yaml` **last** as the success barrier. Those steps
@@ -263,9 +254,7 @@ Common verbs:
     sibling. Fully-qualified `<org>/<repo>` (`spangap/spangap-sshd`) is
     auto-cloned from github by the host dispatcher if not yet present.
     The included straddle is treated as a soft dep root: its own
-    `requires:` / `additional_installs:` are followed transitively. Under
-    `--straddles` nothing is cloned (see "--straddles is local-only" below) —
-    a slash-form `--with` not in the checkout is an error, not a fetch.
+    `requires:` / `additional_installs:` are followed transitively.
   - `--flash-size <MB>` overrides `CONFIG_ESPTOOLPY_FLASHSIZE_*MB` for
     this build — useful when running a generic spangap firmware against
     differently-sized hardware. Valid: 4, 8, 16, 32, 64, 128. Probe a
@@ -283,9 +272,8 @@ Common verbs:
   `requires:` (also runs implicitly as the first phase of `build`)
 - `spangap cli [-h <host>] <cmd>…` — talk to the device's TCP CLI
 - `spangap clean` / `spangap reallyclean` — incremental clean vs source-only
-  (reallyclean sweeps **every** straddle, not just the current project, and
-  reaches into the --straddles checkout since `/straddles` *is* the checkout —
-  gitignored artifacts only)
+  (reallyclean sweeps **every** straddle in the workspace, not just the current
+  project — gitignored artifacts only)
 - `spangap docker <cmd>…` — raw `docker exec` into the build-env container
   (e.g. `spangap docker sh` to drop into a shell, `spangap docker claude`)
 
@@ -310,7 +298,7 @@ monorepo tooling (npm/pnpm/yarn workspaces) assumes a single owning root that
 enumerates its members, which a polyrepo doesn't have, so such tooling only
 ever *partially* fits.
 
-### Flat --straddles checkout + `/straddles` mount, and the alternatives we rejected
+### Flat workspace layout
 
 The forcing function is the browser side: a buildable's `web-interface`
 depends on sibling browser packages via `file:../../<sibling>/browser`, which
@@ -322,39 +310,20 @@ host landing place**, so the *layout of that landing place* is what node's
 
 - org-layered checkout (`<rp>/<org>/<repo>`) → `../../<sibling>` lands at
   `<rp>/<org>/<sibling>` → **dangles** (sibling is under a different org).
-- flat checkout (`<rp>/<repo>`) → `../../<sibling>` → `<rp>/<sibling>` →
+- flat layout (`<rp>/<repo>`) → `../../<sibling>` → `<rp>/<sibling>` →
   **resolves**.
 
-So we require a **flat** --straddles checkout. An earlier design instead kept the
-checkout org-layered and papered over it with (a) `.link` visibility symlinks
+So the workspace is a **flat** directory of straddle dirs — every straddle a
+direct child, cloned as `<workspace>/<repo>`. An earlier design instead kept an
+org-layered checkout and papered over it with (a) `.link` visibility symlinks
 in the workspace and (b) per-straddle `/work/<repo>` bind mounts that
 synthesized a flat tree the kernel couldn't realpath out of. Flattening the
-checkout makes both unnecessary — there's nothing to flatten or disambiguate.
+layout makes both unnecessary — there's nothing to flatten or disambiguate.
 
-Given a flat checkout, why bind-mount it at a *separate* `/straddles` instead of
-straight onto the workspace mount?
-
-- The workspace dir — it carries the marker, the dotfiles, the
-  per-host venv, and (without --straddles) the git clones. Mounting the checkout
-  *onto* the workspace would **shadow all of that**.
-- Per-straddle mounts at `<workspace>/<repo>` don't help either: Docker
-  auto-creates each mount-point inside the (bind-mounted) workspace, so they
-  surface as **empty dirs in the host workspace** (the mounts exist only inside
-  the container), and the mount set is fixed at `docker run` so adding a repo
-  needs a `reset-workspace`. (Relatedly: a symlink sitting at a bind-mount target gets
-  resolved-through by Docker Desktop *before* binding — so you can't overlay a
-  mount where a symlink already is. That's the original reason `/work` + the
-  `.link` suffix existed.)
-- Making the workspace *be* the checkout (mount it whole as the workspace) was
-  considered and **rejected**: it kills "remove a workspace and do a whole
-  install from scratch." The separate workspace ↔ checkout split is exactly
-  what lets you `rm -rf` a workspace and re-`init --straddles` against your
-  local source without touching — or re-cloning — the checkout.
-
-Result: one whole-tree `/straddles` mount + a separate workspace mount; `spangap-inside`
-scans both as flat roots; straddles are referenced at **container-native**
-paths so `CMAKE_HOME_DIRECTORY` (baked into `build/CMakeCache.txt`) is stable
-and host-independent — host paths never leak inside.
+`spangap-inside` scans that one flat root; straddles are referenced at their
+**container-native** paths (`<workspace>/<repo>`) so `CMAKE_HOME_DIRECTORY`
+(baked into `build/CMakeCache.txt`) is stable and host-independent — host paths
+never leak inside.
 
 ### macOS Docker Desktop gotchas worth knowing
 
@@ -371,16 +340,6 @@ and host-independent — host paths never leak inside.
   marker (not `test -d <workspace>`, which lies on a dangling mount) and
   recreates the container if it's missing.
 
-### --straddles is local-only and never clones
-
-A --straddles checkout is a **pinned set** you always build against. Cloning a
-missing dep from github would silently mix in a *different* copy than your
-local set, breaking "always build the same thing." So under `--straddles`,
-`clone_spec` never fetches: a required straddle present in the checkout is a
-no-op (it's already on `/straddles`), and one that's absent is an **error** ("add
-it to your checkout"). Without a --straddles checkout, missing deps are git-cloned into
-`<workspace>/<repo>` and pinned there until deleted.
-
 ### Build output, cleaning, flashing
 
 - **Quiet by default + `-v`** live in `spangap-inside` (not a host-side
@@ -389,8 +348,8 @@ it to your checkout"). Without a --straddles checkout, missing deps are git-clon
 - **`reallyclean` is workspace-wide**: a build drops artifacts into *every*
   staged straddle (`build/`, `managed_components/` in firmware dirs;
   `node_modules/` in browser dirs), so cleaning is project-independent and
-  sweeps all straddles. It reaches into the --straddles checkout (`/straddles` is the
-  checkout) but only ever removes gitignored, regenerable output.
+  sweeps all straddles in the workspace — but only ever removes gitignored,
+  regenerable output.
 - **A direct `spangap flash` clears `.spangap-flashme`** on success, so a monitor
   that starts later doesn't treat the stale signal as a fresh reflash request.
 

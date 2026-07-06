@@ -105,7 +105,7 @@ COPY --chmod=0644 build-system/schemas/straddle.schema.json /usr/local/share/spa
 # Container assistant instructions. Normally seeded into a workspace as README.md
 # at `spangap init`; baked in here too so `spangap claude` can re-seed it (and the
 # CLAUDE.md pointer it writes) in a workspace predating that flow. Version-matched
-# to the CLI and present regardless of clone vs --straddles mode.
+# to the CLI.
 COPY --chmod=0644 build-system/README.md /usr/local/share/spangap/README.md
 
 # Stamp the build-system/ content hash so spangap-outside can detect a stale
@@ -152,9 +152,8 @@ ENV NPM_CONFIG_PREFIX=/home/spangap/.npm-global
 ENV PATH=/home/spangap/.npm-global/bin:$PATH
 
 # The workspace bind-mount lands at /home/spangap/<basename> (under the
-# persistent ~ mount), not a fixed path; the flat --straddles checkout (when
-# set) is bind-mounted whole at /straddles, so straddles are container-native
-# dirs at /straddles/<repo> or <workspace>/<repo>. spangap-outside passes
+# persistent ~ mount), not a fixed path; straddles are container-native dirs at
+# <workspace>/<repo>. spangap-outside passes
 # --workdir (and SPANGAP_WORKSPACE) to every `docker exec`, so this WORKDIR is
 # mostly cosmetic (default for `docker run` only, and the container is started
 # with `sleep infinity`). Set to the home mount, which is always present.

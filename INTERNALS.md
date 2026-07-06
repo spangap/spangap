@@ -339,6 +339,35 @@ never leak inside.
   gone inode; `ensure_container` probes for the `spangap.workspace.yaml`
   marker (not `test -d <workspace>`, which lies on a dangling mount) and
   recreates the container if it's missing.
+- **VirtioFS `keep_cache` can freeze a truncated packfile in the container's
+  view.** The workspace mount is `virtiofs … keep_cache` (see `/proc/mounts`):
+  the guest never invalidates its page cache for a file across opens. A repo
+  whose `.git/objects/pack/*.pack` the container cached *mid-clone* (while the
+  host was still writing it) stays truncated **in the container** forever —
+  `git status`/`log`/`commit` there fail with `packfile does not match index`,
+  `too short to be a packfile`, or `bad object HEAD`, even though the host's copy
+  is complete (the `.idx`/`.rev`, which git writes *after* the full `.pack`, are
+  correctly sized). This is the same `keep_cache` behaviour that makes
+  `.spangap-log` unreadable in-container (worked around there with the host log
+  relay). Note `git rev-parse HEAD` still *succeeds* on a broken repo — it reads
+  the loose ref without touching the pack — so it's a misleading health check;
+  resolving `HEAD^{tree}` (which reads objects) is the real test.
+
+  **Self-heal — `heal_truncated_packs()` (spangap-inside).** For each workspace
+  repo it resolves `HEAD^{tree}` (one `git rev-parse`, no network); if a
+  committed HEAD won't resolve, the object store is unreadable, so it moves the
+  bad pack aside, `git fetch origin` to write a fresh pack (a pack the
+  **container** authors is cached coherently), and — if the fetch didn't fix it —
+  restores the original bytes exactly (never leaves a repo worse). It touches
+  only `.git/objects/pack/`, never the working tree. It runs automatically at the
+  start of every `spangap build` (cheap: one rev-parse per repo when nothing is
+  broken; a refetch only for genuinely-broken repos) and after host-side
+  `get-deps`; **`spangap heal`** triggers it on demand. It needs the repo's
+  `origin` reachable without host credentials (the straddle repos are public), so
+  a broken *and* unreachable repo is reported and left for a host-side commit.
+  The permanent alternative is switching Docker Desktop's file sharing from
+  VirtioFS to gRPC-FUSE — coherent, but slower for the many-small-file I/O of
+  ESP-IDF builds.
 
 ### Build output, cleaning, flashing
 

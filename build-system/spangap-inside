@@ -2251,7 +2251,88 @@ def write_flasher_zip(build_dir: Path) -> None:
           file=sys.stderr)
 
 
+def _git(repo: Path, *args: str, timeout: int | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True, text=True, timeout=timeout,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+
+
+def _objstore_broken(repo: Path) -> bool:
+    """True if a repo has a committed HEAD whose objects can't be read — the
+    virtiofs keep_cache truncated-pack signature (see INTERNALS.md → macOS Docker
+    Desktop gotchas). Healthy repos resolve HEAD's tree in one call (the common
+    path); a repo with no commits has no HEAD and is not our case."""
+    if _git(repo, "rev-parse", "-q", "--verify", "HEAD^{tree}").returncode == 0:
+        return False
+    # HEAD tree didn't resolve: a truncated pack, OR a repo with no committed HEAD.
+    return _git(repo, "rev-parse", "-q", "--verify", "HEAD").returncode == 0
+
+
+def _heal_repo(repo: Path) -> bool:
+    """Re-materialise a repo's object store from origin so it reads in-container.
+
+    The truncated pack is complete on the host but the container's keep_cache view
+    is frozen short; a pack the CONTAINER fetches is cached coherently. Move the
+    bad pack(s) aside, fetch a fresh one, and — if that didn't fix it — restore
+    the original bytes exactly (never leaves a repo worse than we found it). The
+    working tree is never touched; only .git/objects/pack/."""
+    if _git(repo, "remote", "get-url", "origin").returncode != 0:
+        return False  # nothing to refetch from
+    packdir = repo / ".git" / "objects" / "pack"
+    stash = repo / ".git" / "spangap-broken-packs"
+    shutil.rmtree(stash, ignore_errors=True)
+    stash.mkdir(parents=True, exist_ok=True)
+    for f in [p for p in packdir.iterdir() if p.is_file()]:
+        f.rename(stash / f.name)     # pack/ now empty → fetch does a full download
+    try:
+        _git(repo, "fetch", "origin", timeout=300)
+    except subprocess.TimeoutExpired:
+        pass
+    if not _objstore_broken(repo):
+        shutil.rmtree(stash, ignore_errors=True)
+        return True
+    # Fetch didn't help — undo: drop anything it wrote, restore the originals.
+    for f in [p for p in packdir.iterdir() if p.is_file()]:
+        f.unlink()
+    for f in list(stash.iterdir()):
+        f.rename(packdir / f.name)
+    shutil.rmtree(stash, ignore_errors=True)
+    return False
+
+
+def heal_truncated_packs(verbose: bool = False) -> None:
+    """Detect and repair workspace repos whose git object store is unreadable in
+    the container because virtiofs keep_cache froze a mid-clone truncated packfile
+    (see INTERNALS.md → macOS Docker Desktop gotchas). Cheap when nothing is
+    broken — one `git rev-parse` per repo, no network — so it runs at every build;
+    only a genuinely-broken repo triggers a refetch from origin."""
+    if not WORKSPACE.is_dir():
+        return
+    healed, failed = [], []
+    for child in sorted(WORKSPACE.iterdir()):
+        if not (child / ".git").exists() or not _objstore_broken(child):
+            continue
+        print(f"spangap: {child.name}: git objects unreadable (virtiofs truncated "
+              "pack) — refetching from origin…", file=sys.stderr)
+        (healed if _heal_repo(child) else failed).append(child.name)
+    if healed:
+        print(f"spangap: healed {len(healed)} repo(s): {', '.join(healed)}", file=sys.stderr)
+    if failed:
+        print(f"spangap: could NOT heal {', '.join(failed)} (no origin or offline) — "
+              "commit these from the host", file=sys.stderr)
+    if verbose and not healed and not failed:
+        print("spangap: all workspace git repos readable — nothing to heal", file=sys.stderr)
+
+
+def cmd_heal(args: argparse.Namespace) -> int:
+    heal_truncated_packs(verbose=True)
+    return 0
+
+
 def cmd_build(args: argparse.Namespace) -> int:
+    heal_truncated_packs()   # repair any virtiofs-truncated packs before we build
     all_straddles = scan_workspace_straddles()
 
     # Optional leading positional target: `spangap build <straddle> [idf args…]`.
@@ -3204,6 +3285,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_show)
     sub = p.add_subparsers(dest="cmd", required=False)
 
+    sub.add_parser("heal", help="repair workspace repos whose git object store is unreadable in-container (virtiofs truncated packs) by refetching from origin; runs automatically before each build").set_defaults(func=cmd_heal)
     sub.add_parser("validate", help="parse + validate manifest and dep graph").set_defaults(func=cmd_validate)
     sub.add_parser("clean", help="run idf.py fullclean").set_defaults(func=cmd_clean)
     sub.add_parser("reallyclean", help="strip ALL workspace straddles back to source-only state (build/, managed_components/, node_modules/, …)").set_defaults(func=cmd_reallyclean)

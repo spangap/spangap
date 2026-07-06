@@ -2007,6 +2007,10 @@ $inc"
     done
     # shellcheck disable=SC2086  # tokens are simple org/repo names + flags
     fetch_missing_deps "$container_cwd" $gd_flags
+    # Freshly host-cloned packs can read short in the container (virtiofs
+    # keep_cache) — heal the container's view now, before anything relies on git
+    # there. Best-effort; the next `spangap build` heals too.
+    [ -n "${container:-}" ] && docker exec -e SPANGAP_WORKSPACE="$container_ws" "$container" spangap heal || true
     log "get-deps done — all requires: present"
     exit 0
     ;;

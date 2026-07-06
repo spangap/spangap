@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -1515,6 +1516,29 @@ def _kconfig_key(line: str) -> str:
     return line.split("=", 1)[0]          # "CONFIG_X=..."
 
 
+def _flatten_kconfig(items: list, staged: set[str] | None = None) -> list[str]:
+    """Flatten a straddle's raw `kconfig:` list to plain sdkconfig lines.
+
+    Each item is either a plain `CONFIG_x=y` string or a `when:`-gated group
+    `{when: <org>/<repo>, set: [lines]}`. A group's lines are kept only when
+    `staged` is None (the caller wants every candidate line — the flash-size
+    scan) or its `when` straddle is in `staged`. This mirrors the `when:` gating
+    hooks use, so a board can declare a peripheral's pins (LoRa/audio) whose
+    CONFIG_* symbols only exist when the consuming straddle is staged, without
+    them warning as unknown symbols in a build that omits it. Plain strings are
+    unconditional.
+    """
+    out: list[str] = []
+    for it in items:
+        if isinstance(it, str):
+            out.append(it)
+        elif isinstance(it, dict):
+            when = it.get("when")
+            if staged is None or when is None or when in staged:
+                out.extend(it.get("set", []))
+    return out
+
+
 def write_sdkconfig_fragments(proj: Manifest, deps: list[Manifest]) -> None:
     """Collect every staged straddle's `kconfig:` lines into one generated
     staging/sdkconfig.spangap-fragments — a plain sdkconfig.defaults fragment
@@ -1552,6 +1576,7 @@ def write_sdkconfig_fragments(proj: Manifest, deps: list[Manifest]) -> None:
     intended and stays quiet.
     """
     sources = init_order(deps) + [proj]   # project last → wins among fragments
+    staged_names = {s.name for s in sources}
     blocks: list[str] = []
     owner: dict[str, str] = {}            # CONFIG_ key -> straddle that last set it
 
@@ -1560,7 +1585,7 @@ def write_sdkconfig_fragments(proj: Manifest, deps: list[Manifest]) -> None:
         # (stub/display_name/banner/default_hostname → CONFIG_SPANGAP_FW_*).
         # Both ride the same dependency-order precedence, so the built straddle
         # wins its own identity and spangap-core, deepest, loses.
-        lines = m.kconfig + m.identity_kconfig
+        lines = _flatten_kconfig(m.kconfig, staged_names) + m.identity_kconfig
         if not lines:
             continue
         clean: list[str] = []
@@ -1873,8 +1898,10 @@ def flash_size_configured(
     """
     if flash_mb is not None:
         return True
+    staged = {m.name for m in deps} | {proj.name}
     for m in deps + [proj]:
-        if any(_FLASHSIZE_SET_RE.match(ln.strip()) for ln in m.kconfig):
+        if any(_FLASHSIZE_SET_RE.match(ln.strip())
+               for ln in _flatten_kconfig(m.kconfig, staged)):
             return True
     for m in deps + [proj]:
         for fname in ("sdkconfig.defaults", "sdkconfig.defaults.spangap"):
@@ -2187,6 +2214,43 @@ def print_partition_layout(csv_path: Path) -> None:
     print(f"  {'user state':<22}{state}")
 
 
+def write_flasher_zip(build_dir: Path) -> None:
+    """Bundle everything needed to flash a board into build/flasher.zip.
+
+    Contents: flasher_args.json (the offset→file map plus chip/baud/reset and
+    write_flash flags esptool needs) and every image it references under
+    flash_files, each stored at its build-relative path (e.g.
+    bootloader/bootloader.bin, partition_table/partition-table.bin, the app
+    .bin, ota_data_initial.bin). Any flasher — host esptool or the web
+    flasher — has all it needs from these: read flasher_args.json for the
+    layout, flash the bins at their offsets. Best-effort: a build with no
+    flashable images (flash_files empty) writes no zip.
+    """
+    args_json = build_dir / "flasher_args.json"
+    try:
+        d = json.loads(args_json.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    flash_files = d.get("flash_files") or {}
+    if not flash_files:
+        return
+    zip_path = build_dir / "flasher.zip"
+    missing = []
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(args_json, "flasher_args.json")
+        for _offset, fname in flash_files.items():
+            f = build_dir / fname
+            if f.exists():
+                z.write(f, fname)
+            else:
+                missing.append(fname)
+    if missing:
+        print(f"spangap: flasher.zip: skipped missing image(s): {', '.join(missing)}",
+              file=sys.stderr)
+    print(f"spangap: wrote {zip_path.name} ({len(flash_files) - len(missing)} images)",
+          file=sys.stderr)
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     all_straddles = scan_workspace_straddles()
 
@@ -2339,6 +2403,7 @@ def cmd_build(args: argparse.Namespace) -> int:
                                        quiet=quiet, env=build_env)
         if rc == 0:
             print_partition_layout(proj.firmware_dir / "partitions.csv")
+            write_flasher_zip(build_dir)
     return rc
 
 

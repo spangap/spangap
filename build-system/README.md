@@ -1,6 +1,6 @@
 # Inside the spangap build-env container
 
-This is a spangap workspace directory. It's where spangap projects get assembled and built. You may be seeing this from the host system or from inside the spangap build system docker container. If you are inside the container, you are running as user `spangap`/ This file tells you what that means: what's mounted, what `spangap` does *from in here*, what you can and
+This is a spangap workspace directory. It's where spangap projects get assembled and built. You may be seeing this from the host system or from inside the spangap build system docker container. If you are inside the container, you are running as user `spangap`. This file tells you what that means: what's mounted, what `spangap` does *from in here*, what you can and
 can't do without the host, and how to help with the real job — **writing and
 maintaining straddles**.
 
@@ -70,7 +70,9 @@ container these verbs work directly, with the IDF env already set up:
 
 | works in here | what it does |
 |---|---|
-| `spangap build [-v] [-e/-i <straddle>] [--no-lcd/--no-web] [--flash-size MB] [idf args…]` | resolve deps → stage → lint → `idf.py build` (+ browser build) |
+| `spangap build [-v] [-w/--with <straddle>] [-x/--without <straddle>] [--no-lcd/--no-web/--no-net] [--flash-size MB] [idf args…]` | resolve deps → stage → lint → `idf.py build` (+ browser build) |
+| `spangap menuconfig [--save]` | interactive Kconfig editor (`idf.py menuconfig`) over the staged project; `--save` writes the minimal `sdkconfig.defaults` (the "configure a board straddle, save as `hw-whatever`" step) |
+| `spangap autoconfig` | leave manual-kconfig mode (drop `.spangap-manual-kconfig`) and reseed `sdkconfig` from `sdkconfig.defaults` on the next build |
 | `spangap validate` | parse + jsonschema-check the manifest and dep graph (fast, read-only) |
 | `spangap list-requires` / `list-deps` | full transitive set / missing siblings (read-only diagnostics) |
 | `spangap clean` / `reallyclean` | `idf.py fullclean` / strip **every** straddle in the active root back to source (gitignored artifacts only) |
@@ -87,8 +89,11 @@ over the network. The full device loop is its own section below
 ([Working with a real device](#working-with-a-real-device--the-you--user--board-loop)).
 
 **Host-only verbs you can't run from this container:** `monitor`, `probe`, real
-`flash`, `init`, `reset-workspace`, `get-deps` (the cloning side), and
-`docker <cmd>` — those
+`flash`, `init`, `reset-workspace`, `get-deps` (the cloning side), `push-all`
+(create + push every straddle repo to GitHub — runs `gh`/`git` with the host's
+credentials, never in the container), `make-builds` (build every entry in a
+builds repo's `builds.yaml` and collect each `build/flasher.zip` to
+`main/<name>.zip`), and `docker <cmd>` — those
 live in **`spangap-outside`** on the host and need the serial port / docker / the
 container lifecycle. There is **no `docker` and no `esptool.py`** in here by design
 (no docker-in-docker; esptool is host-side in the per-host venv).
@@ -233,8 +238,8 @@ populated checkout of the core platform plus a downstream project looks like:
 
 ```
 <root>/
-├── spangap/        ← THIS repo: the entry script + build-system/ (you're reading its CLAUDE.md)
-├── spangap-core/   platform runtime, prefix "" (storageGet, cliRegister, info…)  — has its own CLAUDE.md + docs/
+├── spangap/        ← THIS repo: the entry script + build-system/ (you're reading its README.md)
+├── spangap-core/   platform runtime, prefix "" (storageGet, cliRegister, info…)  — has its own README.md + docs/
 ├── spangap-net/    IP+TLS+NTP+mDNS (net)   spangap-web/  HTTPS+auth+WebRTC+browser shell (web, a UI activator)
 ├── spangap-lcd/    on-device LVGL launcher (lcd, the other UI activator)
 ├── ota/ wg/ upnp/ duckdns/ acme/ maps/ sshd/   central + optional straddles
@@ -295,6 +300,10 @@ enumerate the workspace.
 4. **lint**: reject any `idf_component_register(REQUIRES …)` that hand-writes a known straddle
    repo name — cross-straddle deps MUST flow through `${SPANGAP_REQUIRES}`.
 5. `idf.py build` (which drives the browser build).
+6. on a successful plain build, write **`build/flasher.zip`** — `flasher_args.json`
+   plus every image it references (bootloader, partition table, app, data). A
+   self-contained, host-independent bundle any flasher consumes: the web flasher
+   (`spangap/flasher`), or `spangap make-builds` collecting it into a builds repo.
 
 Consumer CMake idiom: `include(${CMAKE_CURRENT_LIST_DIR}/spangap_requires.cmake)` then
 `REQUIRES ${SPANGAP_REQUIRES} …`. The buildable's `main/CMakeLists.txt` reads
@@ -396,10 +405,9 @@ superseded per-straddle `CLAUDE.md` files. Four concrete traps when reading them
   `scripts/`, etc. The **actual** tree is `build-system/{spangap-inside, spangap-outside,
   Dockerfile, schemas/}` + the `spangap` shim — no `cli/`, `install/`, or `scripts/`.
   Trust this file and `ls` over those boxes.
-- **Per-straddle `CLAUDE.md` files are superseded.** Their content moved into
-  `INTERNALS.md` (per-straddle + the platform-wide `spangap/INTERNALS.md`) and
-  `spangap-core/docs/`. The "Read next" pointer below to `../spangap-core/CLAUDE.md` may
-  resolve to a stale file — prefer those `INTERNALS.md` / `docs/` as canonical.
+- **Per-straddle `CLAUDE.md` files are superseded.** Any content that used to live in a
+  straddle's `CLAUDE.md` moved into its `README.md`, its `INTERNALS.md` (per-straddle + the
+  platform-wide `spangap/INTERNALS.md`), and `spangap-core/docs/` — prefer those as canonical.
 - **The hand-written `app_main()` init sequences are obsolete.** READMEs that show
   `pmInit(); logInit(); fs_init(); …` enumerated by hand predate auto-init; today that
   is one `spangapInitStraddles()` call (see "Auto-init" above).

@@ -59,6 +59,10 @@ Commands (run inside a workspace):
   reset-workspace            wipe build state (container + image) and rebuild
   docker <cmd> [args]        run a command on the build container (e.g. sh)
   shell                      interactive shell in the build container
+  push-all [--force] [dir]   create + push every git repo under dir (default: the
+                             workspace) to GitHub; host-only, uses your gh auth
+  make-builds <builds-dir>   build every entry in <builds-dir>/builds.yaml and
+                             copy each flasher.zip to <builds-dir>/main/<name>.zip
 
 init  (run outside any workspace; creates one):
   <dir>              workspace directory. Created if absent; else init uses cwd.

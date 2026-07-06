@@ -1131,6 +1131,188 @@ ensure-venv)
 # which touches the same workspace-root .spangap-resetme marker. (Tearing the
 # workspace's container/image down is still the host-only `spangap
 # reset-workspace`.)
+push-all)
+    # Host-only. Push every git repo directly under DIR (default: the workspace
+    # root, where straddles live as flat siblings), creating its GitHub repo
+    # (public) first if it doesn't exist yet. This runs entirely on the host —
+    # `gh`/`git` and your credentials live here, never in the build container —
+    # so it is handled in this arm and NOT forwarded inside. --force rewrites the
+    # remote branch (needed after a history rewrite).
+    shift
+    force=0
+    dir=$workspace
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --force) force=1 ;;
+            -h|--help)
+                printf '%s\n' \
+                    "usage: spangap push-all [--force] [DIR]" \
+                    "  Push every git repo directly under DIR (default: the workspace root)," \
+                    "  creating its GitHub repo (private) first if it doesn't exist yet." \
+                    "  --force rewrites the remote branch (needed after a history rewrite)." \
+                    "  Requires an authenticated \`gh\`; new repos are created PUBLIC."
+                exit 0 ;;
+            -*) die "push-all: unknown option: $1 (try --help)" ;;
+            *)  dir=$1 ;;
+        esac
+        shift
+    done
+
+    [ -d "$dir" ] || die "push-all: not a directory: $dir"
+    command -v gh  >/dev/null 2>&1 || die "push-all: gh not found (install the GitHub CLI)"
+    command -v git >/dev/null 2>&1 || die "push-all: git not found"
+    gh auth status >/dev/null 2>&1 || die "push-all: gh is not authenticated (run: gh auth login)"
+
+    # git@github.com:owner/repo.git | https://github.com/owner/repo(.git) -> owner/repo
+    slug_from_url() { printf '%s' "$1" | sed -E 's#.*github\.com[:/]##; s#\.git$##; s#/$##'; }
+
+    for repo in "$dir"/*/; do
+        [ -d "$repo.git" ] || continue                       # skip non-git dirs
+        name=$(basename "$repo")
+
+        url=$(git -C "$repo" remote get-url origin 2>/dev/null) || {
+            printf '%-24s no origin remote — skipped\n' "$name"; continue; }
+        slug=$(slug_from_url "$url")
+        [ -n "$slug" ] || { printf '%-24s cannot parse slug from %s — skipped\n' "$name" "$url"; continue; }
+        branch=$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null || echo main)
+
+        # Fast path: nothing new to push if the local tip already equals the
+        # remote-tracking tip that `push -u` maintains. A never-pushed repo has no
+        # tracking ref and falls through to create/push. --force always proceeds.
+        if [ "$force" -eq 0 ]; then
+            rtracking="refs/remotes/origin/$branch"
+            if git -C "$repo" rev-parse --verify -q "$rtracking" >/dev/null 2>&1 &&
+               [ "$(git -C "$repo" rev-parse HEAD)" = "$(git -C "$repo" rev-parse "$rtracking")" ]; then
+                printf '%-24s up to date — skipped\n' "$name"; continue
+            fi
+        fi
+
+        # Create the GitHub repo if it isn't there yet (empty; push happens below).
+        if ! gh repo view "$slug" >/dev/null 2>&1; then
+            if gh repo create "$slug" --public >/dev/null 2>&1; then
+                printf '%-24s created %s (public)\n' "$name" "$slug"
+            else
+                printf '%-24s FAILED to create %s\n' "$name" "$slug"; continue
+            fi
+        fi
+
+        # Push the current branch, tracking upstream.
+        if [ "$force" -eq 1 ]; then
+            if git -C "$repo" push -u --force origin "$branch" >/dev/null 2>&1; then
+                printf '%-24s force-pushed %s -> %s\n' "$name" "$branch" "$slug"
+            else
+                printf '%-24s push FAILED\n' "$name"
+            fi
+        else
+            if git -C "$repo" push -u origin "$branch" >/dev/null 2>&1; then
+                printf '%-24s pushed %s -> %s\n' "$name" "$branch" "$slug"
+            else
+                printf '%-24s push FAILED (non-fast-forward? re-run with --force)\n' "$name"
+            fi
+        fi
+    done
+    exit 0
+    ;;
+make-builds)
+    # Host-only. Build every entry in a builds repo's builds.yaml and copy the
+    # resulting flasher.zip to <builds-repo>/main/<name>.zip. Each entry pairs a
+    # short name with a `spangap build` invocation; we re-run the normal build
+    # path per entry (so dep cloning + the container build happen exactly as
+    # usual), then copy the zip. Copies only — committing/pushing the zips is the
+    # builds repo's own job (its GitHub Action, or `spangap push-all`).
+    shift
+    case ${1:-} in
+        -h|--help)
+            printf '%s\n' \
+                "usage: spangap make-builds <builds-repo-dir>" \
+                "  Build every entry in <builds-repo-dir>/builds.yaml (a short name + a" \
+                "  \`spangap build\` invocation) and copy each flasher.zip to" \
+                "  <builds-repo-dir>/main/<name>.zip. Run from inside a spangap workspace;" \
+                "  copies only (commit/push the zips separately)."
+            exit 0 ;;
+    esac
+    [ $# -ge 1 ] || die "usage: spangap make-builds <builds-repo-dir> (try --help)"
+    bdir=$1
+    [ -d "$bdir" ] || die "make-builds: not a directory: $bdir"
+    byaml="$bdir/builds.yaml"
+    [ -f "$byaml" ] || die "make-builds: no builds.yaml in $bdir"
+    command -v python3 >/dev/null 2>&1 || die "make-builds: python3 required to read builds.yaml"
+    mkdir -p "$bdir/main"
+    self="$workspace/spangap/build-system/spangap-outside"
+
+    # Parse the simple builds.yaml (a `builds:` list of {name, invocation}) with
+    # no PyYAML dependency — the host python3 isn't guaranteed to have it.
+    builds=$(python3 - "$byaml" <<'PY'
+import sys
+name = inv = None
+out = []
+def flush():
+    global name, inv
+    if name is not None:
+        if not inv:
+            sys.exit(f"build '{name}' has no invocation")
+        out.append((name, inv))
+    name = inv = None
+in_builds = False
+for raw in open(sys.argv[1]):
+    st = raw.strip()
+    if not st or st.startswith("#"):
+        continue
+    if st == "builds:":
+        in_builds = True
+        continue
+    if not in_builds:
+        continue
+    if st.startswith("- "):
+        flush()
+        st = st[2:].strip()
+    if ":" in st:
+        k, _, v = st.partition(":")
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k == "name":
+            name = v
+        elif k == "invocation":
+            inv = v
+flush()
+if not out:
+    sys.exit("no builds in builds.yaml")
+for n, i in out:
+    print(f"{n}\t{i}")
+PY
+    ) || die "make-builds: could not parse $byaml"
+
+    fails=0
+    tab=$(printf '\t')
+    while IFS="$tab" read -r name inv; do
+        [ -n "$name" ] || continue
+        log "=== '$name': spangap build $inv ==="
+        # The invocation's first token names the buildable; its repo dir holds
+        # the esp-idf/build/ where flasher.zip lands.
+        target=${inv%% *}
+        repo=${target##*/}
+        fw="$workspace/$repo/esp-idf"
+        # Clear the cached partition sizes so a board switch between entries can't
+        # trip the size-check deadlock; the build re-measures cleanly.
+        rm -f "$fw/build/.spangap-sizes"
+        # shellcheck disable=SC2086
+        if SPANGAP_WORKSPACE="$workspace" "$self" build $inv; then
+            if [ -f "$fw/build/flasher.zip" ] && cp "$fw/build/flasher.zip" "$bdir/main/$name.zip"; then
+                log "  -> main/$name.zip"
+            else
+                log "  !! no flasher.zip collected for '$name' (looked in $fw/build/)"
+                fails=$((fails + 1))
+            fi
+        else
+            log "  !! build failed for '$name'"
+            fails=$((fails + 1))
+        fi
+    done < <(printf '%s\n' "$builds")
+
+    [ "$fails" -eq 0 ] || die "make-builds: $fails build(s) failed"
+    log "make-builds: wrote $bdir/main/*.zip"
+    exit 0
+    ;;
 flash)
     shift
     proj=$(require_straddle flash)

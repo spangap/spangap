@@ -1,51 +1,50 @@
-# Spangap
+# Spangap — command-line tool & build system
 
-This repository holds the **command line script, installer and build system** for [spangap](https://github.com/spangap) — the Device Application Framework for the ESP32, the on-device web-interface and more. See [https://github.com/spangap](https://github.com/spangap) for more general information on Spangap.
+This repository is just one component of [**Spangap**](https://github.com/spangap), the Device Application Framework for the ESP32. It holds the **command-line launcher, the installer, and the build system** — the tooling you use to assemble and flash firmware. It is not the platform itself; for what Spangap is and what it can do, read the **[org README](https://github.com/spangap)**.
 
-Spangap builds ESP32 device firmware using a host of software that never needs to touch your host system: it all runs in a docker container that is automatically set up as part of initializing a spangap 'workspace', a directory you build firmware in. All you need on the host is `docker`, `git`, `python3` and the `spangap` script this sits in the root of this repository. Apart the spangap command line shell script (installed in any directory in your `$PATH`) and a persistent home directory for the docker containers (in `~/.spangap`, nothing lives outside of the workspace(s) you initialize.)
+## What this repo provides
 
-The easiest install is the one-liner, which checks your prerequisites, finds (or asks for) a directory on your `$PATH`, and drops the launcher there:
+Spangap builds ESP32 firmware inside a Docker container that is set up automatically when you initialize a *workspace* (a directory you build firmware in). Nothing but the container's own home lands outside your workspaces — it lives in `~/.spangap` — and on the host you only need `docker`, `git`, `python3`, and the single-file `spangap` launcher this repo ships.
+
+The launcher stays a thin dispatcher; the real build system lives in the per-workspace `spangap/` skeleton that `spangap init` sets up. Because of that, a workspace keeps your launcher current on its own: when it ships a newer launcher than the one on your `$PATH`, it upgrades that file in place (printing `spangap: auto-upgraded <path>`), or tells you a newer one is available if the file isn't writeable. So you rarely need to re-install.
+
+## Install
+
+One-liner — checks your prerequisites, finds (or asks for) a directory on your `$PATH`, and drops the launcher there:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/spangap/spangap/refs/heads/main/install.sh | sh
 ```
 
-Or do it by hand — the launcher is a single file. Drop [`./spangap`](https://raw.githubusercontent.com/spangap/spangap/refs/heads/main/spangap) (the only file at the root of this repo) somewhere on your `$PATH` and make it executable. Either way that's the entire install: everything else — dependency resolution, the Docker image we use for building, the small Python venv we use for flashing and the serial monitor — is pulled in on demand.
-
-The launcher stays a thin dispatcher; the real build system lives in the per-workspace `spangap/` skeleton that `spangap init` sets up. Because of that, a workspace can keep your launcher current on its own: when it ships a newer launcher than the one on your `$PATH`, it upgrades that file in place (printing `spangap: auto-upgraded <path>`), or tells you a newer one is available if the file isn't writeable. So you rarely need to re-install.
+Or do it by hand — the launcher is a single file. Drop [`./spangap`](https://raw.githubusercontent.com/spangap/spangap/refs/heads/main/spangap) (the only file at the root of this repo) somewhere on your `$PATH` and make it executable. Either way that's the entire install: dependency resolution, the Docker build image, and the small Python venv used for flashing and the serial monitor are all pulled in on demand.
 
 ## Host prerequisites
 
-- **`docker`** — used for the build environment. Builds + runs in a per-workspace container; no toolchain on your host.
-- **`git`** — clones the `spangap/` skeleton into your workspace on `spangap init`, and clones the named project plus its dependent straddles on `spangap build <org>/<repo>` (or `spangap get-deps`).
-- **`python3`** with the `venv` module — on `spangap init`, used once to create `./.spangap-venv-<os>-<arch>/` inside the workspace and `pip install` pinned versions of [`esptool`](https://pypi.org/project/esptool/) and [`esp-idf-monitor`](https://pypi.org/project/esp-idf-monitor/) into it. These are what actually talk to the ESP-32 over the serial port for `spangap flash` and `spangap monitor`. The host suffix lets a workspace shared across hosts (e.g. a Linux VM and a Mac mounting it over the network) carry one venv per host without colliding. On Debian/Ubuntu you may need `apt install python3-venv` separately; on Alpine, `apk add py3-virtualenv`.
+- **`docker`** — the build environment. Builds and runs in a per-workspace container; no toolchain on your host.
+- **`git`** — clones the `spangap/` skeleton on `spangap init`, and the named project plus its dependent straddles on `spangap build <org>/<repo>` (or `spangap get-deps`).
+- **`python3`** with the `venv` module — on `spangap init`, creates `./.spangap-venv-<os>-<arch>/` in the workspace and `pip install`s pinned [`esptool`](https://pypi.org/project/esptool/) and [`esp-idf-monitor`](https://pypi.org/project/esp-idf-monitor/) into it. These are what actually talk to the ESP32 over the serial port for `spangap flash` and `spangap monitor`. The host suffix lets a workspace shared across hosts (e.g. a Linux VM and a Mac mounting it over the network) carry one venv per host without colliding. On Debian/Ubuntu you may need `apt install python3-venv` separately; on Alpine, `apk add py3-virtualenv`.
 
-## Getting started
+## Using it
 
-Spangap works for Linux, Mac and probably also Windows (Windows is untested for now). Let's say you are in your homedir on a Mac and want to install the Reticulous mesh networking software built with Spangap and run it on the LilyGo T-Deck Plus device connected to port `/dev/cu.usbmodem1101` on your Mac. Let's say you want to install the spangap command line tool in ~/bin which is in your `$PATH` and you'd like the workspace directory to be called `tdeck` directly below your homedir.
+Initialize a workspace, start a serial monitor, then build a project *with* a board and flash it. For example, to build the Reticulous mesh firmware for a LilyGo T-Deck Plus on `/dev/cu.usbmodem1101`:
 
 ```sh
-curl -o ~/bin/spangap https://raw.githubusercontent.com/spangap/spangap/refs/heads/main/spangap && \
-chmod a+x ~/bin/spangap && \
-spangap init tdeck && \
-cd tdeck && \
-spangap monitor /dev/cu.usbmodem1101
+spangap init tdeck && cd tdeck
+spangap monitor /dev/cu.usbmodem1101      # leave running: shows the device log, and flashes on request
 ```
 
-Leave this running, it will show you the device log output and once we're done will allow you to switch to CLI mode by typing a command.
-
-Now open a new terminal window and do:
+Then, in another terminal:
 
 ```sh
-cd tdeck && \
-spangap build reticulous/reticulous --with spangap/hw-tdeck && \
+cd tdeck
+spangap build reticulous/reticulous --with spangap/hw-tdeck
 spangap flash
 ```
 
-After downloading, building and flashing, the device now comes alive and presents a smartophone-like UI on the LCD as well as a full-featured web interface on a built-in access point named reticulous_<hex digits>. If you would rather have the device to meet you on your own wifi network, you can go the serial window and type `net add <ssid> <password>` (use quotes if your password has spaces.) To not leave the web UI unprotected, set a password using `passwd`.
+`spangap build <org>/<repo>` clones the project and its dependencies on first use; `--with <board>` supplies the hardware HAL. `spangap flash` signals the running monitor to write the image. Run bare `spangap` at any point to see the resolved project, its dependencies, and the environment report.
 
 ## For more information
 
-- [https://github.com/spangap](https://github.com/spangap) for more about spangap itself.
-- [https://github.com/reticulous](https://github.com/reticulous) for more information about the Reticulous mesh networking firmware.
-- [INTERNALS.md](INTERNALS.md) to learn what the Spangap build system actually does behind the scenes.
+- [https://github.com/spangap](https://github.com/spangap) — what Spangap is, and the platform straddles it provides.
+- [https://github.com/reticulous](https://github.com/reticulous) — the Reticulous mesh firmware used as the example above.
+- [INTERNALS.md](INTERNALS.md) — what the Spangap build system actually does behind the scenes.

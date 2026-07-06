@@ -648,9 +648,12 @@ def _integration_cues(firmware_dir: Path, staged_repos: set[str]) -> set[str]:
 
       - a conditional/<repo>/ slice dir: compiled ONLY when <repo> is staged
         (SPANGAP_CONDITIONAL_SRCS), so when present it needs <repo>'s headers; and
-      - a source reference to <repo>'s CONFIG_SPANGAP_<alias> presence shortcut:
-        the same `#if` that already gates an optional cross-straddle call (acme's
-        HTTP-01 path under CONFIG_SPANGAP_WEB, duckdns under CONFIG_SPANGAP_UPNP).
+      - a source reference to a staged peer's presence symbol — the same `#if`
+        that already gates an optional cross-straddle call. Two spellings count:
+        the generic CONFIG_STRADDLE_<NAME> (emitted for every staged straddle,
+        e.g. lxmf's audio-notification path under CONFIG_STRADDLE_AUDIO) and the
+        CONFIG_SPANGAP_<alias> shortcut for the central straddles (acme's HTTP-01
+        path under CONFIG_SPANGAP_WEB, duckdns under CONFIG_SPANGAP_UPNP).
 
     Either cue adds <repo> to REQUIRES only when it is staged, and never installs
     it — a peer-less build just drops the dep and the #if / excluded slice
@@ -662,10 +665,18 @@ def _integration_cues(firmware_dir: Path, staged_repos: set[str]) -> set[str]:
         for sub in cond.iterdir():
             if sub.is_dir() and sub.name in staged_repos:
                 cues.add(sub.name)
-    # CONFIG_SPANGAP_<alias> → the aliased repo, for staged central straddles not
-    # already cued by a slice. Scan source once, dropping tokens as they're found.
-    want = {f"CONFIG_{_SHORTCUT_ALIASES[r]}": r
-            for r in staged_repos if r in _SHORTCUT_ALIASES and r not in cues}
+    # Presence-symbol → the staged repo it gates, for peers not already cued by a
+    # slice. Both the generic CONFIG_STRADDLE_<NAME> and the CONFIG_SPANGAP_<alias>
+    # shortcut map to the same repo; either spelling in source pulls it into
+    # REQUIRES. Scan source once, dropping tokens as they're found.
+    want: dict[str, str] = {}
+    for r in staged_repos:
+        if r in cues:
+            continue
+        want[f"CONFIG_STRADDLE_{_name_to_kconfig(r)}"] = r
+        alias = _SHORTCUT_ALIASES.get(r)
+        if alias:
+            want[f"CONFIG_{alias}"] = r
     if want:
         for path in _iter_component_sources(firmware_dir):
             if not want:

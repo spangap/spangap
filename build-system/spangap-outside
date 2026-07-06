@@ -1738,7 +1738,23 @@ ensure_container() {
     # allocated") for as long as this one idles. Ephemeral sidesteps that — each
     # workspace gets its own port and they never collide. `spangap dev` reads the
     # assigned port back (see the dev verb) to build the browser URL.
+    # The image bakes spangap as uid/gid 1000. On Docker Desktop the bind mount
+    # remaps host uids to that, so the container and host always agree on
+    # workspace ownership. On a NATIVE-Linux host the mount passes raw uids
+    # straight through, so if the invoking user isn't uid 1000 (e.g. GitHub's
+    # `runner` is 1001) the container-as-1000 can neither write the workspace
+    # nor let the host clean it up afterwards. Run the container as the host
+    # uid/gid there so both sides agree; `spangap` (below) re-stamps the passwd
+    # entry so the uid still resolves to a real user with HOME=/home/spangap.
+    run_user_args=()
+    remap_uid=1000; remap_gid=1000
+    if [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" != "1000" ]; then
+        remap_uid=$(id -u); remap_gid=$(id -g)
+        run_user_args=(--user "$remap_uid:$remap_gid")
+    fi
+
     docker run -d --name "$container" \
+        ${run_user_args[@]+"${run_user_args[@]}"} \
         -p "127.0.0.1::$DEV_PORT" \
         -v "$spangap_home:/home/spangap" \
         -v "$workspace:$container_ws" \
@@ -1746,13 +1762,29 @@ ensure_container() {
         --label spangap.workspace="$workspace" \
         "$IMAGE" sleep infinity >/dev/null
 
-    # Pre-create the npm prefix dir (Dockerfile sets NPM_CONFIG_PREFIX
-    # but the bind mount hides any dirs the image baked into /home/spangap)
-    # and align ownership with the in-container spangap user. Failures are
-    # benign on Docker Desktop where the bind mount handles uid mapping
-    # for us.
-    docker exec -u 0 "$container" sh -c \
-        'mkdir -p /home/spangap/.npm-global && chown -R spangap:spangap /home/spangap 2>/dev/null || true'
+    # When running as a remapped uid, point the container's `spangap` passwd/group
+    # entry at it so getpwuid()/`whoami`/HOME resolve for build tooling. usermod
+    # would refuse ("user is in use" by the sleep process), so edit the files
+    # directly — root via `-u 0` regardless of the container's run-user.
+    if [ "$remap_uid" != 1000 ]; then
+        docker exec -u 0 "$container" sh -c '
+            sed -i "s/^spangap:x:1000:1000:/spangap:x:$1:$2:/" /etc/passwd
+            sed -i "s/^spangap:x:1000:/spangap:x:$2:/"        /etc/group
+        ' _ "$remap_uid" "$remap_gid" >/dev/null 2>&1 || true
+    fi
+
+    # Pre-create the npm prefix dir (Dockerfile sets NPM_CONFIG_PREFIX but the
+    # bind mount hides any dirs the image baked into /home/spangap) and align
+    # ownership of the persistent home with the run-user. CRUCIAL: prune the
+    # nested workspace mount ($1) — its files already carry the correct (host)
+    # uid, and a `-R` chown that descends into it would rewrite them to the
+    # container uid, orphaning the workspace from the host. On a native-Linux
+    # runner that breaks init's marker write and the launcher's failure-cleanup
+    # rm -rf (the permission-denied flood that fails the CI build job).
+    docker exec -u 0 "$container" sh -c '
+        mkdir -p /home/spangap/.npm-global
+        find /home/spangap -path "$1" -prune -o -exec chown "$2:$3" {} + 2>/dev/null || true
+    ' _ "$container_ws" "$remap_uid" "$remap_gid" 2>/dev/null || true
 }
 
 # Host-side require-fetching loop. Runs `spangap list-deps` inside the

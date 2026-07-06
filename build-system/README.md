@@ -85,7 +85,14 @@ container these verbs work directly, with the IDF env already set up:
 **`spangap flash` / `spangap reset` / `spangap cli` from in here don't touch hardware
 directly** — the
 container has no USB. `flash`/`reset` only signal a host monitor; `cli` reaches the device
-over the network. The full device loop is its own section below
+over the network. `spangap cli "<cmd>"` runs an **arbitrary** device CLI command and returns
+its output (`spangap cli gps`, `spangap cli "set s.gps.interval=5"`) — combine it with
+`spangap log` to verify firmware autonomously. Note that only the `spangap`-mediated verbs
+route to the device: the **raw socket level is not reachable from the container** — `nc` to
+the device's ssh (`:22`), web (`:80`/`:443`), or TCP CLI (`:2323`) is refused, because the
+host bridge terminates on the host's own loopback with no container route. Raw-socket work
+(the browser config-channel, an ssh `Ctrl-D`, physical checks) stays user-driven. The full
+device loop is its own section below
 ([Working with a real device](#working-with-a-real-device--the-you--user--board-loop)).
 
 **Host-only verbs you can't run from this container:** `monitor`, `probe`, real
@@ -93,7 +100,7 @@ over the network. The full device loop is its own section below
 (create + push every straddle repo to GitHub — runs `gh`/`git` with the host's
 credentials, never in the container), `make-builds` (build every entry in a
 builds repo's `builds.yaml` and collect each `build/flasher.zip` to
-`main/<name>.zip`), and `docker <cmd>` — those
+`<name>.zip` in the builds-repo root), and `docker <cmd>` — those
 live in **`spangap-outside`** on the host and need the serial port / docker / the
 container lifecycle. There is **no `docker` and no `esptool.py`** in here by design
 (no docker-in-docker; esptool is host-side in the per-host venv).
@@ -155,7 +162,10 @@ the cache from inside the container.
 So `spangap log` doesn't read the file from in here — it streams the log over the network
 instead. `spangap monitor` runs a small **serial-log relay** on the host (a TCP server in
 the same host-side bridge that forwards the device ports — see `start_bridge`/`serve_log` in
-`spangap-outside`, bound to `:2324`, `$SPANGAP_LOG_PORT`). In-container `spangap log`
+`spangap-outside`, bound to `:2324`, `$SPANGAP_LOG_PORT`, and passed through on every
+`docker exec`). Unlike the device-port forwards (which need a configured device address),
+the log relay **always runs** — so `spangap log` works from the moment the monitor is up,
+before the device is even reachable. In-container `spangap log`
 connects to it at `host.docker.internal:2324`, sends `ONCE` (dump) or `FOLLOW` (`-f`,
 `tail -f` style, survives the flash/reset truncation with a `--- log reset ---` marker), and
 prints what the host reads natively (always fresh). This works **the same from the host and
@@ -262,7 +272,9 @@ refused only when it would take out spangap-core or a buildable hard-require),
 call sites **must** gate on `CONFIG_*`); `firmware:` / `browser:` (paths to the two
 halves, e.g. `esp-idf` / `browser`); **`init:`** (bring-up function name — see the
 auto-init note below); `buildable:` (an **object**, not a bare flag: presence marks a
-flashable image, and it carries `firmware` / `browser` / `lcd` entry paths).
+flashable image, and it carries `firmware` / `browser` / `lcd` entry paths);
+**`settings:`** (a declarative settings-pane block lowered to LCD + web + storage
+defaults at build time — see ["Declarative settings"](#declarative-settings-the-settings-block)).
 
 ### The straddle namespace map (prefix ≠ repo name)
 
@@ -325,6 +337,56 @@ C++-linkage decl is what actually links. (This whole mechanism supersedes the lo
 `app_main()` init sequences still shown in some sibling READMEs — see the stale-doc caveats
 below.)
 
+### Declarative settings (the `settings:` block)
+
+A `settings:` block in a `straddle.yaml` is the **single source** for a settings pane;
+`spangap-inside` lowers it into **three** surfaces at build time — LCD pane, web panel,
+and storage defaults — written once, not thrice (search `collect_settings`,
+`_settings_lcd_cpp`, `_settings_defaults_cpp`, `_settings_web_descriptors`). Prefer it
+over hand-writing all three for any pane that's just static rows.
+
+The block is a **list of panels**, each `{ menu: [{id, label, placement?}, …], rows: […] }`.
+The `menu` segment carries **both** an `id` and a `label` because the two UIs address panes
+differently: `id`s join into the **web** menu path (`settings/<id>/…`, also the container
+merge key), while `label`s join into the **LCD** `lcdRegisterSettings` path. Row kinds:
+`section` / `caption` (text), `switch{label,key}`, `slider{label,key,min,max}`,
+`text{label,key,secret?}`, `dropdown{label,key,options:[{v,l}]}`, `value{label,key}`
+(read-only live value), `button{label,cmd,payload?}` (payload defaults `"1"`), and
+`list{key,item_label,add,remove,fields}` (array-of-objects).
+
+The three generated surfaces:
+
+- **LCD pane** → static `spangapGenPane_N(void*)` functions of `lcdSetting*` calls plus a
+  `spangapSettingsGenRegister()` that wires them via `lcdRegisterSettings`, emitted into
+  `staging/spangap_init_dispatch.gen.cpp` and called after `spangapInitStraddles()`. The
+  body is emitted **only when `spangap-lcd` is staged** (gated globally, not per-panel).
+- **Storage defaults** → `spangapSettingsGenDefaults()` (also in that gen file), one
+  `storageDefault()` per binding row (`switch`/`slider`/`text`/`dropdown`) that carries a
+  `default:` **and** whose key is persisted config (`s.` prefix); the C literal type follows
+  the YAML value's type. **Always emitted** (headless/web builds seed defaults too), and
+  called after `spangapInit`, before straddle init. Bare/ephemeral keys and secrets are
+  never seeded.
+- **Web panel** → a JSON descriptor inlined into `<browser>/src/boot/straddles.gen.ts` as
+  `GENERATED_PANELS`; `registerGeneratedPanels()` (`spangap-web`'s `lib/generatedPanels`)
+  registers each at its menu path against **one shared** `GeneratedPanel.vue` interpreted at
+  runtime — no per-pane SFC codegen.
+
+**Escape hatch:** a panel with `web: false` suppresses only its generated web panel (the
+straddle keeps a hand-written `*Panel.vue` at the same menu leaf for rich UI a static
+descriptor can't express — WiFi scan, ACME, WireGuard, ssh); the LCD pane and storage
+defaults still generate from the same block. **`list` rows are web-only to edit**: the web
+side edits the array (`GeneratedListRow.vue`, mutations routed through the owning task's
+`cmd` storage sentinels, never mutating the array from the UI), while the LCD pane just
+shows a "manage this list in the web UI" caption (the core storage API exposes no array
+*editor* to the LCD; a straddle can still surface per-item status via `value` rows).
+
+Panel gating is purely **presence** — a panel appears iff its straddle is staged; there is
+no per-panel `when:`. The schema lives in `$defs/settingsPanel` + `$defs/settingsRow` of
+`build-system/schemas/straddle.schema.json`. Many straddles already carry a `settings:`
+block (enumerate with `grep -l '^settings:' <workspace>/*/straddle.yaml`); don't assume a
+fixed converted-set. `storageSet` is **async** (it queues to the owning actor) — rely on
+operation ordering, not an immediate read-back.
+
 ## Editing the build system from inside this container
 
 **The `spangap` you run is baked into the image.** The Dockerfile `COPY`s
@@ -336,12 +398,29 @@ diverged from the image's `org.spangap.buildsys-hash` LABEL and rebuilds on the 
 host command).
 
 To **test an edit to the in-container CLI without a rebuild**, run the source copy
-directly (the spangap repo lives at `<workspace>/spangap`):
+directly (the spangap repo lives at `<workspace>/spangap`) with the **system**
+interpreter `/usr/bin/python3`:
 
 ```sh
-. "$IDF_PATH/export.sh"                              # only needed for build; not for validate/list-*
-python3 .../spangap/build-system/spangap-inside validate        # or list-requires, build, …
+/usr/bin/python3 .../spangap/build-system/spangap-inside validate   # or list-requires, build, …
+. "$IDF_PATH/export.sh"                                              # ONLY for build/flash — see below
 ```
+
+Use `/usr/bin/python3` explicitly, **not** a bare `python3` after sourcing
+`$IDF_PATH/export.sh`: `export.sh` puts the **IDF venv** python first on PATH, and that one
+lacks the CLI's pip deps (`jsonschema`, `pyyaml`). The system `/usr/bin/python3` is where
+those deps were installed. Source `export.sh` only for the subcommands that actually shell
+out to the toolchain (`build`, and flash which needs esptool via the toolchain env) — the
+read-only verbs (`validate`, `list-requires`, `list-deps`, `show`) don't need it. The source
+file has **no `.py` extension** and is loaded via `importlib.machinery.SourceFileLoader`.
+
+**The schema is baked too.** The manifest schema is `COPY`d to
+`/usr/local/share/spangap/straddle.schema.json` (root-owned), and `spangap-inside` reads it
+via `SCHEMA_PATH`, which honours **`SPANGAP_SCHEMA_PATH`**. So when you edit the manifest
+schema under `build-system/schemas/` and want the running CLI to see it before a rebuild,
+point at the source copy — `SPANGAP_SCHEMA_PATH=.../schemas/straddle.schema.json spangap
+validate` — otherwise the baked schema rejects any manifest key your edit just added (the
+same applies to `flash`/`cli`/`log` once a manifest gains a new key).
 
 `spangap-outside` (POSIX `/bin/sh`) and the Dockerfile are **host-build-time**
 artifacts — editing them here is fine, but they only matter on the host / at the next

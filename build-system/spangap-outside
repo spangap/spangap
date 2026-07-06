@@ -1215,7 +1215,7 @@ push-all)
     ;;
 make-builds)
     # Host-only. Build every entry in a builds repo's builds.yaml and copy the
-    # resulting flasher.zip to <builds-repo>/main/<name>.zip. Each entry pairs a
+    # resulting flasher.zip to <builds-repo>/<name>.zip. Each entry pairs a
     # short name with a `spangap build` invocation; we re-run the normal build
     # path per entry (so dep cloning + the container build happen exactly as
     # usual), then copy the zip. Copies only — committing/pushing the zips is the
@@ -1227,7 +1227,7 @@ make-builds)
                 "usage: spangap make-builds <builds-repo-dir>" \
                 "  Build every entry in <builds-repo-dir>/builds.yaml (a short name + a" \
                 "  \`spangap build\` invocation) and copy each flasher.zip to" \
-                "  <builds-repo-dir>/main/<name>.zip. Run from inside a spangap workspace;" \
+                "  <builds-repo-dir>/<name>.zip. Run from inside a spangap workspace;" \
                 "  copies only (commit/push the zips separately)."
             exit 0 ;;
     esac
@@ -1237,7 +1237,6 @@ make-builds)
     byaml="$bdir/builds.yaml"
     [ -f "$byaml" ] || die "make-builds: no builds.yaml in $bdir"
     command -v python3 >/dev/null 2>&1 || die "make-builds: python3 required to read builds.yaml"
-    mkdir -p "$bdir/main"
     self="$workspace/spangap/build-system/spangap-outside"
 
     # Parse the simple builds.yaml (a `builds:` list of {name, invocation}) with
@@ -1292,13 +1291,14 @@ PY
         target=${inv%% *}
         repo=${target##*/}
         fw="$workspace/$repo/esp-idf"
-        # Clear the cached partition sizes so a board switch between entries can't
-        # trip the size-check deadlock; the build re-measures cleanly.
-        rm -f "$fw/build/.spangap-sizes"
+        # Redirect the build's stdin from /dev/null: it runs `docker exec -i`,
+        # which would otherwise forward this loop's stdin (the process
+        # substitution below) into the container and drain the remaining
+        # entries — so only the first build would ever run.
         # shellcheck disable=SC2086
-        if SPANGAP_WORKSPACE="$workspace" "$self" build $inv; then
-            if [ -f "$fw/build/flasher.zip" ] && cp "$fw/build/flasher.zip" "$bdir/main/$name.zip"; then
-                log "  -> main/$name.zip"
+        if SPANGAP_WORKSPACE="$workspace" "$self" build $inv </dev/null; then
+            if [ -f "$fw/build/flasher.zip" ] && cp "$fw/build/flasher.zip" "$bdir/$name.zip"; then
+                log "  -> $name.zip"
             else
                 log "  !! no flasher.zip collected for '$name' (looked in $fw/build/)"
                 fails=$((fails + 1))
@@ -1310,7 +1310,7 @@ PY
     done < <(printf '%s\n' "$builds")
 
     [ "$fails" -eq 0 ] || die "make-builds: $fails build(s) failed"
-    log "make-builds: wrote $bdir/main/*.zip"
+    log "make-builds: wrote $bdir/*.zip"
     exit 0
     ;;
 flash)

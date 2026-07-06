@@ -2039,17 +2039,39 @@ def cmd_autoconfig(args: argparse.Namespace) -> int:
     return 0
 
 
+def align_up(x: int, a: int) -> int:
+    return ((x + a - 1) // a) * a
+
+
+def _fixed_size_in(partitions_csv: Path) -> int:
+    """The `fixed` partition size (bytes) in a partitions.csv, or -1 if absent.
+
+    Used to decide whether the just-built littlefs already sits at its shrink-wrapped
+    size — comparing against this build's own table, so no cross-run state is kept.
+    """
+    try:
+        for line in partitions_csv.read_text().splitlines():
+            c = [x.strip() for x in line.split(",")]
+            if len(c) >= 5 and c[0] == "fixed":
+                return int(c[4], 0)
+    except (OSError, ValueError):
+        pass
+    return -1
+
+
 def finalize_shrink_wrap(proj: "Manifest", build_dir: Path,
                          app_b: int, fixed_b: int) -> int:
-    """Shrink-wrap partitions to the measured sizes WITHOUT a second full build.
+    """Shrink-wrap `fixed` to its measured size WITHOUT a second full build.
 
-    After pass 1 everything the flash needs already exists: `app.bin` is linked at
-    a fixed offset (reused verbatim — its content is independent of the partition
-    *size*), the read-only data is packed, and the floor image fits. A resize only
-    changes four artifacts, so we regenerate exactly those in place instead of
-    touching partitions.csv (which would force a ~30 s CMake reconfigure + rebuild):
+    `app` is the remainder below `fixed`, so its size falls out of `fixed`'s — the
+    only thing a resize moves is `fixed` (up, as it shrinks) and `app` (bigger). We
+    regenerate exactly the artifacts a `fixed` resize touches, in place, instead of
+    editing partitions.csv the slow way (a ~30 s CMake reconfigure + rebuild):
 
-        1. partitions.csv           — gen-partitions.py at the measured sizes
+        1. partitions.csv           — gen-partitions.py at the measured `fixed` size
+                                      (`app_b` is passed only to ASSERT the firmware
+                                      ceiling — app.bin must fit the remainder — it
+                                      never sizes a partition)
         2. partition-table.bin      — IDF's gen_esp32part.py
         3. fixed.bin                — littlefs re-pack to the measured size
         4. flasher_args.json        — the `fixed` flash offset (app/bootloader
@@ -2129,13 +2151,15 @@ def finalize_shrink_wrap(proj: "Manifest", build_dir: Path,
 
 
 def measure_build_sizes(build_dir: Path) -> tuple[int, int]:
-    """(app_bytes, fixed_bytes) from a completed build, for shrink-wrapping.
+    """(app_bytes, fixed_bytes) from a completed build.
 
-    A small headroom margin is added to each so ordinary build-to-build growth
-    doesn't overflow the (cached) partition before the next measure pass: app
-    rounds to 64 K with +128 K margin; fixed models the LittleFS image the way
-    it actually packs (per-file data blocks + per-directory metadata pairs +
-    superblock, plus an 8-block cushion). 0 = couldn't measure (skip shrink).
+    `fixed_bytes` sizes the `fixed` partition (and its littlefs hint); `app_bytes`
+    is only asserted against the app remainder (app never gets a measured size).
+    A small headroom margin is added to each so the ceiling assertion keeps ~128 K
+    of app slack and the littlefs pack keeps a cushion: app rounds to 64 K with
+    +128 K margin; fixed models the LittleFS image the way it actually packs
+    (per-file data blocks + per-directory metadata pairs + superblock, plus an
+    8-block cushion). 0 = couldn't measure (skip shrink).
     """
     app_bytes = 0
     pd = build_dir / "project_description.json"
@@ -2216,10 +2240,28 @@ def print_partition_layout(csv_path: Path) -> None:
                     if mb * 1024 * 1024 >= floor), 0)
     pinned = container > minimal > 0
 
-    for label, key in (("compiled code", "app"),
-                       ("compressed files", "fixed"),
-                       ("reserved for growth", "reserved")):
-        print(f"  {label:<22}{human(sizes.get(key, 0)):>8}")
+    # `app` is the remainder below `fixed`, so its partition is deliberately large
+    # and mostly free — report the real firmware size + its headroom, not the slot.
+    app_used = 0
+    pd = csv_path.parent / "build" / "project_description.json"
+    if pd.exists():
+        try:
+            ab = json.loads(pd.read_text()).get("app_bin", "")
+            p = csv_path.parent / "build" / ab if ab else None
+            if p and p.exists():
+                app_used = p.stat().st_size
+        except (ValueError, OSError):
+            pass
+    app_slot = sizes.get("app", 0)
+    if app_used:
+        head = app_slot - app_used
+        print(f"  {'compiled code':<22}{human(app_used):>8}  "
+              f"(+{human(max(head, 0))} free in app slot)")
+    else:
+        print(f"  {'compiled code':<22}{human(app_slot):>8}")
+    print(f"  {'compressed files':<22}{human(sizes.get('fixed', 0)):>8}")
+    if sizes.get("reserved", 0):
+        print(f"  {'reserved for growth':<22}{human(sizes['reserved']):>8}")
     state = f"{human(container - floor):>8}" if pinned else \
         "  <all further space in flash>"
     print(f"  {'user state':<22}{state}")
@@ -2464,35 +2506,27 @@ def cmd_build(args: argparse.Namespace) -> int:
     rc = run_build_idf(
         idf_args or ["build"], cwd=proj.firmware_dir, quiet=quiet, env=build_env
     )
-    # On a successful plain build, shrink-wrap app/fixed to the measured app .bin
-    # + data sizes: cache them in build/.spangap-sizes (read by bootstrap.cmake)
-    # and, if they differ from what this build was configured with, rebuild once
-    # so IDF regenerates the partition table, flash offsets, and littlefs image
-    # consistently for the real sizes. Steady-state rebuilds measure the same
-    # values and stay single-pass. Then print the resulting layout.
+    # On a successful plain build, shrink-wrap `fixed` to the measured data size.
+    # Configure sized `fixed` generously (a safe upper bound, so the littlefs pack
+    # never NOSPCs) and `app` as the remainder, so nothing was carried in from a
+    # previous run. Now that `data_merged` is built we know `fixed`'s real size, so
+    # we shrink it — computed fresh, persisting nothing. `app_b` is measured only to
+    # assert the firmware ceiling. We finalize only when the real size differs from
+    # what the (generous) configure produced, comparing against the size already in
+    # partitions.csv — in-build state, not a cross-run cache. Finalize regenerates
+    # the table + fixed image + flash offset in place (no rebuild); on failure it
+    # falls back to a rebuild so a broken fixup can't ship a bad image.
     if rc == 0 and (not idf_args or idf_args == ["build"]):
         build_dir = proj.firmware_dir / "build"
         app_b, fixed_b = measure_build_sizes(build_dir)
-        if app_b:
-            sizes_file = build_dir / ".spangap-sizes"
-            new = f"app={app_b}\nfixed={fixed_b}\n"
-            old = sizes_file.read_text() if sizes_file.exists() else ""
-            if new != old:
-                sizes_file.write_text(new)
-                # Finalize in place: app.bin is offset-stable (reused as-is) and
-                # littlefs re-packs deterministically, so we regenerate only the
-                # partition table + fixed image + flash offset instead of forcing
-                # a ~30 s CMake reconfigure + rebuild. On any failure, fall back to
-                # the old touch-and-rebuild so a broken fixup can never ship a bad
-                # image. (bootstrap.cmake still reads .spangap-sizes on the *next*
-                # build, so a later reconfigure stays single-pass.)
-                frc = finalize_shrink_wrap(proj, build_dir, app_b, fixed_b)
-                if frc != 0:
-                    print("spangap: in-place finalize failed (%d) — rebuilding "
-                          "once" % frc, file=sys.stderr)
-                    (proj.firmware_dir / "partitions.csv").touch()
-                    rc = run_build_idf(idf_args or ["build"], cwd=proj.firmware_dir,
-                                       quiet=quiet, env=build_env)
+        if fixed_b and align_up(fixed_b, 0x1000) != _fixed_size_in(proj.firmware_dir / "partitions.csv"):
+            frc = finalize_shrink_wrap(proj, build_dir, app_b, fixed_b)
+            if frc != 0:
+                print("spangap: in-place finalize failed (%d) — rebuilding "
+                      "once" % frc, file=sys.stderr)
+                (proj.firmware_dir / "partitions.csv").touch()
+                rc = run_build_idf(idf_args or ["build"], cwd=proj.firmware_dir,
+                                   quiet=quiet, env=build_env)
         if rc == 0:
             print_partition_layout(proj.firmware_dir / "partitions.csv")
             write_flasher_zip(build_dir)

@@ -106,22 +106,29 @@ the source dir's contents plus two generated files:
   automatically from any component, so the corresponding `CONFIG_*` symbols
   are visible to every source file and every CMakeLists `if(CONFIG_*)`.
 
-- A generated **`staging/spangap_init_dispatch.gen.cpp`** defines
-  `spangapInitStraddles()` — the auto-init dispatcher. spangap-inside collects
-  the `init:` hooks every staged straddle declares in its `straddle.yaml`
-  (`init: [{call: <fn>, order: <n>}]`) and emits a forward decl + call for
-  each, ordered by `(order, dependency-topo)` (ties fall back to the resolved
-  dep order, so a straddle inits after the ones it `requires:`). The buildable
-  adds this file to its `main` component `SRCS` (guarded on `EXISTS`) and calls
-  `spangapInitStraddles()` once from `app_main`. **This is how a straddle
-  initializes without any edit to the consumer's `main.cpp`:** declaring
-  `init:` is sufficient — `spangap build --with spangap/sshd` brings sshd
-  up, and the default-on `wg`/`upnp`/`duckdns`/`maps` are initialized the same
-  way. Decls carry default (C++) linkage to match the `void xInit()` header
-  convention; the dispatcher references each symbol directly (so static-lib
-  linker GC can't drop it) and includes no per-straddle header (a straddle
-  pulled in with `--with` has its `include/` dir off the `main` path, but its lib is on the
-  link line). A `.c`-defined init needs an `extern "C"` wrapper to match.
+- A generated **`staging/spangap_init_dispatch.gen.cpp`** is the buildable's
+  **entire** entry point — it ships no hand-written `main.cpp`. spangap-inside
+  emits `spangapRegisterServices()`, which constructs every staged straddle's boot
+  object and appends it to one ordered registry (`serviceRegister`), plus an
+  `app_main()` that walks that registry twice: `serviceRunStart()` (bare hardware,
+  before `spangapInit()`) then `serviceRunInit()` (after, ecosystem up). A service
+  takes part in a phase purely by overriding its `onStart`/`onInit` virtual.
+  Registration order is `init_order()` — platform band (core/net/web/lcd) then
+  dependency-topo — so a straddle comes up after the ones it `requires:`.
+  **This is how a straddle boots without any edit to the consumer's `main.cpp`:**
+  a `services:` entry (a `Service` subclass) — or a legacy `init:`/`start:` hook,
+  which the generator wraps in an adapter `Service` — is sufficient; `spangap
+  build --with spangap/sshd` brings sshd up, and the default-on
+  `wg`/`upnp`/`duckdns`/`maps` boot the same way. Each `services:` class gets a
+  per-straddle trampoline TU (`spangap_services.gen.cpp`) that `#include`s its
+  header and `new`s it; the dispatcher forward-declares that trampoline symbol,
+  and legacy hook decls carry default (C++) linkage to match the `void xInit()`
+  convention. The dispatcher references every symbol directly (so static-lib
+  linker GC can't drop it) and includes no per-straddle header (a straddle pulled
+  in with `--with` has its `include/` dir off the `main` path, but its lib is on
+  the link line — and the trampoline TU, which does need the header, lives in the
+  straddle's *own* component where the header is on-path). A `.c`-defined legacy
+  init needs an `extern "C"` wrapper to match.
 
 - A separate generated file, **`staging/sdkconfig.spangap-overrides`**, is
   the highest-priority entry in `SDKCONFIG_DEFAULTS`. spangap-inside writes
@@ -624,6 +631,17 @@ CFG / POLL remain edge-only.
 - **IDF 5.5 `HEAP_TASK_TRACKING` global mutex** —
   `spangap-core/src/heap_track_stub.c` provides `--wrap` no-op stubs;
   required for stable cJSON-heavy workloads.
+- **A hand-tuned `sdkconfig` ignores later `sdkconfig.defaults.spangap`
+  bumps.** Once `spangap menuconfig` has been run (the
+  `.spangap-manual-kconfig` marker), the defaults staleness check keeps
+  the live `sdkconfig` and only prints a build notice — easy to miss. A
+  new mandatory default therefore has to be set directly in the affected
+  board's `sdkconfig` (or reseed with `spangap autoconfig`, losing the
+  hand tuning). Concrete case: raising
+  `CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS` for the PM boost TLS
+  slot never reached hw-tdeck's diverged `sdkconfig`; `pm.cpp` `#error`s
+  when it's too low, but a silently-missed default won't always be that
+  lucky.
 
 ## ESP-IDF specifics
 

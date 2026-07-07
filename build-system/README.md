@@ -270,8 +270,9 @@ dropping one with `--without` cascades the drop to whatever hard-requires it, an
 refused only when it would take out spangap-core or a buildable hard-require),
 `additional_installs` (soft, **default-on**, pruned silently when absent —
 call sites **must** gate on `CONFIG_*`); `firmware:` / `browser:` (paths to the two
-halves, e.g. `esp-idf` / `browser`); **`init:`** (bring-up function name — see the
-auto-init note below); `buildable:` (an **object**, not a bare flag: presence marks a
+halves, e.g. `esp-idf` / `browser`); **`services:`** (boot-registered `Service` classes)
+and the legacy **`init:`** / **`start:`** bring-up hooks — see the boot-registration note
+below; `buildable:` (an **object**, not a bare flag: presence marks a
 flashable image, and it carries `firmware` / `browser` / `lcd` entry paths);
 **`settings:`** (a declarative settings-pane block lowered to LCD + web + storage
 defaults at build time — see ["Declarative settings"](#declarative-settings-the-settings-block)).
@@ -322,20 +323,34 @@ Consumer CMake idiom: `include(${CMAKE_CURRENT_LIST_DIR}/spangap_requires.cmake)
 `${CMAKE_CURRENT_LIST_DIR}/../staging/main_requires.cmake` — **`CMAKE_CURRENT_LIST_DIR`,
 not `CMAKE_SOURCE_DIR`** (the latter breaks in IDF's requirements pre-pass).
 
-**Auto-init (don't hand-wire `xInit()` in `app_main`).** The build also collects every
-staged straddle's `init:` hook, topologically orders them by `requires`, and generates a
-**`spangapInitStraddles()`** dispatcher into `staging/` (alongside `main_requires.cmake`).
-The buildable calls that **one** function from `app_main()`; you do **not** list each
-straddle's init by hand. Two consequences for a straddle author: (1) declare your bring-up
-function in `init:` rather than asking the app to call it, and (2) that function uses
-**plain C++ linkage** — the generator emits each forward decl as `void xInit(void);` with
-default (C++) linkage, so your `init:` symbol must be a C++ `void xInit(void)` whose header
-does **not** wrap it in `extern "C"`, or the dispatcher fails to link (an init defined in a
-`.c` file needs an `extern "C"` wrapper to match). **Caveat:** the schema's own `init.call`
-*description* still says the symbol must be `extern "C"` — that prose is stale; the emitted
-C++-linkage decl is what actually links. (This whole mechanism supersedes the long manual
-`app_main()` init sequences still shown in some sibling READMEs — see the stale-doc caveats
-below.)
+**Boot registration (don't hand-wire bring-up in `app_main`).** The buildable ships no
+`main.cpp` — `spangap-inside` generates the **entire** entry point into
+`staging/spangap_init_dispatch.gen.cpp`: a `spangapRegisterServices()` that constructs every
+staged straddle's boot object and appends it to one ordered registry (`serviceRegister`),
+plus an `app_main()` that walks that registry twice — `serviceRunStart()` (bare hardware,
+before `spangapInit()`) then `serviceRunInit()` (after, ecosystem up). Registration order is
+`init_order()` (platform band core/net/web/lcd, then dependency-topo), so a straddle's deps
+come up before it; you do **not** list any bring-up by hand.
+
+A straddle contributes boot code two ways:
+
+- **`services:` (modern).** Declare a `Service` subclass (spangap-core's `service.h`); it
+  participates in a phase purely by overriding `onStart()` / `onInit()`, and the generator
+  emits a per-straddle trampoline TU (`spangap_services.gen.cpp`) that `#include`s the class
+  header and `new`s it. The class must be **global, external-linkage, default-constructible
+  with an ecosystem-free ctor** (member init only — storage/fs/log/cli/ITS are not up when
+  ctors run at the top of `app_main`). An `LcdApp` is a `Service`, so an on-device app is
+  just a `services:` entry. Full contract: the `services` key in
+  `schemas/straddle.schema.json` and spangap-core's `docs/init.md`.
+- **`start:` / `init:` (legacy free-function hook).** Still supported — the generator wraps
+  each `void xInit(void)` in an adapter `Service`. The symbol uses **plain C++ linkage** (the
+  forward decl is `void xInit(void);` with no `extern "C"`), so an init defined in a `.c`
+  file needs an `extern "C"` wrapper to match. **Caveat:** the schema's `init.call`
+  *description* still says the symbol must be `extern "C"` — stale prose; the emitted
+  C++-linkage decl is what links.
+
+(This supersedes the long manual `app_main()` init sequences still shown in some sibling
+READMEs — see the stale-doc caveats below.)
 
 ### Declarative settings (the `settings:` block)
 
@@ -358,18 +373,19 @@ The three generated surfaces:
 
 - **LCD pane** → static `spangapGenPane_N(void*)` functions of `lcdSetting*` calls plus a
   `spangapSettingsGenRegister()` that wires them via `lcdRegisterSettings`, emitted into
-  `staging/spangap_init_dispatch.gen.cpp` and called after `spangapInitStraddles()`. The
+  `staging/spangap_init_dispatch.gen.cpp` and called after the `serviceRunInit()` walk. The
   body is emitted **only when `spangap-lcd` is staged** (gated globally, not per-panel).
 - **Storage defaults** → `spangapSettingsGenDefaults()` (also in that gen file), one
   `storageDefault()` per binding row (`switch`/`slider`/`text`/`dropdown`) that carries a
   `default:` **and** whose key is persisted config (`s.` prefix); the C literal type follows
   the YAML value's type. **Always emitted** (headless/web builds seed defaults too), and
-  called after `spangapInit`, before straddle init. Bare/ephemeral keys and secrets are
-  never seeded.
+  called after `spangapInit`, before the `serviceRunInit()` walk. Bare/ephemeral keys and
+  secrets are never seeded.
 - **Web panel** → a JSON descriptor inlined into `<browser>/src/boot/straddles.gen.ts` as
   `GENERATED_PANELS`; `registerGeneratedPanels()` (`spangap-web`'s `lib/generatedPanels`)
   registers each at its menu path against **one shared** `GeneratedPanel.vue` interpreted at
-  runtime — no per-pane SFC codegen.
+  runtime — no per-pane SFC codegen (a runtime-interpreted descriptor is far less fragile
+  than generating Vue components).
 
 **Escape hatch:** a panel with `web: false` suppresses only its generated web panel (the
 straddle keeps a hand-written `*Panel.vue` at the same menu leaf for rich UI a static
@@ -430,9 +446,10 @@ image build, never to the currently-running container.
 
 1. **Manifest** — `straddle.yaml` with `name`/`prefix`/`version`; pick `prefix` with
    care (symbol prefix *and* browser import name — check it's free in the namespace map
-   above). If the straddle has bring-up code, declare it via **`init:`** (C++-linkage
-   function, no `extern "C"`) so the generated `spangapInitStraddles()` calls it in
-   dependency order — don't expect the app to hand-call it. Check with `spangap validate`.
+   above). If the straddle has bring-up code, declare a **`services:`** class (or a legacy
+   **`init:`**/**`start:`** hook, C++-linkage, no `extern "C"`) so the generated boot
+   registration constructs and runs it in dependency order — don't expect the app to
+   hand-call it. Check with `spangap validate`.
 2. **Deps** — hard → `requires`; integrate-when-present → `additional_installs`, and
    **gate every such call site** on `CONFIG_STRADDLE_<UPPER_REPO>` (or a
    `CONFIG_SPANGAP_*` alias) so a pruned dep still links. Ungated optional dep = the
@@ -453,6 +470,74 @@ image build, never to the currently-running container.
 
 After any manifest/dep/CMake change, the fast in-container check is `spangap validate`
 then `spangap list-requires`; a real `spangap build` confirms staging + linking.
+
+## Writing straddle docs
+
+The docs of every straddle follow one standard: two roles — an **operator guide**
+and a **maintainer reference** — laid out by how much the straddle does. (`rns` is
+the reference end-state.)
+
+**Mono-function straddle (most):** exactly two files at the straddle root —
+`README.md` (operator guide) and `INTERNALS.md` (maintainer reference). If a
+section grows big, it's a section, not a new file.
+
+**Multi-function straddle (`spangap-core/-net/-web/-lcd`):** a thin index
+`README.md` (what's here, pointing at each function's doc — *not* the operator
+guide for every function) plus a `docs/` pair **per function**: `docs/<func>.md`
+(operator guide) and `docs/<func>-internals.md` (maintainer reference), each
+linked from its `<func>.md`. Internals are a separate file, not a trailing
+chapter, so a context reading one doc doesn't load the whole maintainer
+reference. No root `INTERNALS.md` in these straddles. `docs/` exists **only**
+for this pattern — one self-contained file per function, never arbitrary
+per-subsystem fragmentation.
+
+**Operator-guide shape** (a mono README or a `docs/<func>.md`): one-paragraph
+what-it-is; brief origins (wraps/forks/ports what — detail goes to internals);
+what it does and how it interacts with the other straddles, with one minimal
+real usage example; the public surface (ports/API/opcodes, pointer to the header
+for exact layouts); the **full storage-variable list** (settings with defaults,
+runtime/telemetry, command sentinels, secrets — exhaustive, verified against
+code); CLI / user manual. Never tell users to call an `xInit()` the generated
+init already calls — state that it starts automatically when the straddle is in
+the build.
+
+**Maintainer shape** (an `INTERNALS.md` or `docs/<func>-internals.md`): §1 first —
+an exhaustive inventory of everything changed/added relative to the
+upstream/baseline; then task/threading model and ownership rules, wire/IPC
+framing, lifecycle, and a dedicated pitfalls section. Self-authoritative.
+
+Hard rules:
+
+- **A straddle's docs live in that straddle.** Never document straddle A inside
+  straddle B; fold a stray doc into the owner and retire it.
+- **No plan file is documentation.** `plans/*` is scratch history; docs stand on
+  their own and never link into plans.
+- **Settings ownership is declarative** — a doc never re-defines a config key or
+  default owned by another straddle's `settings:` block; the owner documents it
+  fully, everyone else points at the owner.
+- **Describe the present, not the path to it.** Cut plan phases, "used
+  to"/"previously"/migration history, dated status prose, plan-only facts not in
+  code, and header restatements. Keep current true behavior/contracts, the
+  complete verified surface, architecture and ownership/threading rules,
+  pitfalls (a historical one only as the rule — "X must be Y, because Z" — not
+  the anecdote), and rationale for non-obvious decisions stated as present fact.
+  This applies to code comments, CLI help, and log strings too.
+- **Use the real vocabulary** — upstream/protocol terms and existing platform
+  names; don't coin words that collide with a platform primitive's term. Rename
+  across code, comments, and docs in one pass, verifying zero stragglers.
+- A genuinely cross-cutting, multi-straddle architecture doc is not one
+  straddle's doc — it stays separate.
+
+Overhaul process, when consolidating or retiring docs: gather all sources (stray
+`.md`, comments, headers, history); write the standard files; **coverage-audit
+before deleting anything** — walk every fact/key/opcode/CLI command/pitfall in
+the material to be deleted and confirm it's either reflected in the new docs or
+genuinely stale (verify each value against live source, not against a plan or an
+older doc; watch for keys hidden behind macros and for `#if 0`'d/stubbed code —
+don't document those as live). Classify what you drop (stale / plan-only /
+domain-foreign), fix dangling references, and retire superseded files by
+renaming to `*.old.md` — never hard-delete — only after every receiver has
+absorbed them.
 
 ## Container gotchas
 
@@ -488,8 +573,9 @@ superseded per-straddle `CLAUDE.md` files. Four concrete traps when reading them
   straddle's `CLAUDE.md` moved into its `README.md`, its `INTERNALS.md` (per-straddle + the
   platform-wide `spangap/INTERNALS.md`), and `spangap-core/docs/` — prefer those as canonical.
 - **The hand-written `app_main()` init sequences are obsolete.** READMEs that show
-  `pmInit(); logInit(); fs_init(); …` enumerated by hand predate auto-init; today that
-  is one `spangapInitStraddles()` call (see "Auto-init" above).
+  `pmInit(); logInit(); fs_init(); …` enumerated by hand predate boot registration; today
+  `app_main` is fully generated — service registration plus the two registry walks (see
+  "Boot registration" above).
 
 Platform realities not stated elsewhere in this file, but assumed everywhere: target is
 **ESP32-S3 with octal PSRAM (mandatory)**, toolchain is **ESP-IDF 5.5.4** + Node 20.

@@ -78,7 +78,7 @@
       "default": []
     },
     "start": {
-      "description": "START-phase hooks: bare-hardware bring-up the platform itself depends on, run by the generated spangapStartStraddles() dispatcher as the FIRST thing in app_main — BEFORE spangapInit(), i.e. before fs/storage/log/cli even exist. This is the band for a board straddle to power a peripheral rail before spangap-core's fs_mount_sd() touches the SD bus, register the display/touch HAL before spangap-lcd's lcdInit(), etc. CONTRACT (the strict inverse of init:): a start hook runs on bare hardware — it must NOT use info()/warn()/dbg(), storage*, fs_*, or ITS (none are up yet); raw peripherals only (GPIO, power rails, pin mux, bus CS parking, HAL/driver registration that later init: hooks consume). Ordering is the same dependency-topo walk as init: (a board lands early because its dependents require: it); within one straddle, hooks fire in listed order. Same entry shape and `when:` gating as init:. By convention a start hook is named xStart (e.g. tdeckStart), mirroring the xInit convention of init:.",
+      "description": "START-phase hooks (the legacy free-function form of a Service onStart — see services: for the object form): bare-hardware bring-up the platform itself depends on. The generator wraps each in an adapter Service and runs it in the serviceRunStart() walk, as the FIRST thing in app_main — BEFORE spangapInit(), i.e. before fs/storage/log/cli even exist. This is the band for a board straddle to power a peripheral rail before spangap-core's fs_mount_sd() touches the SD bus, register the display/touch HAL before spangap-lcd's lcdInit(), etc. CONTRACT (the strict inverse of init:): a start hook runs on bare hardware — it must NOT use info()/warn()/dbg(), storage*, fs_*, or ITS (none are up yet); raw peripherals only (GPIO, power rails, pin mux, bus CS parking, HAL/driver registration that later init: hooks consume). Ordering is the same dependency-topo walk as init: (a board lands early because its dependents require: it); within one straddle, hooks fire in listed order. Same entry shape and `when:` gating as init:. By convention a start hook is named xStart (e.g. tdeckStart), mirroring the xInit convention of init:.",
       "type": "array",
       "items": {
         "type": "object",
@@ -100,7 +100,7 @@
       "default": []
     },
     "init": {
-      "description": "INIT-phase hooks this straddle wants the buildable to run automatically, AFTER spangapInit() (the platform foundations) — the post-infrastructure band, contrast start: above. spangap-inside collects these across the staged set and generates staging/spangap_init_dispatch.gen.cpp — a spangapInitStraddles() that calls them in two bands: first spangap's own platform components (core, net, web, lcd) in that fixed order, then every other straddle in dependency-topo order (a straddle inits after the straddles it requires:). There is no per-hook order knob — a straddle that must come up after another declares it in requires:/additional_installs: and the topo walk handles it; everything in the straddle band can already assume the platform band is up. Within one straddle, hooks fire in listed order. The buildable calls spangapInitStraddles() once; from then on, staging a straddle that declares init: is enough to have it initialize — no consumer main.cpp edit. Each entry's `call` is a plain global `void <name>()` defined in this straddle's firmware half (the dispatcher emits its own C++-linkage forward declaration, so no header wiring and no `extern \"C\"` is needed). By convention an init hook is named xInit.",
+      "description": "INIT-phase hooks (the legacy free-function form of a Service onInit — see services: for the object form) this straddle wants the buildable to run automatically, AFTER spangapInit() (the platform foundations) — the post-infrastructure band, contrast start: above. spangap-inside collects these across the staged set and, in the generated staging/spangap_init_dispatch.gen.cpp, wraps each in an adapter Service run in the serviceRunInit() walk, in two bands: first spangap's own platform components (core, net, web, lcd) in that fixed order, then every other straddle in dependency-topo order (a straddle inits after the straddles it requires:). There is no per-hook order knob — a straddle that must come up after another declares it in requires:/additional_installs: and the topo walk handles it; everything in the straddle band can already assume the platform band is up. Within one straddle, hooks fire in listed order (and legacy init: hooks register before services: entries). The buildable ships no main.cpp — app_main is generated; from then on, staging a straddle that declares init: is enough to have it initialize — no consumer edit. Each entry's `call` is a plain global `void <name>()` defined in this straddle's firmware half (the generated dispatch emits its own C++-linkage forward declaration, so no header wiring and no `extern \"C\"` is needed). By convention an init hook is named xInit.",
       "type": "array",
       "items": {
         "type": "object",
@@ -122,7 +122,7 @@
       "default": []
     },
     "browser_register": {
-      "description": "BROWSER-side registration hooks — the browser-half parallel to init:. spangap-inside collects these across the staged set (same init_order as the firmware spangapInitStraddles()) and generates, into a buildable's browser half, src/boot/straddles.gen.ts: a default-export registerStraddles() that imports each hook's `call` symbol from this straddle's browser package and invokes it, in order. It also injects a `file:../../<repo>/browser` dependency into the buildable's browser package.json so the import resolves under node_modules. The buildable loads the generated function ONCE from its hand-written boot/modules.ts (import registerStraddles from './straddles.gen'; registerStraddles()) — the browser analog of calling spangapInitStraddles() once. From then on, staging a straddle that declares browser_register: is enough to surface its UI (menu pane, etc.); no consumer edit. Only emitted into buildables that have a browser half, and only for staged straddles that themselves have a browser half. Same `when:` gating as init:. By convention the symbol is named register<Prefix> (e.g. registerWg) and is exported from <pkg>/modules/<repo>.",
+      "description": "BROWSER-side registration hooks — the browser-half parallel to init:. spangap-inside collects these across the staged set (same init_order as the firmware boot registration) and generates, into a buildable's browser half, src/boot/straddles.gen.ts: a default-export registerStraddles() that imports each hook's `call` symbol from this straddle's browser package and invokes it, in order. It also injects a `file:../../<repo>/browser` dependency into the buildable's browser package.json so the import resolves under node_modules. The buildable loads the generated function ONCE from its hand-written boot/modules.ts (import registerStraddles from './straddles.gen'; registerStraddles()) — the browser analog of the firmware's generated boot registration. From then on, staging a straddle that declares browser_register: is enough to surface its UI (menu pane, etc.); no consumer edit. Only emitted into buildables that have a browser half, and only for staged straddles that themselves have a browser half. Same `when:` gating as init:. By convention the symbol is named register<Prefix> (e.g. registerWg) and is exported from <pkg>/modules/<repo>.",
       "type": "array",
       "items": {
         "type": "object",
@@ -179,6 +179,12 @@
       },
       "default": []
     },
+    "services": {
+      "description": "Boot-registered Service objects (see spangap-core service.h) this straddle contributes. The modern replacement for start:/init: free-function hooks: instead of declaring a bare `void xInit()` symbol, declare a Service SUBCLASS and the generated boot code constructs it and appends it to the ordered registry (serviceRegister) at the straddle's init_order position. The object participates in a boot phase purely by overriding that phase's virtual (onStart pre-spangapInit / onInit post-spangapInit) — the generator never learns which phases a class overrides. spangap-inside emits, per entry, a per-straddle trampoline TU (staging/components/<repo>/spangap_services.gen.cpp) that #includes the class header and defines spangapService_<Class>() { serviceRegister(new <Class>()); }; the generated app_main forward-declares and calls that symbol in boot order. The trampoline rides SPANGAP_CONDITIONAL_SRCS (the straddle's CMakeLists must already compile ${SPANGAP_CONDITIONAL_SRCS} in SRCS — the same list conditional/ code uses), and the class header must be on the component's include path (e.g. a public include/ header, or a conditional/<name>/include header when the class is gated). Class requirements: external linkage, GLOBAL (no namespace — the codebase disambiguates by symbol prefix), default-constructible with an ECOSYSTEM-FREE ctor (member init only — storage/fs/log/cli/ITS are NOT up when ctors run at the very top of app_main). An LcdApp is a Service, so an on-device app is just a services: entry. Same `when:` gating as init:. Within one straddle, legacy init: entries register before services: entries.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/serviceEntry" },
+      "default": []
+    },
     "settings": {
       "description": "Declarative settings panels — one descriptor per settings pane. spangap-inside lowers each panel into THREE generated surfaces from this single source: (1) the on-device LCD pane (lcdRegisterSettings + lcdSetting* calls, gated on spangap-lcd being staged), (2) the browser panel (serialized as a JSON descriptor inlined into straddles.gen.ts and rendered at runtime by spangap-web's GeneratedPanel.vue, registered through the menu store), and (3) the persisted storage defaults (storageDefault() for every row carrying a `default:` whose key starts with `s.`). This replaces the three-way hand-duplication of a setting across a *_lcd.cpp pane fn, a *Panel.vue, and scattered storageDefault() calls. A straddle declaring a settings: block deletes those three copies. Custom interaction flows, computed/conditional rows, and rich live-status panels stay hand-written (register a pane the old way) — the descriptor is for the static rows. The default-seeding is emitted into the firmware init band (runs on headless/web-only builds too), the LCD pane only when spangap-lcd is staged.",
       "type": "array",
@@ -187,6 +193,28 @@
     }
   },
   "$defs": {
+    "serviceEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "header"],
+      "properties": {
+        "class": {
+          "description": "The Service subclass to construct and register, e.g. 'MapsApp'. GLOBAL (no namespace), external linkage, default-constructible with an ecosystem-free ctor. Its instance is `new`'d once at boot and lives forever. The generated trampoline symbol is spangapService_<class>.",
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "header": {
+          "description": "The header (as written in an #include \"...\") that declares the class, e.g. 'maps_app.h'. Resolved against this component's include path — a public include/ header, or a conditional/<name>/include header when the class is when:-gated on <name>. No '<prefix>.h' magic: name it explicitly.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._/-]+$"
+        },
+        "when": {
+          "description": "Optional gate: construct+register this service only when the named straddle ('<org>/<repo>') is in the staged build set. Resolved at generation time — when the gating straddle is pruned, neither the trampoline TU nor its registration call is emitted, so the class (and its header) need not exist in that configuration. Same vocabulary and semantics as init:'s when: (e.g. an LcdApp service gates 'when: spangap/spangap-lcd').",
+          "type": "string",
+          "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+$"
+        }
+      }
+    },
     "settingsPanel": {
       "type": "object",
       "additionalProperties": false,

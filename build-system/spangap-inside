@@ -2073,9 +2073,13 @@ def finalize_shrink_wrap(proj: "Manifest", build_dir: Path,
                                       ceiling — app.bin must fit the remainder — it
                                       never sizes a partition)
         2. partition-table.bin      — IDF's gen_esp32part.py
-        3. fixed.bin                — littlefs re-pack to the measured size
-        4. flasher_args.json        — the `fixed` flash offset (app/bootloader
+        3. flasher_args.json        — the `fixed` flash offset (app/bootloader
                                       keep their offsets, so nothing else moves)
+
+    `fixed.bin` is NOT re-packed: a spanfs image is byte-exact and placement-
+    independent, so the image built during the (generously-sized) main build IS
+    the final image — it is reused verbatim, exactly like app.bin/bootloader.bin.
+    (This is the LittleFS re-pack step the old flow needed and spanfs removes.)
 
     Returns 0 on success; nonzero lets the caller fall back to a full rebuild.
     """
@@ -2094,10 +2098,17 @@ def finalize_shrink_wrap(proj: "Manifest", build_dir: Path,
     max_fw_kb = int(cfg("CONFIG_SPANGAP_MAX_FIRMWARE_KB", "0") or "0")
     state_floor = max_fw_kb * 1024 if max_fw_kb > 0 else container_mb * 1024 * 1024
     updater = "y" if (fw / "staging/components/updater").exists() else "n"
-    name_max = cfg("CONFIG_LITTLEFS_OBJ_NAME_LEN", "64")
 
     gen_parts = fw / "staging/components/spangap-core/scripts/gen-partitions.py"
     if not gen_parts.exists():
+        return 1
+
+    # The packed spanfs image must fit the shrink-wrapped partition. It always
+    # does (gen-partitions rounds fixed_b up to the 4 K alignment), but guard
+    # against a stale/missing fixed.bin so we never patch an offset for an image
+    # that isn't there.
+    fixed_bin = build_dir / "fixed.bin"
+    if not fixed_bin.exists():
         return 1
 
     def run(argv: list[str]) -> int:
@@ -2118,6 +2129,8 @@ def finalize_shrink_wrap(proj: "Manifest", build_dir: Path,
             fixed_off, fixed_size = int(c[3], 0), int(c[4], 0)
     if fixed_off is None or fixed_size is None:
         return 1
+    if fixed_bin.stat().st_size > fixed_size:
+        return 1                                    # image outgrew its partition
 
     # 2. partition-table.bin — IDF's own generator, same flags as the build.
     idf = Path(os.environ["IDF_PATH"])
@@ -2128,15 +2141,7 @@ def finalize_shrink_wrap(proj: "Manifest", build_dir: Path,
             "--flash-size", fs, "--", str(partitions), str(ptbin)]):
         return 1
 
-    # 3. Re-pack fixed.bin to the measured partition size (littlefs is
-    #    deterministic — this is byte-identical to what a rebuild would pack).
-    lfs = build_dir / "littlefs_py_venv" / "bin" / "littlefs-python"
-    if run([str(lfs), "create", str(build_dir / "data_merged"),
-            str(build_dir / "fixed.bin"), "--fs-size=%#x" % fixed_size,
-            "--name-max=%s" % name_max, "--block-size=4096"]):
-        return 1
-
-    # 4. Patch the `fixed` offset in flasher_args.json (unique, so a quoted
+    # 3. Patch the `fixed` offset in flasher_args.json (unique, so a quoted
     #    string replace preserves IDF's formatting and touches nothing else).
     fa = build_dir / "flasher_args.json"
     try:
@@ -2153,13 +2158,15 @@ def finalize_shrink_wrap(proj: "Manifest", build_dir: Path,
 def measure_build_sizes(build_dir: Path) -> tuple[int, int]:
     """(app_bytes, fixed_bytes) from a completed build.
 
-    `fixed_bytes` sizes the `fixed` partition (and its littlefs hint); `app_bytes`
-    is only asserted against the app remainder (app never gets a measured size).
-    A small headroom margin is added to each so the ceiling assertion keeps ~128 K
-    of app slack and the littlefs pack keeps a cushion: app rounds to 64 K with
-    +128 K margin; fixed models the LittleFS image the way it actually packs
-    (per-file data blocks + per-directory metadata pairs + superblock, plus an
-    8-block cushion). 0 = couldn't measure (skip shrink).
+    `fixed_bytes` sizes the `fixed` partition; `app_bytes` is only asserted
+    against the app remainder (app never gets a measured size).
+
+    `fixed` is a spanfs image now: byte-exact and placement-independent, so its
+    size is simply the packed `fixed.bin` on disk — no LittleFS block rounding,
+    no per-directory metadata pairs, no cushion. gen-partitions rounds it up to
+    the 4 K data alignment for the partition. `app_bytes` keeps a +128 K
+    headroom so the ceiling assertion leaves the app slot with slack.
+    0 = couldn't measure (skip shrink).
     """
     app_bytes = 0
     pd = build_dir / "project_description.json"
@@ -2172,28 +2179,12 @@ def measure_build_sizes(build_dir: Path) -> tuple[int, int]:
         except (ValueError, OSError):
             pass
     fixed_bytes = 0
-    merged = build_dir / "data_merged"
-    if merged.is_dir():
-        BLK = 0x1000
-        # Size the image the way LittleFS packs it, not as a bare sum of file
-        # bytes. The byte-sum misses real per-image overhead: a 2-block
-        # superblock pair and a 2-block metadata pair for every directory
-        # (root included). Omitting the directories — there can be many in a
-        # webroot/icon tree — undersizes the partition and the littlefs image
-        # overflows it at pack time (LFS_ERR_NOSPC).
-        blocks = 2 + 2                                  # superblock + root dir
-        for f in merged.rglob("*"):
-            try:
-                if f.is_dir():
-                    blocks += 2                         # directory metadata pair
-                elif f.is_file():
-                    blocks += max((f.stat().st_size + BLK - 1) // BLK, 1)
-            except OSError:
-                pass
-        if blocks > 4:
-            # +8 blocks: CTZ skip-list back-pointers ride inside multi-block
-            # files (usable bytes/block < BLK) and littlefs won't pack to 100 %.
-            fixed_bytes = (blocks + 8) * BLK
+    fixed_bin = build_dir / "fixed.bin"
+    if fixed_bin.exists():
+        try:
+            fixed_bytes = fixed_bin.stat().st_size          # byte-exact spanfs image
+        except OSError:
+            pass
     return app_bytes, fixed_bytes
 
 

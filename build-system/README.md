@@ -269,7 +269,10 @@ spangap-core), `version` (`X.Y.Z`); `requires` (hard — missing = error;
 dropping one with `--without` cascades the drop to whatever hard-requires it, and is
 refused only when it would take out spangap-core or a buildable hard-require),
 `additional_installs` (soft, **default-on**, pruned silently when absent —
-call sites **must** gate on `CONFIG_*`); `firmware:` / `browser:` (paths to the two
+call sites **must** gate on `CONFIG_*`; an entry is a plain spec or
+`{ install:, when: }`, staging `install:` only when the `when:` straddle is
+also in the closure — e.g. spangap-lcd pulls lcdmirror only into builds that
+already have spangap-web); `firmware:` / `browser:` (paths to the two
 halves, e.g. `esp-idf` / `browser`); **`services:`** (boot-registered `Service` classes)
 and the legacy **`init:`** / **`start:`** bring-up hooks — see the boot-registration note
 below; `buildable:` (an **object**, not a bare flag: presence marks a

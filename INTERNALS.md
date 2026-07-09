@@ -25,7 +25,11 @@ carry the rest of the deps:
   straddle the buildable itself hard-requires.
 - **`additional_installs:`** — soft, **default-on**. Pruned silently when
   the dep isn't in the staged set (not cloned, not in the buildable's
-  requires, or dropped by `--without` / `--no-X`).
+  requires, or dropped by `--without` / `--no-X`). The object form
+  `{ install:, when: }` gates the edge on a second straddle's presence, so
+  an extra can ride a conjunction (lcd ∧ web) without dragging the second
+  straddle in; gates resolve to a fixpoint, and dropping the `when:`
+  straddle takes the gated extra with it.
 
 There's no manifest list of "extras you might also want" — anything the
 user wants beyond the curated set goes in via `--with <name>` at build

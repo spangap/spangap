@@ -159,7 +159,21 @@ class Manifest:
         return list(self.data.get("requires", []))
     @property
     def additional_installs(self) -> list[str]:
-        return list(self.data.get("additional_installs", []))
+        """Spec names only — a gated entry contributes its install: name."""
+        return [spec for spec, _ in self.additional_installs_gated]
+    @property
+    def additional_installs_gated(self) -> list[tuple[str, str | None]]:
+        """(spec, when) pairs. A plain-string entry is ungated (when=None). The
+        object form { install:, when: } stages install: only when the when:
+        straddle is itself in the resolved closure — evaluated to a fixpoint in
+        resolve_requires(), so gate order doesn't matter."""
+        out: list[tuple[str, str | None]] = []
+        for e in self.data.get("additional_installs", []):
+            if isinstance(e, str):
+                out.append((e, None))
+            else:
+                out.append((e["install"], e.get("when")))
+        return out
     @property
     def start(self) -> list[dict[str, Any]]:
         return list(self.data.get("start", []))
@@ -428,7 +442,11 @@ def resolve_requires(
 
     Two tiers in the manifest:
       requires:           hard — always pulled in, missing = error
-      additional_installs:  soft, default-on — pruned silently if absent/excluded
+      additional_installs:  soft, default-on — pruned silently if absent/excluded.
+        The object form { install:, when: } additionally gates the edge on the
+        when: straddle being in the closure (fixpoint pass below), so an extra
+        can ride the *conjunction* of two straddles without dragging in the
+        second one.
 
     spangap-core is always an implicit hard root (see CORE_NAME) and sorts to
     the head of the topo order. `included` (from --with <name>) seeds the
@@ -468,6 +486,9 @@ def resolve_requires(
     seen: set[str] = set()
     on_stack: set[str] = set()
     missing: dict[str, str] = {}
+    # Gated soft edges ({install:, when:}) parked until their when: straddle
+    # enters the closure: (spec, requested_by, gate-bare-name).
+    pending_gated: list[tuple[str, str, str]] = []
     hard_deps: dict[str, set[str]] = {}  # name → bare names of its hard requires:
 
     def visit(spec: str, requested_by: str, hard: bool) -> None:
@@ -498,8 +519,11 @@ def resolve_requires(
         for dep in all_straddles[bare].requires:
             hd.add(_bare(dep))
             visit(dep, bare, hard=True)
-        for dep in all_straddles[bare].additional_installs:
-            visit(dep, bare, hard=False)
+        for dep, when in all_straddles[bare].additional_installs_gated:
+            if when is None:
+                visit(dep, bare, hard=False)
+            else:
+                pending_gated.append((dep, bare, _bare(when)))
         on_stack.discard(bare)
         seen.add(bare)
         hard_deps[bare] = hd
@@ -513,10 +537,27 @@ def resolve_requires(
         visit(CORE_NAME, f"{proj.name} (implicit core)", hard=True)
     for r in proj.requires:
         visit(r, proj.name, hard=True)
-    for r in proj.additional_installs:
-        visit(r, proj.name, hard=False)
+    for r, when in proj.additional_installs_gated:
+        if when is None:
+            visit(r, proj.name, hard=False)
+        else:
+            pending_gated.append((r, proj.name, _bare(when)))
     for r in included:
         visit(r, f"{proj.name} (--with)", hard=False)
+
+    # Fire gated soft edges to a fixpoint: an edge stages its install: only
+    # once its when: straddle is in the closure (staged — or, in the get-deps
+    # missing_ok walk, collected for cloning). Firing an edge can stage
+    # straddles whose own gated edges then become eligible, so iterate.
+    # Edges whose gate never enters the closure are dropped silently, like
+    # any other absent soft dep.
+    while pending_gated:
+        ready = [e for e in pending_gated if e[2] in seen or e[2] in missing]
+        if not ready:
+            break
+        pending_gated = [e for e in pending_gated if e not in ready]
+        for dep, requested_by, _gate in ready:
+            visit(dep, requested_by, hard=False)
 
     # Hard-cycle pass: additional_installs cycles are allowed (above), but a
     # cycle made purely of requires: edges is a genuine init-ordering
@@ -586,9 +627,16 @@ def resolve_requires(
     # Forward-prune: keep only what's still reachable from the surviving roots
     # over hard+optional edges, skipping the excluded set. Drops the named
     # targets, their cascaded dependents, and any now-orphaned forward deps.
+    # A gated soft edge only carries reachability while its when: straddle
+    # survives the exclude pass — dropping the gate re-orphans the install:
+    # (unless something else still reaches it).
+    def _live_soft(m: Manifest) -> list[str]:
+        return [d for d, w in m.additional_installs_gated
+                if w is None or (_bare(w) in seen and _bare(w) not in excl)]
+
     roots = ([CORE_NAME] if proj.name != CORE_NAME else [])
     roots += [_bare(r) for r in proj.requires]
-    roots += [_bare(r) for r in proj.additional_installs]
+    roots += [_bare(r) for r in _live_soft(proj)]
     roots += [_bare(r) for r in included]
     reachable: set[str] = set()
     stack = [r for r in roots if r in seen and r not in excl]
@@ -597,7 +645,7 @@ def resolve_requires(
         if n in reachable:
             continue
         reachable.add(n)
-        for dep in all_straddles[n].requires + all_straddles[n].additional_installs:
+        for dep in all_straddles[n].requires + _live_soft(all_straddles[n]):
             db = _bare(dep)
             if db in seen and db not in excl and db not in reachable:
                 stack.append(db)

@@ -69,11 +69,32 @@
       "default": []
     },
     "additional_installs": {
-      "description": "Other straddles to ALSO stage whenever this one is in the build — default-on extras pulled in transitively, droppable with --without/--no-X. Unlike requires:, absence is NOT an error: a listed straddle that isn't on disk (or was dropped) is pruned silently. This is the 'pull in the kitchen sink' knob, kept deliberately rare — an aggregator/app straddle uses it to assemble a device's feature set; most straddles list nothing here. Source code that integrates with a thus-pulled straddle must still gate its call sites on the auto-generated CONFIG_STRADDLE_<UPPER_NAME> (or the CONFIG_SPANGAP_LCD/CONFIG_SPANGAP_WEB shortcuts) so a --without drop compiles away cleanly.",
+      "description": "Other straddles to ALSO stage whenever this one is in the build — default-on extras pulled in transitively, droppable with --without/--no-X. Unlike requires:, absence is NOT an error: a listed straddle that isn't on disk (or was dropped) is pruned silently. This is the 'pull in the kitchen sink' knob, kept deliberately rare — an aggregator/app straddle uses it to assemble a device's feature set; most straddles list nothing here. An entry is either a plain '<org>/<repo>' spec (unconditional) or the object form { install:, when: }, which stages install: only when the when: straddle is itself in the resolved closure — the edge expresses a conjunction ('this extra makes sense only when X is ALSO here') without dragging X in. Gates are evaluated to a fixpoint, and a when: straddle dropped by --without takes the gated extra with it (unless something else still reaches it). Source code that integrates with a thus-pulled straddle must still gate its call sites on the auto-generated CONFIG_STRADDLE_<UPPER_NAME> (or the CONFIG_SPANGAP_LCD/CONFIG_SPANGAP_WEB shortcuts) so a --without drop compiles away cleanly.",
       "type": "array",
       "items": {
-        "type": "string",
-        "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+(@[A-Za-z0-9._/-]+)?$"
+        "oneOf": [
+          {
+            "type": "string",
+            "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+(@[A-Za-z0-9._/-]+)?$"
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["install"],
+            "properties": {
+              "install": {
+                "description": "The straddle to stage — same '<org>/<repo>[@ref]' spec as the plain-string form.",
+                "type": "string",
+                "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+(@[A-Za-z0-9._/-]+)?$"
+              },
+              "when": {
+                "description": "Gate: stage install: only when this '<org>/<repo>' straddle is in the resolved closure (same vocabulary as the when: on init:/start:/browser_register: hooks). Omit for an unconditional entry (equivalent to the plain-string form).",
+                "type": "string",
+                "pattern": "^[a-z0-9._-]+/[a-z0-9._-]+$"
+              }
+            }
+          }
+        ]
       },
       "default": []
     },

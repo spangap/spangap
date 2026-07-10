@@ -628,6 +628,14 @@ CFG / POLL remain edge-only.
   workaround: `CONFIG_LWIP_PPP_SUPPORT=y`.
 - **`CONFIG_ESP_WIFI_NVS_ENABLED=n`** — prevents the WiFi blob from
   auto-reconnecting outside `net.cpp` and avoids mid-session NVS writes.
+- **WiFi boot crash is the driver's PSRAM *heap* structs, not its `.bss`.**
+  `esp_wifi_set_config`/scan die on a corrupted near-null pointer when the
+  driver's runtime control structs (allocated in PSRAM via `ALWAYSINTERNAL=0`)
+  are hit by a boot-window flash op. `.bss` pinning via a linker fragment was
+  tried and disproven on-device, then backed out. Live fix: `net.cpp` defers
+  radio bring-up until `sys.boot_complete` + a `storageSave()` drain, so the
+  structs are written against idle flash. Details:
+  [memory-internals.md](../spangap-core/docs/memory-internals.md).
 - **SDMMC DMA requires internal DRAM buffers** — the fs worker
   serializes all SD access.
 - **ESP32-S3 AES-GCM hardware DMA bug** (espressif/esp-idf#12689) —
@@ -688,6 +696,10 @@ The detail of each subsystem lives in `docs/` *in the straddle that owns
 it*. Cross-cutting docs that still live in `spangap-core`:
 
 - [docs/its.md](../spangap-core/docs/its.md) — ITS architecture
+- [docs/memory.md](../spangap-core/docs/memory.md) — PSRAM-vs-DRAM placement
+  policy; [memory-internals.md](../spangap-core/docs/memory-internals.md) is
+  the forensic case log (PSRAM placement corruption, the boot-window theory,
+  the WiFi-blob-bss-in-PSRAM side effect and its linker-fragment fix)
 - [docs/storage.md](../spangap-core/docs/storage.md)
 - [docs/fs.md](../spangap-core/docs/fs.md) — unified filesystem API
 - [docs/cron.md](../spangap-core/docs/cron.md)

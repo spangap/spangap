@@ -98,9 +98,9 @@ device loop is its own section below
 **Host-only verbs you can't run from this container:** `monitor`, `probe`, real
 `flash`, `init`, `reset-workspace`, `get-deps` (the cloning side), `push-all`
 (create + push every straddle repo to GitHub — runs `gh`/`git` with the host's
-credentials, never in the container), `make-builds` (build every entry in a
-builds repo's `builds.yaml` and collect each `build/flasher.zip` to
-`<name>.zip` in the builds-repo root), and `docker <cmd>` — those
+credentials, never in the container), `detect-build`
+(build flashmon's `esp-idf/` peripheral
+detector in the container), and `docker <cmd>` — those
 live in **`spangap-outside`** on the host and need the serial port / docker / the
 container lifecycle. There is **no `docker` and no `esptool.py`** in here by design
 (no docker-in-docker; esptool is host-side in the per-host venv).
@@ -349,7 +349,7 @@ enumerate the workspace.
 6. on a successful plain build, write **`build/flasher.zip`** — `flasher_args.json`
    plus every image it references (bootloader, partition table, app, data). A
    self-contained, host-independent bundle any flasher consumes: the web flasher
-   (`spangap/flasher`), or `spangap make-builds` collecting it into a builds repo.
+   (`flashmon`), or flashmon's `make-builds.py` collecting it into a catalogue.
 
 Consumer CMake idiom: `include(${CMAKE_CURRENT_LIST_DIR}/spangap_requires.cmake)` then
 `REQUIRES ${SPANGAP_REQUIRES} …`. The buildable's `main/CMakeLists.txt` reads

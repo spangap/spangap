@@ -2711,6 +2711,10 @@ def cmd_build(args: argparse.Namespace) -> int:
         "SPANGAP_BUILD_STRADDLE": proj.name,
         "SPANGAP_BUILD_VERSION": proj.version,
         "SPANGAP_BUILD_ARGS": getattr(args, "spangap_invocation", "") or "spangap build",
+        # A catalogue build stamp, when a caller (flashmon's make-builds.py) set it
+        # in the environment; empty otherwise. Passed through so the image logs the
+        # exact stamp it's published under.
+        "SPANGAP_BUILD_DATETIME": os.environ.get("SPANGAP_BUILD_DATETIME", ""),
     }
     # Provenance manifest → device webroot as /BUILD.md. Written before the IDF
     # run so it's on disk when project_include.cmake's configure step picks it up
@@ -2926,6 +2930,18 @@ def cmd_log(args: argparse.Namespace) -> int:
 def cmd_clean(args: argparse.Namespace) -> int:
     proj = find_project()
     return run_idf(["fullclean"], cwd=proj.firmware_dir)
+
+
+def cmd_detect_build(args: argparse.Namespace) -> int:
+    """Build flashmon's peripheral-detection RAM app (flashmon/esp-idf) with
+    idf.py. In-container twin of the host `spangap detect-build`, so it works
+    the same however it's reached; leaves build/spangap_detect.bin for
+    flashmon/esp-idf/Makefile to stage into flashmon/flashmon/detect/."""
+    espdir = WORKSPACE / "flashmon" / "esp-idf"
+    if not (espdir / "CMakeLists.txt").is_file():
+        die(f"detect-build: no flashmon/esp-idf in {WORKSPACE}")
+    return run_idf(["set-target", "esp32s3", "build"], cwd=espdir)
+
 
 
 def _capture(cmd: list[str]) -> str:
@@ -3589,6 +3605,12 @@ def main(argv: list[str] | None = None) -> int:
              "(.spangap-build). TARGET + --with/--without are remembered there.",
     )
     p_build.set_defaults(func=cmd_build)
+
+    sub.add_parser(
+        "detect-build",
+        help="build flashmon/esp-idf (the peripheral detector) with idf.py; "
+             "leaves build/spangap_detect.bin for its Makefile to stage",
+    ).set_defaults(func=cmd_detect_build)
 
     p_mc = sub.add_parser(
         "menuconfig",

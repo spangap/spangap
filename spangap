@@ -61,8 +61,6 @@ Commands (run inside a workspace):
   shell                      interactive shell in the build container
   push-all [--force] [dir]   create + push every git repo under dir (default: the
                              workspace) to GitHub; host-only, uses your gh auth
-  make-builds <builds-dir>   build every entry in <builds-dir>/builds.yaml and
-                             copy each flasher.zip to <builds-dir>/main/<name>.zip
   heal                       repair workspace repos whose git object store reads
                              short in-container (virtiofs); auto-runs before builds
 

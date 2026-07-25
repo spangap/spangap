@@ -1213,106 +1213,6 @@ push-all)
     done
     exit 0
     ;;
-make-builds)
-    # Host-only. Build every entry in a builds repo's builds.yaml and copy the
-    # resulting flasher.zip to <builds-repo>/<name>.zip. Each entry pairs a
-    # short name with a `spangap build` invocation; we re-run the normal build
-    # path per entry (so dep cloning + the container build happen exactly as
-    # usual), then copy the zip. Copies only — committing/pushing the zips is the
-    # builds repo's own job (its GitHub Action, or `spangap push-all`).
-    shift
-    case ${1:-} in
-        -h|--help)
-            printf '%s\n' \
-                "usage: spangap make-builds <builds-repo-dir>" \
-                "  Build every entry in <builds-repo-dir>/builds.yaml (a short name + a" \
-                "  \`spangap build\` invocation) and copy each flasher.zip to" \
-                "  <builds-repo-dir>/<name>.zip. Run from inside a spangap workspace;" \
-                "  copies only (commit/push the zips separately)."
-            exit 0 ;;
-    esac
-    [ $# -ge 1 ] || die "usage: spangap make-builds <builds-repo-dir> (try --help)"
-    bdir=$1
-    [ -d "$bdir" ] || die "make-builds: not a directory: $bdir"
-    byaml="$bdir/builds.yaml"
-    [ -f "$byaml" ] || die "make-builds: no builds.yaml in $bdir"
-    command -v python3 >/dev/null 2>&1 || die "make-builds: python3 required to read builds.yaml"
-    self="$workspace/spangap/build-system/spangap-outside"
-
-    # Parse the simple builds.yaml (a `builds:` list of {name, invocation}) with
-    # no PyYAML dependency — the host python3 isn't guaranteed to have it.
-    builds=$(python3 - "$byaml" <<'PY'
-import sys
-name = inv = None
-out = []
-def flush():
-    global name, inv
-    if name is not None:
-        if not inv:
-            sys.exit(f"build '{name}' has no invocation")
-        out.append((name, inv))
-    name = inv = None
-in_builds = False
-for raw in open(sys.argv[1]):
-    st = raw.strip()
-    if not st or st.startswith("#"):
-        continue
-    if st == "builds:":
-        in_builds = True
-        continue
-    if not in_builds:
-        continue
-    if st.startswith("- "):
-        flush()
-        st = st[2:].strip()
-    if ":" in st:
-        k, _, v = st.partition(":")
-        k = k.strip()
-        v = v.strip().strip('"').strip("'")
-        if k == "name":
-            name = v
-        elif k == "invocation":
-            inv = v
-flush()
-if not out:
-    sys.exit("no builds in builds.yaml")
-for n, i in out:
-    print(f"{n}\t{i}")
-PY
-    ) || die "make-builds: could not parse $byaml"
-
-    fails=0
-    tab=$(printf '\t')
-    while IFS="$tab" read -r name inv; do
-        [ -n "$name" ] || continue
-        log "=== '$name': spangap build $inv ==="
-        # The invocation's first token names the buildable; its repo dir holds
-        # the esp-idf/build/ where flasher.zip lands.
-        target=${inv%% *}
-        repo=${target##*/}
-        fw="$workspace/$repo/esp-idf"
-        # Redirect the build's stdin from /dev/null: it runs `docker exec -i`,
-        # which would otherwise forward this loop's stdin (the process
-        # substitution below) into the container and drain the remaining
-        # entries — so only the first build would ever run.
-        # shellcheck disable=SC2086
-        if SPANGAP_WORKSPACE="$workspace" "$self" build $inv </dev/null; then
-            if [ -f "$fw/build/flasher.zip" ] && cp "$fw/build/flasher.zip" "$bdir/$name.zip"; then
-                log "  -> $name.zip"
-            else
-                log "  !! no flasher.zip collected for '$name' (looked in $fw/build/)"
-                fails=$((fails + 1))
-            fi
-        else
-            log "  !! build failed for '$name'"
-            fails=$((fails + 1))
-        fi
-    done < <(printf '%s\n' "$builds")
-
-    [ "$fails" -eq 0 ] || die "make-builds: $fails build(s) failed"
-    log "make-builds: wrote $bdir/*.zip"
-    exit 0
-    ;;
 flash)
     shift
     proj=$(require_straddle flash)
@@ -2046,6 +1946,29 @@ $inc"
     log "get-deps done — all requires: present"
     exit 0
     ;;
+detect-build)
+    # Build flashmon's peripheral-detection RAM app inside the build container,
+    # so no local ESP-IDF is needed — just a workspace with the flashmon repo
+    # checked out. Runs idf.py in flashmon/esp-idf; leaves build/spangap_detect.bin
+    # for flashmon/esp-idf/Makefile to stage into flashmon/flashmon/detect/.
+    shift
+    case ${1:-} in
+        -h|--help)
+            printf '%s\n' \
+                "usage: spangap detect-build" \
+                "  Build flashmon/esp-idf (the peripheral detector) in the container." \
+                "  Leaves build/spangap_detect.bin; \`make\` in flashmon/esp-idf stages it."
+            exit 0 ;;
+    esac
+    espdir="$workspace/flashmon/esp-idf"
+    [ -f "$espdir/CMakeLists.txt" ] || die "detect-build: no flashmon/esp-idf in $workspace"
+    cdir=$(host_to_container "$espdir")
+    # bash -lc + explicit export.sh: docker exec skips the image entrypoint that
+    # normally activates the IDF env, so idf.py isn't on PATH until we source it.
+    docker exec $exec_flags -e SPANGAP_WORKSPACE="$container_ws" --workdir "$cdir" "$container" \
+        bash -lc '. "$IDF_PATH/export.sh" >/dev/null 2>&1; idf.py set-target esp32s3 build'
+    exit $?
+    ;;
 build)
     command -v git >/dev/null 2>&1 || die "git required on host PATH (for auto-clone + get-deps)"
     shift   # drop 'build'; "$@" is now the build args
@@ -2160,7 +2083,10 @@ $inc"
     [ -z "$verbose" ] && log "building $proj_name"
     # No -t: keep output non-interactive (matches the previous piped path).
     set +e
+    # SPANGAP_BUILD_DATETIME (empty unless a caller like flashmon's make-builds.py
+    # set it) bakes a catalogue build stamp into the image; forward it verbatim.
     docker exec -i -e SPANGAP_PORT="$sticky_port" -e SPANGAP_WORKSPACE="$container_ws" \
+        -e SPANGAP_BUILD_DATETIME="${SPANGAP_BUILD_DATETIME:-}" \
         --workdir "$container_cwd" "$container" spangap build "$@"
     rc=$?
     set -e

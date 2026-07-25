@@ -651,7 +651,7 @@ CFG / POLL remain edge-only.
   board's `sdkconfig` (or reseed with `spangap autoconfig`, losing the
   hand tuning). Concrete case: raising
   `CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS` for the PM boost TLS
-  slot never reached hw-tdeck's diverged `sdkconfig`; `pm.cpp` `#error`s
+  slot never reached hw-lilygo-tdeck's diverged `sdkconfig`; `pm.cpp` `#error`s
   when it's too low, but a silently-missed default won't always be that
   lucky.
 

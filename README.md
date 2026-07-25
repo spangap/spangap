@@ -37,7 +37,7 @@ Then, in another terminal:
 
 ```sh
 cd tdeck
-spangap build reticulous/reticulous --with spangap/hw-tdeck
+spangap build reticulous/reticulous --with spangap/hw-lilygo-tdeck
 spangap flash
 ```
 

@@ -29,7 +29,7 @@ resolved project + its deps + the toolchain/environment. Running 'spangap' and l
   straddle is where the project's identity *and its target hardware* live — the board
   HAL, pin map, partition layout, and OTA key are all owned there — so its README tells
   you what's being built and **which board it compiles for**. The `--with` line often
-  names that board straddle (e.g. `--with spangap/hw-tdeck`). If `.spangap-build` is
+  names that board straddle (e.g. `--with spangap/hw-lilygo-tdeck`). If `.spangap-build` is
   absent (nothing built yet), the user names a target with `spangap build <org>/<repo>`
   (cloned + remembered on first build) or `cd`s into a straddle dir.
 - `.spangap-port-<os>-<arch>` (sticky serial port) and `.spangap-venv-<os>-<arch>/`
@@ -295,7 +295,7 @@ gate, which keys off the **repo name**, not the prefix):
 | `acme` `duckdns` `upnp` `wg` `ota` | (= repo) | `iface-lora` | `rns_lora` |
 | `sshd` | `sshd` | `lxmf` | `lxmf` |
 | `maps` | `maps` | `nomad` | `nomad` |
-| | | `hw-tdeck` | `tdeck` |
+| | | `hw-lilygo-tdeck` | `tdeck` |
 
 This table can go stale — `spangap-inside` reads the real values; `ls <workspace>` +
 `grep -h '^prefix:' <workspace>/*/straddle.yaml` is the source of truth. Note `sshd` and
@@ -564,7 +564,7 @@ The straddle READMEs were recently rewritten and several carry `README-old.md` a
 superseded per-straddle `CLAUDE.md` files. Four concrete traps when reading them:
 
 - **The flat layout is real; the `s/` paths in docs are not.** Some READMEs (notably
-  `hw-tdeck`) link siblings as `../../s/spangap/INTERNALS.md` or
+  `hw-lilygo-tdeck`) link siblings as `../../s/spangap/INTERNALS.md` or
   `[…](../../s/)`. There is **no `s/` directory** — `<workspace>` is flat,
   as this file's tree shows. Resolve any `s/`-style link to `<workspace>/<repo>/…` directly.
 - **README file-layout boxes are partly aspirational.** The org-profile README and

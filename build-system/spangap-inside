@@ -358,8 +358,8 @@ def resolve_target_straddle(
     This is what lets you name the image to build instead of cd-ing into its
     dir (or relying on .spangap-build). Matches:
 
-      - the full <org>/<repo> name        (spangap/hw-tdeck)
-      - the straddle's directory basename  (hw-tdeck)
+      - the full <org>/<repo> name        (spangap/hw-lilygo-tdeck)
+      - the straddle's directory basename  (hw-lilygo-tdeck)
 
     Returns the Manifest, or None if the token names no straddle at all (so the
     caller can leave it for idf.py — keeping `spangap build menuconfig`, idf
@@ -899,7 +899,7 @@ _GEN_HEADER_KCONFIG = (
 
 
 def _name_to_kconfig(repo: str) -> str:
-    """spangap-lcd → SPANGAP_LCD, hw-tdeck → HW_TDECK."""
+    """spangap-lcd → SPANGAP_LCD, hw-lilygo-tdeck → HW_TDECK."""
     return repo.upper().replace("-", "_").replace(".", "_")
 
 
@@ -1046,7 +1046,7 @@ def write_main_requires(proj: Manifest, staged_repos: set[str],
     main is special: it hosts the generated start/init dispatcher, which can
     call a hook from ANY staged straddle — including a board pulled in with
     --with that this buildable never names in requires:/additional_installs:
-    (the `reticulous/reticulous --with spangap/hw-tdeck` shape). So main
+    (the `reticulous/reticulous --with spangap/hw-lilygo-tdeck` shape). So main
     REQUIRES the FULL staged set, not just this straddle's declared deps:
     staging a straddle has to be enough to link and activate it. (Per-component
     REQUIRES stay narrow — effective_requires() — so only main is the catch-all.)
@@ -1757,7 +1757,7 @@ def write_sdkconfig_fragments(proj: Manifest, deps: list[Manifest]) -> None:
     defaults and the buildable's own sdkconfig.defaults).
 
     This is the road by which a NON-buildable straddle hands Kconfig values to
-    other straddles: a board straddle (hw-tdeck) declares its pins in
+    other straddles: a board straddle (hw-lilygo-tdeck) declares its pins in
     straddle.yaml `kconfig:`, and they reach iface-lora / the SD driver / the LCD
     here, via the shared global sdkconfig. The peripheral straddle still OWNS
     the option schema (its component Kconfig); the board only supplies values.
@@ -1767,7 +1767,7 @@ def write_sdkconfig_fragments(proj: Manifest, deps: list[Manifest]) -> None:
          then the straddle band in dependency-topo order (a straddle's values
          override the values of the straddles it requires:);
       2. the buildable itself LAST, so the building straddle always wins among
-         fragments — `reticulous` overriding a value `hw-tdeck` set is the
+         fragments — `reticulous` overriding a value `hw-lilygo-tdeck` set is the
          intended "if you're the building straddle you win".
     The buildable's own sdkconfig.defaults file (layered after this whole file
     by bootstrap.cmake) and the CLI overrides win over everything here, in that
@@ -2956,7 +2956,7 @@ def cmd_list_deps(args: argparse.Namespace) -> int:
     --with/--without mirror the build's selection so the walk resolves the same
     closure the build will. The --with seeds matter most: a --with straddle's
     additional_installs are only reachable when that straddle is a walk root,
-    so without them the loop never clones e.g. hw-tdeck's spangap-lcd and the
+    so without them the loop never clones e.g. hw-lilygo-tdeck's spangap-lcd and the
     build silently drops it (soft + absent). Slash-form --with names may not be
     in the workspace yet on the first pass — the host pre-clones them before
     list-deps runs, but a bare-form name that's still absent resolves to itself.
@@ -3640,7 +3640,7 @@ def main(argv: list[str] | None = None) -> int:
     # The host fetch loop forwards the build's selection so the missing-walk
     # sees what the build will: a --with straddle's additional_installs are
     # only reachable when that straddle seeds the walk as a root. Without this,
-    # `build --with hw-tdeck` never clones hw-tdeck's additional_installs (e.g.
+    # `build --with hw-lilygo-tdeck` never clones hw-lilygo-tdeck's additional_installs (e.g.
     # spangap-lcd) — the build then silently drops them as soft-and-absent.
     p_ld.add_argument(
         "-w", "--with", dest="include", action="append", default=[], metavar="STRADDLE",

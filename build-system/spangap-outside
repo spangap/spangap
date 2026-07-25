@@ -1884,7 +1884,7 @@ prefetch_explicit_includes() {
 # selection flags matter to the missing-walk; the target/idf-args are dropped.
 # A --with straddle's additional_installs are reachable by list-deps ONLY when
 # the straddle seeds the walk, so these MUST reach list-deps or transitive
-# soft deps (e.g. hw-tdeck's spangap-lcd) never get cloned.
+# soft deps (e.g. hw-lilygo-tdeck's spangap-lcd) never get cloned.
 emit_selection_flags() {
     while [ $# -gt 0 ]; do
         case $1 in
@@ -2030,7 +2030,7 @@ get-deps)
     # Standalone get-deps has no argv selection — the last build's --with set
     # lives in .spangap-build, so feed it to list-deps the same way the build
     # path does (else a remembered --with straddle's additional_installs, e.g.
-    # hw-tdeck's spangap-lcd, are never fetched).
+    # hw-lilygo-tdeck's spangap-lcd, are never fetched).
     gd_flags=""
     for inc in $(remembered_build_includes); do
         gd_flags="$gd_flags

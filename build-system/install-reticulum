@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+#
+# install-reticulum — install a working reference Reticulum stack (rns + rnsh)
+# into this container and wire it to the rns.beleth.net:4242 uplink so it is
+# ready to use immediately.
+#
+# Baked onto PATH in every spangap build-env container (see build-system's
+# Dockerfile). Run it as the `spangap` user; it is re-runnable (idempotent) and
+# refreshes the install, the uplink address, and the security patch each time.
+#
+# After it finishes, `rnsd`, `rnsh`, `rnstatus`, `rnpath`, `rnprobe`, `rnid`,
+# `rncp` and `rnx` are on PATH and use ~/.reticulum (the RNS default config
+# dir), so they need no --config flag.
+#
+# What it does:
+#   1. creates a dedicated venv (~/.reticulum-venv) and pip-installs rns + rnsh;
+#   2. writes ~/.reticulum/config with a TCPClientInterface to the beleth uplink,
+#      choosing an address family that is actually routable from this container
+#      (beleth publishes both A and AAAA; some containers only egress on one);
+#   3. patches the reference rnsh listener against the initiator-identity auth
+#      bypass (a rejected identity was left able to run a command — see below);
+#   4. links the console scripts into ~/.npm-global/bin, which is on PATH and
+#      writable at runtime (/usr/local/bin is root-owned in the running
+#      container).
+#
+set -euo pipefail
+
+UPLINK_HOST="rns.beleth.net"
+UPLINK_PORT="4242"
+
+VENV="${RETICULUM_VENV:-$HOME/.reticulum-venv}"
+CONFIGDIR="${RNS_CONFIGDIR:-$HOME/.reticulum}"
+BINDIR="$HOME/.npm-global/bin"   # already on PATH in the spangap container
+CONSOLE_SCRIPTS=(rnsd rnsh rnstatus rnpath rnprobe rnid rncp rnx)
+
+say() { printf '\033[36m[install-reticulum]\033[0m %s\n' "$*"; }
+die() { printf '\033[31m[install-reticulum] error:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ── 1. venv + packages ────────────────────────────────────────────────────
+command -v python3 >/dev/null 2>&1 || die "python3 not found on PATH"
+if [ ! -x "$VENV/bin/python" ]; then
+    say "creating venv at $VENV"
+    python3 -m venv "$VENV"
+fi
+say "installing/upgrading rns + rnsh (this may take a moment)"
+"$VENV/bin/pip" install --quiet --upgrade pip >/dev/null
+"$VENV/bin/pip" install --quiet --upgrade rns rnsh
+RNS_VER="$("$VENV/bin/python" -c 'import RNS; print(RNS.__version__)')"
+RNSH_VER="$("$VENV/bin/pip" show rnsh 2>/dev/null | sed -n 's/^Version: //p')"
+say "rns $RNS_VER, rnsh $RNSH_VER"
+
+# ── 2. config with a reachable uplink address ─────────────────────────────
+# RNS's TCPClientInterface only tries the first getaddrinfo() result and never
+# falls back to the other family, so we resolve + probe here and write the
+# literal that actually connects. Prefer IPv4 for broad compatibility, fall
+# back to IPv6, and if neither answers a TCP connect, fall back to the hostname
+# (best effort) with a warning.
+say "probing $UPLINK_HOST:$UPLINK_PORT for a routable address"
+TARGET="$("$VENV/bin/python" - "$UPLINK_HOST" "$UPLINK_PORT" <<'PY'
+import socket, sys
+host, port = sys.argv[1], int(sys.argv[2])
+def addrs(family):
+    try:
+        return [ai[4] for ai in socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)]
+    except socket.gaierror:
+        return []
+def reachable(family, sa):
+    s = socket.socket(family, socket.SOCK_STREAM); s.settimeout(6)
+    try:
+        s.connect(sa); return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+for family in (socket.AF_INET, socket.AF_INET6):   # IPv4 first, then IPv6
+    for sa in addrs(family):
+        if reachable(family, sa):
+            print(sa[0]); sys.exit(0)
+print(host)   # nothing connected — emit the hostname as a best-effort fallback
+sys.exit(3)
+PY
+)" || say "WARNING: neither A nor AAAA for $UPLINK_HOST accepted a TCP connect; writing hostname anyway"
+say "uplink target: $TARGET"
+
+mkdir -p "$CONFIGDIR"
+cat > "$CONFIGDIR/config" <<EOF
+# Managed by install-reticulum — re-run it to refresh the uplink address.
+[reticulum]
+  enable_transport = No
+  share_instance = Yes
+  shared_instance_port = 37428
+  instance_control_port = 37429
+  panic_on_interface_error = No
+
+[logging]
+  loglevel = 4
+
+[interfaces]
+
+  [[Default Interface]]
+    type = AutoInterface
+    enabled = No
+
+  [[beleth-uplink]]
+    type = TCPClientInterface
+    enabled = Yes
+    target_host = $TARGET
+    target_port = $UPLINK_PORT
+EOF
+say "wrote $CONFIGDIR/config"
+
+# ── 3. security patch: rnsh listener initiator-identity auth bypass ────────
+# Upstream rnsh's ListenerSession._initiator_identified() calls terminate()
+# when the initiator's identity is not in the allowed set, but does not return
+# afterwards — so it falls through to _set_state(WAIT_VERS), re-activating the
+# session, and the state machine then accepts VersionInfo -> ExecuteCommand and
+# spawns a shell in the window before the pruning timer fires. Same missing
+# return after the WAIT_IDENT/WAIT_VERS state check. We add both returns so a
+# rejected identity is actually stopped.
+"$VENV/bin/python" - <<'PY'
+import io, os, re, rnsh.session as s
+path = s.__file__
+src = io.open(path, encoding="utf-8").read()
+orig = src
+
+# Return after the out-of-state protocol error.
+src = src.replace(
+    "        if self.state not in [LSState.LSSTATE_WAIT_IDENT, LSState.LSSTATE_WAIT_VERS]:\n"
+    "            self._protocol_error(LSState.LSSTATE_WAIT_IDENT.name)\n",
+    "        if self.state not in [LSState.LSSTATE_WAIT_IDENT, LSState.LSSTATE_WAIT_VERS]:\n"
+    "            self._protocol_error(LSState.LSSTATE_WAIT_IDENT.name)\n"
+    "            return\n")
+
+# Return after rejecting a disallowed identity.
+src = src.replace(
+    "            self.terminate(\"Identity is not allowed.\")\n"
+    "\n"
+    "        self.remote_identity = identity\n",
+    "            self.terminate(\"Identity is not allowed.\")\n"
+    "            return\n"
+    "\n"
+    "        self.remote_identity = identity\n")
+
+if src != orig:
+    io.open(path, "w", encoding="utf-8").write(src)
+    print("  patched rnsh auth-bypass in", path)
+else:
+    # Already patched, or upstream fixed it / changed shape.
+    if "self.terminate(\"Identity is not allowed.\")\n            return" in src:
+        print("  rnsh auth-bypass patch already present")
+    else:
+        print("  NOTE: rnsh listener shape changed; auth-bypass patch not applied — review manually")
+PY
+
+# ── 4. expose console scripts on PATH ─────────────────────────────────────
+mkdir -p "$BINDIR"
+for s in "${CONSOLE_SCRIPTS[@]}"; do
+    [ -x "$VENV/bin/$s" ] && ln -sf "$VENV/bin/$s" "$BINDIR/$s"
+done
+say "linked ${CONSOLE_SCRIPTS[*]} into $BINDIR"
+
+cat <<EOF
+
+$(printf '\033[32mReticulum reference stack ready.\033[0m')
+  config : $CONFIGDIR/config  (uplink $UPLINK_HOST:$UPLINK_PORT via $TARGET)
+  tools  : ${CONSOLE_SCRIPTS[*]}
+
+Quick start (open a new shell, or run 'hash -r', so PATH picks up the links):
+  rnstatus                 # show interfaces; the beleth-uplink should read Up
+  rnsd -v                  # run a transport/instance daemon in the foreground
+  rnsh -l -n -- /bin/bash  # listen (server); prints the destination hash
+  rnsh <dest_hash>         # connect (client) to a listening rnsh
+EOF

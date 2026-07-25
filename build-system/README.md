@@ -116,6 +116,36 @@ container lifecycle. There is **no `docker` and no `esptool.py`** in here by des
 - `python3` (system) has `pyyaml` + `jsonschema`; the IDF venv has Pillow/cairosvg/pypng/lz4
   for the LCD icon rasterizer. `git` is present.
 
+### `install-reticulum` — the reference Reticulum stack
+
+`install-reticulum` is on PATH in every container (a plain script, **not** a
+`spangap` verb). Run it as `spangap` to install the upstream Python Reticulum
+stack (`rns` + `rnsh`) into `~/.reticulum-venv` and wire it to the
+**rns.beleth.net:4242** uplink, ready to use. It is idempotent — re-run it to
+refresh the install, the uplink address, and the patch below.
+
+Afterward `rnsd`, `rnsh`, `rnstatus`, `rnpath`, `rnprobe`, `rnid`, `rncp`, `rnx`
+are on PATH (symlinked into `~/.npm-global/bin`) and use `~/.reticulum` (the RNS
+default config dir), so they take no `--config` flag. `hash -r` or a new shell
+picks up the links. Sanity check: `rnstatus` should show `beleth-uplink` **Up**.
+
+Two things the script handles that are easy to trip over:
+
+- **Uplink address family.** beleth publishes both an A and an AAAA record, and a
+  given container may only egress on one family. RNS's `TCPClientInterface` tries
+  only the first `getaddrinfo()` result and never falls back, so the script
+  probes both and writes the literal that actually connects (IPv4 preferred,
+  IPv6 fallback). This is why the config holds an IP, not the hostname.
+- **rnsh listener auth-bypass patch.** Upstream `rnsh`'s
+  `ListenerSession._initiator_identified()` rejects a disallowed initiator with
+  `terminate()` but omits the following `return`, so it falls through to
+  `_set_state(WAIT_VERS)` and the session goes on to accept a command and spawn a
+  shell in the window before the pruning timer fires. The script adds the missing
+  `return` (and the one after the out-of-state `_protocol_error`) so a rejected
+  identity is actually stopped. Our firmware `rnsh` does not share this flaw — it
+  runs no identity allowlist and gates every session on the server-side `cli`
+  admin-password login, which dispatches no command until `authLogin` succeeds.
+
 ## Working with a real device — the you ↔ user ↔ board loop
 
 **This container has no serial ports and no `esptool`** — it cannot talk to hardware

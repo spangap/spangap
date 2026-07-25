@@ -101,6 +101,11 @@ RUN mkdir -p /usr/local/lib/spangap /usr/local/share/spangap
 # 0700 (no group/other); without --chmod that carries into the image and the
 # `spangap` user can't read the script.
 COPY --chmod=0755 build-system/spangap-inside /usr/local/lib/spangap/cli.py
+# install-reticulum: on PATH in every container. Run it (as spangap) to install
+# the reference Reticulum stack (rns + rnsh) into a user venv, wired to the
+# rns.beleth.net:4242 uplink and ready to use. Not a spangap verb — a plain
+# script, deliberately independent of the build toolchain.
+COPY --chmod=0755 build-system/install-reticulum /usr/local/bin/install-reticulum
 COPY --chmod=0644 build-system/schemas/straddle.schema.json /usr/local/share/spangap/straddle.schema.json
 # Container assistant instructions. Normally seeded into a workspace as README.md
 # at `spangap init`; baked in here too so `spangap claude` can re-seed it (and the

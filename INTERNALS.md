@@ -608,6 +608,12 @@ CFG / POLL remain edge-only.
   `%u` in printf.
 - The canonical `itsPoll` loop:
   `for (;;) { while (itsPoll(0)) {}; /* non-ITS work */; itsPoll(blockTime); }`
+- Two light-sleep levers when spawning tasks: pin with the `CORE_PRIMARY` /
+  `CORE_SECONDARY` / `CORE_SECONDARY_NO_LCD` constants (`compat.h`), not bare
+  `0`/`1` — put a producer/consumer pair on opposite cores so their busy windows
+  overlap; and let an idle event-driven task **block on its wake source**, not
+  poll on a short timer (a short poll caps the whole chip's sleep window). See
+  [power-management](../spangap-core/docs/power-management.md#idle-discipline--park-dont-poll).
 - Do **not** include the task name in log messages — `[taskname]` is
   prepended automatically.
 - **No PlatformIO** — ESP-IDF only.

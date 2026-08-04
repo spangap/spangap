@@ -524,8 +524,31 @@ reference. No root `INTERNALS.md` in these straddles. `docs/` exists **only**
 for this pattern — one self-contained file per function, never arbitrary
 per-subsystem fragmentation.
 
-**Operator-guide shape** (a mono README or a `docs/<func>.md`): one-paragraph
-what-it-is; brief origins (wraps/forks/ports what — detail goes to internals);
+**Every doc opens with an executive summary.** Before the prose, before the
+what-it-is paragraph: a fenced block that gives the whole thing as a
+check → do ladder, in the order it actually happens.
+
+```
+condition?          no  → what happens instead, and stop
+ ↓ yes
+what is read/asked  → what it yields          (how often, if not once)
+ ↓ loop/branch marked where it exists
+the action
+ ↓
+how it is confirmed
+```
+
+Anything with a sequence — a protocol, a boot path, a state machine, a CLI
+workflow, a build pipeline — reduces to one of these, and the reduction is the
+point: a reader gets the shape in ten seconds and the body only has to explain
+*why*. Prefer the real identifiers (`auth -O`, `state=ap`) over prose
+paraphrase; keep it to a screen; put the two or three rules the ladder depends
+on immediately under it. If a doc genuinely has no sequence (a key table, a
+glossary), lead with the one-line invariant that governs the whole table
+instead — but that is the rare case, not the default.
+
+**Operator-guide shape** (a mono README or a `docs/<func>.md`): the executive
+summary above, then one-paragraph what-it-is; brief origins (wraps/forks/ports what — detail goes to internals);
 what it does and how it interacts with the other straddles, with one minimal
 real usage example; the public surface (ports/API/opcodes, pointer to the header
 for exact layouts); the **full storage-variable list** (settings with defaults,
@@ -534,12 +557,16 @@ code); CLI / user manual. Never tell users to call an `xInit()` the generated
 init already calls — state that it starts automatically when the straddle is in
 the build.
 
-**Maintainer shape** (an `INTERNALS.md` or `docs/<func>-internals.md`): §1 first —
-an exhaustive inventory of everything changed/added relative to the
-upstream/baseline; then task/threading model and ownership rules, wire/IPC
+**Maintainer shape** (an `INTERNALS.md` or `docs/<func>-internals.md`): the
+executive summary (the ladder of what runs, in order, with the task each step
+runs on), then §1 — an exhaustive inventory of everything changed/added relative
+to the upstream/baseline; then task/threading model and ownership rules, wire/IPC
 framing, lifecycle, and a dedicated pitfalls section. Self-authoritative.
 
 Hard rules:
+
+- **Lead with the executive summary.** Every doc, both roles. It is the first
+  thing after the title, and it is a ladder, not a paragraph.
 
 - **A straddle's docs live in that straddle.** Never document straddle A inside
   straddle B; fold a stray doc into the owner and retire it.

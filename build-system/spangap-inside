@@ -2715,6 +2715,10 @@ def cmd_build(args: argparse.Namespace) -> int:
         # in the environment; empty otherwise. Passed through so the image logs the
         # exact stamp it's published under.
         "SPANGAP_BUILD_DATETIME": os.environ.get("SPANGAP_BUILD_DATETIME", ""),
+        # The catalogue entry's name, from the same caller. It is what identifies
+        # *which* distribution an image is once a board has several; the datetime
+        # only answers whether something newer exists.
+        "SPANGAP_BUILD_DIST": os.environ.get("SPANGAP_BUILD_DIST", ""),
     }
     # Provenance manifest → device webroot as /BUILD.md. Written before the IDF
     # run so it's on disk when project_include.cmake's configure step picks it up

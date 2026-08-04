@@ -2083,10 +2083,12 @@ $inc"
     [ -z "$verbose" ] && log "building $proj_name"
     # No -t: keep output non-interactive (matches the previous piped path).
     set +e
-    # SPANGAP_BUILD_DATETIME (empty unless a caller like flashmon's make-builds.py
-    # set it) bakes a catalogue build stamp into the image; forward it verbatim.
+    # SPANGAP_BUILD_DATETIME and SPANGAP_BUILD_DIST (both empty unless a caller
+    # like flashmon's make-builds.py set them) bake a catalogue build stamp and
+    # the catalogue entry's name into the image; forward them verbatim.
     docker exec -i -e SPANGAP_PORT="$sticky_port" -e SPANGAP_WORKSPACE="$container_ws" \
         -e SPANGAP_BUILD_DATETIME="${SPANGAP_BUILD_DATETIME:-}" \
+        -e SPANGAP_BUILD_DIST="${SPANGAP_BUILD_DIST:-}" \
         --workdir "$container_cwd" "$container" spangap build "$@"
     rc=$?
     set -e

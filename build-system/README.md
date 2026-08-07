@@ -365,6 +365,13 @@ before `spangapInit()`) then `serviceRunInit()` (after, ecosystem up). Registrat
 `init_order()` (platform band core/net/web/lcd, then dependency-topo), so a straddle's deps
 come up before it; you do **not** list any bring-up by hand.
 
+Each registration also carries a `service_band_t` derived from that same order (`SAFE_BAND`
+in `spangap-inside`): core/net/web get `SERVICE_BAND_SAFE`, everything else
+`SERVICE_BAND_FULL`. A **safe-mode** boot — the recovery boot that backs the state store up,
+restores one, or factory-resets the device — runs the SAFE band only. No straddle declares
+this and none can opt in or out; it is a property of where it sits in the order. See
+spangap-core's `docs/safe-mode.md`.
+
 A straddle contributes boot code two ways:
 
 - **`services:` (modern).** Declare a `Service` subclass (spangap-core's `service.h`); it

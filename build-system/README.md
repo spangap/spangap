@@ -409,6 +409,22 @@ merge key), while `label`s join into the **LCD** `lcdRegisterSettings` path. Row
 (read-only live value), `button{label,cmd,payload?}` (payload defaults `"1"`), and
 `list{key,item_label,add,remove,fields}` (array-of-objects).
 
+A slider's `min`/`max`/`default` may also be `{ kconfig: CONFIG_NAME, default: N }`:
+resolved at lowering time from the staged set's collected `kconfig:` fragments
+(`collect_kconfig_values`, same precedence as the fragment file), so a **board** can size
+a control to its hardware. The `default` applies when no staged straddle sets the symbol
+(component-Kconfig defaults are invisible to the generator).
+
+A slider's `min`/`max` — not its `default` — may instead be
+`{ key: <storage key>, default: N }`: the bound is read from a value the **device**
+publishes, when the row is built on the LCD and reactively on the web. Reach for it when
+the real limit is something the firmware determines and the build cannot: a capability
+sensed on the hardware rather than declared for it. iface-lora's TX-power slider is the
+case in point — the board's Kconfig declares a front-end module's rating, but only
+`femInit` knows whether that part actually answered, so the slider is sized from what it
+publishes and offers the bare radio's ceiling on a board whose front end is missing. The
+`default` applies until the key exists.
+
 The three generated surfaces:
 
 - **LCD pane** → static `spangapGenPane_N(void*)` functions of `lcdSetting*` calls plus a

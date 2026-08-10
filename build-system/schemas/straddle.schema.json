@@ -267,6 +267,36 @@
         }
       }
     },
+    "settingsScalar": {
+      "description": "A settings integer, either literal or { kconfig: CONFIG_NAME, default: N } — resolved at build time from the staged set's collected kconfig: fragments, so a board can size a control to its hardware. The default applies when no straddle sets the symbol.",
+      "oneOf": [
+        { "type": "integer" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kconfig", "default"],
+          "properties": {
+            "kconfig": { "type": "string", "pattern": "^CONFIG_[A-Z0-9_]+$" },
+            "default": { "type": "integer" }
+          }
+        }
+      ]
+    },
+    "settingsBound": {
+      "description": "A slider bound: a settingsScalar, or { key: <storage key>, default: N } — read from a value the device publishes at run time rather than fixed at build time. Use it when the firmware knows the real limit and the build does not, e.g. a capability detected on the hardware itself. The default applies until the key exists.",
+      "oneOf": [
+        { "$ref": "#/$defs/settingsScalar" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["key", "default"],
+          "properties": {
+            "key": { "type": "string" },
+            "default": { "type": "integer" }
+          }
+        }
+      ]
+    },
     "settingsRow": {
       "type": "object",
       "minProperties": 1,
@@ -292,9 +322,9 @@
           "properties": {
             "label": { "type": "string" },
             "key": { "type": "string" },
-            "min": { "type": "integer" },
-            "max": { "type": "integer" },
-            "default": { "type": "integer" }
+            "min": { "$ref": "#/$defs/settingsBound" },
+            "max": { "$ref": "#/$defs/settingsBound" },
+            "default": { "$ref": "#/$defs/settingsScalar" }
           }
         },
         "text": {

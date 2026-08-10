@@ -1149,6 +1149,61 @@ def _cstr(s: str) -> str:
     return f'"{esc}"'
 
 
+def collect_kconfig_values(proj: Manifest, deps: list[Manifest]) -> dict[str, str]:
+    """CONFIG_KEY → value string across every staged straddle's `kconfig:`
+    block (incl. desugared identity values), same precedence as
+    write_sdkconfig_fragments: init order, last wins, buildable last. This is
+    what lets a *settings scalar* reference a board-published Kconfig value
+    (see _settings_scalar) — e.g. a TX-power slider whose max is the board's
+    RF capability. Only fragment-set symbols appear; a symbol left at its
+    component-Kconfig default is absent (callers carry a fallback)."""
+    sources = init_order(deps) + [proj]
+    staged_names = {s.name for s in sources}
+    out: dict[str, str] = {}
+    for m in sources:
+        for raw in _flatten_kconfig(m.kconfig, staged_names) + m.identity_kconfig:
+            line = raw.strip()
+            if not _KCONFIG_LINE_RE.match(line) or "=" not in line:
+                continue   # fragment validity is enforced in write_sdkconfig_fragments
+            key, _, val = line.partition("=")
+            out[key] = val
+    return out
+
+
+def _settings_scalar(spec_val, cfgvals: dict[str, str], where: str) -> int:
+    """A settings integer scalar: either a plain int, or
+    `{ kconfig: CONFIG_NAME, default: int }` — resolved from the staged set's
+    collected `kconfig:` fragments so a board can size a control to its
+    hardware (the default covers builds where no board sets the symbol)."""
+    if isinstance(spec_val, dict):
+        if "key" in spec_val:
+            die(f"{where}: a storage-key bound is only valid on a slider's "
+                f"min/max, where the control can read it at run time")
+        name = spec_val["kconfig"]
+        raw = cfgvals.get(name)
+        if raw is None:
+            return int(spec_val["default"])
+        try:
+            return int(raw, 0)
+        except ValueError:
+            die(f"{where}: kconfig-referenced scalar {name}={raw!r} is not an integer")
+    return int(spec_val)
+
+
+def _settings_bound(spec_val, cfgvals: dict[str, str], where: str) -> tuple[int, str | None]:
+    """A slider bound: a settings scalar (fixed at build time), or
+    `{ key: <storage key>, default: int }` — a value the device publishes and the
+    control reads at run time. Returns (fallback, key or None).
+
+    The key form exists for a limit the firmware knows and the build does not: a
+    capability sensed on the hardware rather than declared for it. Both surfaces
+    honour it, so a control sized this way reads the same on the panel and on the
+    display, and falls back to `default` until the key exists."""
+    if isinstance(spec_val, dict) and "key" in spec_val:
+        return int(spec_val["default"]), str(spec_val["key"])
+    return _settings_scalar(spec_val, cfgvals, where), None
+
+
 def collect_settings(proj: Manifest, deps: list[Manifest]) -> list[tuple[Manifest, dict]]:
     """Every settings panel across the staged set, in init order (buildable
     last). A panel is gated purely by its straddle being staged — there is no
@@ -1169,7 +1224,7 @@ def _panel_lcd_path(panel: dict) -> tuple[str, str, int]:
     return path, leaf["label"], int(leaf.get("placement", 0))
 
 
-def _settings_lcd_cpp(panels: list[tuple[Manifest, dict]]) -> tuple[str, str]:
+def _settings_lcd_cpp(panels: list[tuple[Manifest, dict]], cfgvals: dict[str, str]) -> tuple[str, str]:
     """(pane builder function defs, body of spangapSettingsGenRegister) for the
     LCD half. Each pane becomes a `static void spangapGenPane_N(void*)` filled
     with lcdSetting* calls; the register fn wires them via lcdRegisterSettings.
@@ -1191,8 +1246,15 @@ def _settings_lcd_cpp(panels: list[tuple[Manifest, dict]]) -> tuple[str, str]:
             elif kind == "switch":
                 lines.append(f"    lcdSettingSwitch(p, {_cstr(spec['label'])}, {_cstr(spec['key'])});")
             elif kind == "slider":
+                where = f"{_m.name} slider {spec['key']}"
+                lo, lo_key = _settings_bound(spec["min"], cfgvals, where)
+                hi, hi_key = _settings_bound(spec["max"], cfgvals, where)
+                args = f"{lo}, {hi}"
+                if lo_key or hi_key:
+                    args += f", {_cstr(lo_key) if lo_key else 'nullptr'}"
+                    args += f", {_cstr(hi_key) if hi_key else 'nullptr'}"
                 lines.append(f"    lcdSettingSlider(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}, "
-                             f"{int(spec['min'])}, {int(spec['max'])});")
+                             f"{args});")
             elif kind == "text":
                 secret = ", true" if spec.get("secret") else ""
                 lines.append(f"    lcdSettingText(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}{secret});")
@@ -1227,7 +1289,7 @@ def _settings_lcd_cpp(panels: list[tuple[Manifest, dict]]) -> tuple[str, str]:
     return "\n\n".join(defs), "\n".join(reg)
 
 
-def _settings_defaults_cpp(panels: list[tuple[Manifest, dict]]) -> str:
+def _settings_defaults_cpp(panels: list[tuple[Manifest, dict]], cfgvals: dict[str, str]) -> str:
     """Body of spangapSettingsGenDefaults — one storageDefault() per binding row
     that carries a `default:` and whose key is persisted config (`s.` prefix).
     Bare/ephemeral keys (value rows) and secrets are never seeded here."""
@@ -1249,6 +1311,8 @@ def _settings_defaults_cpp(panels: list[tuple[Manifest, dict]]) -> str:
             dv = spec["default"]
             if isinstance(dv, bool):
                 lit = "1" if dv else "0"
+            elif isinstance(dv, dict):   # { kconfig:, default: } — board-sized value
+                lit = str(_settings_scalar(dv, cfgvals, f"default of {key}"))
             elif isinstance(dv, int):
                 lit = str(dv)
             else:
@@ -1260,7 +1324,7 @@ def _settings_defaults_cpp(panels: list[tuple[Manifest, dict]]) -> str:
     return "\n".join(lines)
 
 
-def _settings_web_descriptors(panels: list[tuple[Manifest, dict]]) -> list[dict]:
+def _settings_web_descriptors(panels: list[tuple[Manifest, dict]], cfgvals: dict[str, str]) -> list[dict]:
     """The browser-side descriptor objects (serialized into straddles.gen.ts).
     Carries the web menu path/containers and normalized rows the GeneratedPanel
     interprets at runtime."""
@@ -1271,8 +1335,13 @@ def _settings_web_descriptors(panels: list[tuple[Manifest, dict]]) -> list[dict]
         if kind == "switch":
             return {"kind": "switch", "label": spec["label"], "k": spec["key"]}
         if kind == "slider":
-            return {"kind": "slider", "label": spec["label"], "k": spec["key"],
-                    "min": int(spec["min"]), "max": int(spec["max"])}
+            lo, lo_key = _settings_bound(spec["min"], cfgvals, f"slider {spec['key']}")
+            hi, hi_key = _settings_bound(spec["max"], cfgvals, f"slider {spec['key']}")
+            r = {"kind": "slider", "label": spec["label"], "k": spec["key"],
+                 "min": lo, "max": hi}
+            if lo_key: r["minKey"] = lo_key
+            if hi_key: r["maxKey"] = hi_key
+            return r
         if kind == "text":
             r = {"kind": "text", "label": spec["label"], "k": spec["key"]}
             if spec.get("secret"):
@@ -1501,10 +1570,11 @@ def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
     #     (else an empty stub); called after the serviceRunInit() walk so the lcd
     #     task and the "Internet"/"Mesh Network" submenus already exist.
     panels = collect_settings(proj, deps)
+    cfgvals = collect_kconfig_values(proj, deps)
     lcd_staged = "spangap/spangap-lcd" in staged_names
-    defaults_body = _settings_defaults_cpp(panels)
+    defaults_body = _settings_defaults_cpp(panels, cfgvals)
     if lcd_staged:
-        pane_defs, register_body = _settings_lcd_cpp(panels)
+        pane_defs, register_body = _settings_lcd_cpp(panels, cfgvals)
         lcd_include = '#include \"lcd.h\"\n'
     else:
         pane_defs, register_body = "", ""
@@ -1683,7 +1753,7 @@ def write_browser_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
     # by spangap-web's GeneratedPanel renderer. No separate asset, no YAML parser
     # in the SPA — it tree-shakes with the module. Registered LAST so the
     # containers other straddles' register* hooks set up already exist.
-    panels = _settings_web_descriptors(collect_settings(proj, deps))
+    panels = _settings_web_descriptors(collect_settings(proj, deps), collect_kconfig_values(proj, deps))
     gen_import = ""
     gen_decl = ""
     gen_call = ""

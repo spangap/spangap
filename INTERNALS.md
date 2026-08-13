@@ -467,7 +467,7 @@ between FreeRTOS tasks**.
   first `itsConnect("taskName", …)` with no such task running invokes
   `spawnFn` to create it (typically a one-shot that serves a blob then
   `killSelf()`s), so the server holds a TCB only while a client is
-  attached. Used by the `cpuhist`/`nethist` web pre-fill responders.
+  attached.
 - **Aux messages**: `itsSendAux("taskName", data, len, timeout, port)`
   for task-to-task signalling that isn't a connection (subscribe/notify,
   register-with-net handshake).

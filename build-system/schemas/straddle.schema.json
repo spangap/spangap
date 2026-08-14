@@ -300,9 +300,22 @@
     "settingsRow": {
       "type": "object",
       "minProperties": 1,
-      "maxProperties": 1,
+      "maxProperties": 2,
       "additionalProperties": false,
+      "anyOf": [
+        { "required": ["section"] }, { "required": ["caption"] },
+        { "required": ["switch"] },  { "required": ["slider"] },
+        { "required": ["text"] },    { "required": ["dropdown"] },
+        { "required": ["value"] },   { "required": ["button"] },
+        { "required": ["list"] }
+      ],
       "properties": {
+        "when_kconfig": {
+          "type": "string",
+          "pattern": "^!?CONFIG_[A-Z0-9_]+$",
+          "description": "Emit this row only when a Kconfig symbol is set — `CONFIG_X`, or `!CONFIG_X` for only when it is NOT set. Gates all three lowered surfaces at once: the LCD pane row, the browser panel row, and the storageDefault() seeding — so a build that gates a feature out has no key for it in storage and no mention of it in either UI. Resolved at generation time against the staged set's `kconfig:` fragments, exactly like a settings scalar's `{ kconfig: … }` form, and with the same limit: a symbol nobody set in a straddle.yaml reads as unset here, even if the compiler sees it set from sdkconfig.defaults or `spangap menuconfig`. A feature meant to ship as a build variant therefore declares its symbol in a `kconfig:` block, which is the one place both halves of the build can see it.",
+          "examples": ["!CONFIG_LORA_NO_SUPE", "CONFIG_SPANGAP_USB_CDC"]
+        },
         "section": { "type": "string" },
         "caption": { "type": "string" },
         "switch": {

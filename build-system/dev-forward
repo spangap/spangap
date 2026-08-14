@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""The TCP relays one `spangap dev` run needs, in one process.
+
+    dev-forward --portfile FILE SPEC [SPEC…]
+
+    SPEC = <bind>:<lport>:<dhost>:<dport>
+
+      lport `N+`   scan upward from N (32 tries) and take the first free port
+      lport `0`    take any free port
+      lport `N`    take exactly N, or warn and drop this relay
+      lport `N?`   the same, quietly — for a relay that is a bonus rather than a
+                   requirement, where "someone already has it" is a normal day
+
+Every listener that came up is written to FILE as `<lport> <dhost> <dport>`, so
+the caller can learn which ports it actually got. Runs until killed; `spangap dev`
+kills it on the way out, which is what keeps a relay from outliving the run that
+owns it.
+
+Two different jobs, same mechanism:
+
+  * **The dev server.** The container publishes its dev port to an EPHEMERAL host
+    port on purpose — a fixed publish would hold that port for the container's
+    whole life (it idles on `sleep infinity`), so a second workspace could never
+    start one. But a dev URL that lands on a different number every run is no use
+    to a bookmark, so the first relay fronts it on a predictable port, scanning
+    upward from 9000 so a second run simply takes 9001.
+
+  * **The device.** The dev server's proxy runs in the container, which on Docker
+    Desktop cannot route to the device's LAN segment; it reaches the host at
+    host.docker.internal instead, and these relays are what answers there. That
+    is why the device relays bind 0.0.0.0 and not loopback — the gateway can't
+    reach a loopback-only listener. Same LAN exposure as any dev server on a
+    trusted network.
+
+`dhost` is a bare address: an IPv6 literal would make the four-field split
+ambiguous, and the device is reached by IPv4 or by name.
+"""
+import socket
+import sys
+import threading
+
+
+def pipe(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def handle(client, dhost, dport):
+    try:
+        up = socket.create_connection((dhost, dport), timeout=10)
+    except OSError as e:
+        # The far end is asleep, still compiling, or gone. One connection fails
+        # and the listener stays up for the next.
+        print(f"dev-forward: {dhost}:{dport}: {e}", flush=True)
+        client.close()
+        return
+    # create_connection's timeout was only for the connect, but Python leaves it
+    # on the socket — an idle websocket (hot-reload sits silent between edits,
+    # the webrtc signaling socket once the session is peer-to-peer) would then
+    # die on recv. Clear it on both halves.
+    up.settimeout(None)
+    client.settimeout(None)
+    threading.Thread(target=pipe, args=(client, up), daemon=True).start()
+    pipe(up, client)
+    client.close()
+    up.close()
+
+
+def serve(srv, dhost, dport):
+    while True:
+        try:
+            client, _ = srv.accept()
+        except OSError:
+            return
+        threading.Thread(target=handle, args=(client, dhost, dport),
+                         daemon=True).start()
+
+
+def bind(addr, port):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((addr, port))
+    srv.listen(64)
+    return srv
+
+
+SCAN_TRIES = 32
+
+
+def listen(addr, spec_port):
+    """Bind per the spec's port form. Returns (socket, port), or (None, 0) when
+    an exact port is taken — the caller's cue to carry on without that relay."""
+    if spec_port.endswith("+"):
+        first = int(spec_port[:-1])
+        for port in range(first, first + SCAN_TRIES):
+            try:
+                return bind(addr, port), port
+            except OSError:
+                continue
+        print(f"dev-forward: no free port in {first}..{first + SCAN_TRIES - 1}",
+              flush=True)
+        return None, 0
+    optional = spec_port.endswith("?")
+    port = int(spec_port[:-1] if optional else spec_port)
+    try:
+        srv = bind(addr, port)
+    except OSError as e:
+        if not optional:
+            print(f"dev-forward: {addr}:{port}: {e}", flush=True)
+        return None, 0
+    return srv, srv.getsockname()[1]     # port 0 asked the kernel to choose
+
+
+def main():
+    args = sys.argv[1:]
+    portfile = None
+    if args[:1] == ["--portfile"]:
+        if len(args) < 2:
+            sys.exit("dev-forward: --portfile needs a path")
+        portfile, args = args[1], args[2:]
+    if not args:
+        sys.exit("usage: dev-forward [--portfile FILE] <bind>:<lport>:<dhost>:<dport>…")
+
+    bound = []
+    for spec in args:
+        try:
+            addr, lport, dhost, dport = spec.split(":")
+        except ValueError:
+            sys.exit(f"dev-forward: bad spec '{spec}' "
+                     f"(want <bind>:<lport>:<dhost>:<dport>)")
+        srv, port = listen(addr, lport)
+        if srv is None:
+            continue
+        bound.append((port, dhost, int(dport)))
+        threading.Thread(target=serve, args=(srv, dhost, int(dport)),
+                         daemon=True).start()
+        print(f"dev-forward: {addr}:{port} -> {dhost}:{dport}", flush=True)
+
+    # The first relay is the dev server's own, and a run with no way to reach the
+    # dev server is not a run — say so instead of idling.
+    if not bound:
+        sys.exit("dev-forward: nothing bound")
+    if portfile:
+        with open(portfile, "w", encoding="utf-8") as f:
+            for port, dhost, dport in bound:
+                f.write(f"{port} {dhost} {dport}\n")
+
+    # Nothing left for this thread but to stay alive holding the listeners.
+    threading.Event().wait()
+
+
+if __name__ == "__main__":
+    main()

@@ -308,11 +308,14 @@ def remembered_build() -> tuple[str, list[str]] | None:
     return (toks[0], toks[1:]) if toks else None
 
 
-def parse_selection(tokens: list[str]) -> tuple[set[str], set[str], int | None]:
-    """Parse remembered selection tokens → (included, excluded, flash_mb)."""
+def parse_selection(
+    tokens: list[str],
+) -> tuple[set[str], set[str], int | None, list[str]]:
+    """Parse remembered selection tokens → (included, excluded, flash_mb, kconfig)."""
     inc: set[str] = set()
     exc: set[str] = set()
     flash: int | None = None
+    kconfig: list[str] = []
     it = iter(tokens)
     for t in it:
         if t in ("--with", "-w"):
@@ -322,6 +325,8 @@ def parse_selection(tokens: list[str]) -> tuple[set[str], set[str], int | None]:
         elif t == "--flash-size":
             v = next(it, "")
             flash = int(v) if v.isdigit() else None
+        elif t == "--kconfig":
+            kconfig.append(next(it, ""))
         elif t.startswith("--with="):
             inc.add(t.split("=", 1)[1])
         elif t.startswith("--without="):
@@ -329,13 +334,16 @@ def parse_selection(tokens: list[str]) -> tuple[set[str], set[str], int | None]:
         elif t.startswith("--flash-size="):
             v = t.split("=", 1)[1]
             flash = int(v) if v.isdigit() else None
+        elif t.startswith("--kconfig="):
+            kconfig.append(t.split("=", 1)[1])
     inc.discard("")
     exc.discard("")
-    return inc, exc, flash
+    return inc, exc, flash, [k for k in kconfig if k]
 
 
 def write_remembered_build(
-    proj: Manifest, included: set[str], excluded: set[str], flash_mb: int | None
+    proj: Manifest, included: set[str], excluded: set[str], flash_mb: int | None,
+    kconfig: list[str] | None = None,
 ) -> None:
     """Record the build target + selection in .spangap-build (canonical form)."""
     parts = [proj.name]
@@ -345,6 +353,8 @@ def write_remembered_build(
         parts += ["--without", exc]
     if flash_mb is not None:
         parts += ["--flash-size", str(flash_mb)]
+    for line in (kconfig or []):
+        parts += ["--kconfig", line]     # order-preserving: later lines win
     SPANGAP_BUILD_FILE.write_text(shlex.join(parts) + "\n")
 
 
@@ -1149,6 +1159,42 @@ def _cstr(s: str) -> str:
     return f'"{esc}"'
 
 
+# The row-level Kconfig gate (schema `when_kconfig:`). It is NOT part of a row's
+# kind, so it is stripped before the kind is read.
+_SETTINGS_GATE_KEY = "when_kconfig"
+
+
+def _row_kind(row: dict) -> tuple[str, Any]:
+    """(kind, spec) of a settings row, ignoring the gate key."""
+    for k, v in row.items():
+        if k != _SETTINGS_GATE_KEY:
+            return k, v
+    die(f"settings row has no kind: {row!r}")
+
+
+def _row_enabled(row: dict, cfgvals: dict[str, str]) -> bool:
+    """Whether a row survives its `when_kconfig:` gate — `CONFIG_X` to emit it
+    only when that symbol is set, `!CONFIG_X` only when it isn't.
+
+    Resolved against the staged set's `kconfig:` fragments, exactly like a
+    settings scalar's `{ kconfig: … }` form, and with the same limit: a symbol
+    nobody set in a straddle.yaml is *absent*, which reads as unset. So a build
+    that turns a symbol on through `spangap menuconfig` or a buildable's
+    sdkconfig.defaults gates its CODE (the compiler sees the sdkconfig) without
+    gating these rows — a gated feature that must ship as a build variant
+    declares the symbol in a `kconfig:` block, where both halves can see it."""
+    gate = row.get(_SETTINGS_GATE_KEY)
+    if gate is None:
+        return True
+    want = True
+    name = str(gate).strip()
+    if name.startswith("!"):
+        want, name = False, name[1:].strip()
+    raw = cfgvals.get(name)
+    is_set = raw is not None and raw not in ("n", "0", "", '""')
+    return is_set == want
+
+
 def collect_kconfig_values(proj: Manifest, deps: list[Manifest]) -> dict[str, str]:
     """CONFIG_KEY → value string across every staged straddle's `kconfig:`
     block (incl. desugared identity values), same precedence as
@@ -1238,7 +1284,9 @@ def _settings_lcd_cpp(panels: list[tuple[Manifest, dict]], cfgvals: dict[str, st
                  "    lv_obj_t* p = static_cast<lv_obj_t*>(arg);"]
         bidx = 0
         for row in panel["rows"]:
-            kind, spec = next(iter(row.items()))
+            if not _row_enabled(row, cfgvals):
+                continue
+            kind, spec = _row_kind(row)
             if kind == "section":
                 lines.append(f"    lcdSettingSection(p, {_cstr(spec)});")
             elif kind == "caption":
@@ -1297,7 +1345,9 @@ def _settings_defaults_cpp(panels: list[tuple[Manifest, dict]], cfgvals: dict[st
 
     def walk(rows: list[dict]) -> None:
         for row in rows:
-            kind, spec = next(iter(row.items()))
+            if not _row_enabled(row, cfgvals):
+                continue
+            kind, spec = _row_kind(row)
             if kind == "list":
                 walk(spec.get("fields", []))
                 continue
@@ -1329,7 +1379,7 @@ def _settings_web_descriptors(panels: list[tuple[Manifest, dict]], cfgvals: dict
     Carries the web menu path/containers and normalized rows the GeneratedPanel
     interprets at runtime."""
     def web_row(row: dict) -> dict:
-        kind, spec = next(iter(row.items()))
+        kind, spec = _row_kind(row)
         if kind in ("section", "caption"):
             return {"kind": kind, "text": spec}
         if kind == "switch":
@@ -1361,7 +1411,8 @@ def _settings_web_descriptors(panels: list[tuple[Manifest, dict]], cfgvals: dict
             return {"kind": "list", "k": spec["key"], "itemLabel": spec["item_label"],
                     "add": spec.get("add", {}).get("cmd", ""),
                     "remove": spec.get("remove", {}).get("cmd", ""),
-                    "fields": [web_row(f) for f in spec.get("fields", [])]}
+                    "fields": [web_row(f) for f in spec.get("fields", [])
+                               if _row_enabled(f, cfgvals)]}
         return {"kind": kind}
 
     out: list[dict] = []
@@ -1387,7 +1438,7 @@ def _settings_web_descriptors(panels: list[tuple[Manifest, dict]], cfgvals: dict
             "id": "settings/" + "/".join(ids),
             "label": leaf["label"],
             "containers": containers,
-            "rows": [web_row(r) for r in panel["rows"]],
+            "rows": [web_row(r) for r in panel["rows"] if _row_enabled(r, cfgvals)],
         }
         if "placement" in leaf:
             entry["placement"] = int(leaf["placement"])
@@ -2263,11 +2314,12 @@ def write_sdkconfig_overrides(
     as the highest-priority SDKCONFIG_DEFAULTS entry (first build / regen path).
     Always written (even if empty body) so bootstrap can rely on its presence.
 
-    `extra_lines` are raw `CONFIG_*=...` lines appended verbatim (reserved for a
-    future generic `--kconfig`/config-file CLI override). Like all
-    SDKCONFIG_DEFAULTS they seed a fresh build / regen only; changing them
-    against an existing sdkconfig needs a `spangap clean` (or `spangap
-    menuconfig`). Per-straddle board values flow through the separate
+    `extra_lines` are the `--kconfig` lines, appended verbatim. Being
+    SDKCONFIG_DEFAULTS they seed a fresh build / regen, but bootstrap.cmake
+    hashes this file along with the other defaults and reseeds sdkconfig when
+    the hash moves — so a changed `--kconfig` set takes effect on the next build
+    with no clean, which is what lets one catalogue run build several flavours
+    from the same tree. Per-straddle board values flow through the separate
     sdkconfig.spangap-fragments file (see write_sdkconfig_fragments), not here.
 
     Also edits an existing sdkconfig in-place when --flash-size is given. IDF's
@@ -2589,17 +2641,43 @@ def print_partition_layout(csv_path: Path) -> None:
     print(f"  {'user state':<22}{state}")
 
 
+def esptool_argfile(write_flash_args: list[str], flash_files: dict[str, str]) -> str:
+    """An esptool argfile for `write_flash`: the flags on the first line, then one
+    `<offset> <file>` pair per image, lowest offset first.
+
+    ESP-IDF writes one of these itself as build/flash_project_args, but the
+    in-place finalize (see finalize_shrink_wrap) patches the `fixed` offset into
+    flasher_args.json alone, so IDF's copy can name an offset the images no
+    longer live at. Generated from flasher_args.json instead — one source, and
+    always the offsets the zip actually ships.
+    """
+    lines = [" ".join(write_flash_args)] if write_flash_args else []
+    lines += [f"{off} {fname}" for off, fname
+              in sorted(flash_files.items(), key=lambda kv: int(kv[0], 16))]
+    return "\n".join(lines) + "\n"
+
+
+def project_name(build_dir: Path, args: dict) -> str:
+    """The IDF project name, which names the argfile inside flasher.zip. The app
+    image is <project_name>.bin, so its stem answers this too when the build
+    description can't be read."""
+    try:
+        return json.loads((build_dir / "project_description.json").read_text())["project_name"]
+    except (OSError, json.JSONDecodeError, KeyError):
+        return Path((args.get("app") or {}).get("file", "firmware")).stem
+
+
 def write_flasher_zip(build_dir: Path) -> None:
     """Bundle everything needed to flash a board into build/flasher.zip.
 
-    Contents: flasher_args.json (the offset→file map plus chip/baud/reset and
-    write_flash flags esptool needs) and every image it references under
-    flash_files, each stored at its build-relative path (e.g.
-    bootloader/bootloader.bin, partition_table/partition-table.bin, the app
-    .bin, ota_data_initial.bin). Any flasher — host esptool or the web
-    flasher — has all it needs from these: read flasher_args.json for the
-    layout, flash the bins at their offsets. Best-effort: a build with no
-    flashable images (flash_files empty) writes no zip.
+    Contents: <project_name>.esptool (the offset→image map and the write_flash
+    flags, as an esptool argfile) and every image it names, each stored at its
+    build-relative path (e.g. bootloader/bootloader.bin,
+    partition_table/partition-table.bin, the app .bin, ota_data_initial.bin).
+    Any flasher — host esptool or the web flasher — has all it needs from
+    these: read the argfile for the layout, flash the bins at their offsets.
+    Best-effort: a build with no flashable images (flash_files empty) writes no
+    zip.
     """
     args_json = build_dir / "flasher_args.json"
     try:
@@ -2611,18 +2689,23 @@ def write_flasher_zip(build_dir: Path) -> None:
         return
     zip_path = build_dir / "flasher.zip"
     missing = []
+    present = {}
+    for offset, fname in flash_files.items():
+        if (build_dir / fname).exists():
+            present[offset] = fname
+        else:
+            missing.append(fname)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        z.write(args_json, "flasher_args.json")
-        for _offset, fname in flash_files.items():
-            f = build_dir / fname
-            if f.exists():
-                z.write(f, fname)
-            else:
-                missing.append(fname)
+        # Only the images that made it into the zip go in the argfile: a flasher
+        # working from it must never be sent looking for a file that isn't there.
+        z.writestr(f"{project_name(build_dir, d)}.esptool",
+                   esptool_argfile(d.get("write_flash_args") or [], present))
+        for offset, fname in present.items():
+            z.write(build_dir / fname, fname)
     if missing:
         print(f"spangap: flasher.zip: skipped missing image(s): {', '.join(missing)}",
               file=sys.stderr)
-    print(f"spangap: wrote {zip_path.name} ({len(flash_files) - len(missing)} images)",
+    print(f"spangap: wrote {zip_path.name} ({len(present)} images)",
           file=sys.stderr)
 
 
@@ -2752,6 +2835,16 @@ def cmd_build(args: argparse.Namespace) -> int:
 
     flash_mb = args.flash_size
 
+    # --kconfig lines ride into staging/sdkconfig.spangap-overrides, the
+    # highest-priority SDKCONFIG_DEFAULTS entry. They express what a build
+    # *flavour* selects (SUPE in or out, a console transport) without a straddle
+    # per combination; a board's own hardware values stay in its `kconfig:`.
+    kconfig: list[str] = list(args.kconfig or [])
+    for line in kconfig:
+        if not _KCONFIG_LINE_RE.match(line):
+            die(f"--kconfig {line!r}: expected `CONFIG_NAME=value` or "
+                f"`# CONFIG_NAME is not set`")
+
     # Remember target + selection in .spangap-build, EXCEPT on a pure replay —
     # a bare `build` (or passthrough like `build menuconfig`) at the workspace
     # root, where the target itself came from .spangap-build and the invocation
@@ -2760,18 +2853,19 @@ def cmd_build(args: argparse.Namespace) -> int:
     # file untouched (so transient/passthrough runs never clobber it). Any
     # explicit selection on this run replaces the remembered one wholesale.
     has_selection = bool(
-        args.include or args.exclude or flash_mb is not None
+        args.include or args.exclude or flash_mb is not None or kconfig
         or any(getattr(args, f"no_{s}", False) for s in _NO_SHORTHANDS)
     )
     persist = not (source == "remembered" and not has_selection)
     if not persist:
         rb = remembered_build()
         if rb is not None:
-            r_inc, r_exc, r_flash = parse_selection(rb[1])
+            r_inc, r_exc, r_flash, r_kconfig = parse_selection(rb[1])
             included |= r_inc
             excluded |= r_exc
             if flash_mb is None:
                 flash_mb = r_flash
+            kconfig = r_kconfig
 
     # --flash-size validation.
     if flash_mb is not None and flash_mb not in _VALID_FLASH_MB:
@@ -2809,10 +2903,10 @@ def cmd_build(args: argparse.Namespace) -> int:
         if flash_mb is not None:
             print(f"flash:     {flash_mb} MB (--flash-size override)", file=sys.stderr)
     stage_components(proj, deps, log_staged=not quiet)
-    write_sdkconfig_overrides(proj, flash_mb)
+    write_sdkconfig_overrides(proj, flash_mb, kconfig)
     lint_cmakelists(proj, deps, all_straddles)
     if persist:
-        write_remembered_build(proj, included, excluded, flash_mb)
+        write_remembered_build(proj, included, excluded, flash_mb, kconfig)
     # Bake the build invocation identity into the image: spangap-core's
     # write-build-info.py (run by CMake during this build) reads these and
     # emits app_build_{straddle,version,args}, which spangapInit() logs on boot.
@@ -2828,6 +2922,10 @@ def cmd_build(args: argparse.Namespace) -> int:
         # *which* distribution an image is once a board has several; the datetime
         # only answers whether something newer exists.
         "SPANGAP_BUILD_DIST": os.environ.get("SPANGAP_BUILD_DIST", ""),
+        # Which catalogue published it (`stable`, `dev`, …) — the channel, one
+        # level above the entry. Stamps from two catalogues are unrelated series,
+        # so a flasher has to know this before comparing them at all.
+        "SPANGAP_BUILD_CATALOGUE": os.environ.get("SPANGAP_BUILD_CATALOGUE", ""),
     }
     # Provenance manifest → device webroot as /BUILD.md. Written before the IDF
     # run so it's on disk when project_include.cmake's configure step picks it up
@@ -3582,15 +3680,67 @@ def _tcp_cli_client(host: str, rest: list[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# `spangap web [-w/--with …] [-x/--without …]` — regenerate the browser half
+# alone, no compile.
+#
+# A build's only contribution to the SPA is generated input in the buildable's
+# browser dir: src/boot/straddles.gen.ts (the registration dispatcher + the
+# declarative settings panels), src/app-icons/, and the `file:` deps in
+# package.json. Everything else Vite serves is source it reads live — the
+# straddle browser halves are npm-linked and kept out of dep pre-bundling
+# (quasar.config.ts), so an edit there is picked up by HMR with no build at all.
+# This verb writes exactly that generated set, so a straddle-set change reaches
+# a running `spangap dev` without an IDF run.
+#
+# Bare, it regenerates for the remembered build (.spangap-build) — the browser
+# half then matches the firmware the device is running. -w/-x override the
+# staged set for a one-off and are NOT remembered; a build re-asserts its own.
+# ---------------------------------------------------------------------------
+def cmd_web(args: argparse.Namespace) -> int:
+    all_straddles = scan_workspace_straddles()
+    proj = find_project()
+    if not proj.has_browser:
+        die(f"spangap web: {proj.name} has no web SPA "
+            f"({proj.browser_dir.name}/package.json missing)")
+
+    included = {_resolve_org_repo(r, all_straddles, "--with")
+                for r in (args.include or [])}
+    excluded = {_resolve_org_repo(r, all_straddles, "--without")
+                for r in (args.exclude or [])}
+    if not included and not excluded:
+        rb = remembered_build()
+        if rb is not None:
+            r_inc, r_exc, _, _ = parse_selection(rb[1])
+            included |= r_inc
+            excluded |= r_exc
+
+    deps, _ = resolve_requires(
+        proj, all_straddles, excluded=excluded, included=included)
+    pkg_path = proj.browser_dir / "package.json"
+    before = pkg_path.read_text()
+    write_browser_dispatch(proj, deps)
+    print(f"spangap web: regenerated {proj.name}'s browser half "
+          f"({len(deps)} straddles staged)", file=sys.stderr)
+    # The generated imports only resolve once node_modules holds a link per
+    # `file:` dep, so a changed dep set needs npm to relink. Steady state
+    # rewrites nothing and this is skipped.
+    if not (proj.browser_dir / "node_modules").is_dir() or pkg_path.read_text() != before:
+        print("spangap web: browser deps changed — npm install…", file=sys.stderr)
+        if subprocess.run(["npm", "install"], cwd=proj.browser_dir).returncode != 0:
+            die("spangap web: npm install failed")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # `spangap dev [-h <host>]` — run the project's Quasar dev server, reachable
 # from outside the container.
 #
 # The buildable's `browser:` dir (reticulous → web-interface/) is the Quasar SPA.
-# We bind 0.0.0.0:DEV_PORT inside; the container publishes that port to an
-# ephemeral host port (see spangap-outside ensure_container), and the host-side
-# `spangap dev` passes the resulting URL in SPANGAP_DEV_URL. The SPA dials wss to
-# whatever ?host= names — the
-# active device address — so the hot-served dev UI drives the real device. Runs
+# We bind 0.0.0.0 on the port the host picked for us out of the published range
+# (SPANGAP_DEV_BIND — one per concurrent run, see spangap-outside
+# ensure_container), and the host-side `spangap dev` passes the browser URL that
+# ends up fronting it in SPANGAP_DEV_URL. The dev server reverse-proxies the
+# device, so the page is same-origin with it and drives the real hardware. Runs
 # in the foreground: Quasar's console streams until you quit it (Ctrl-C). The URL
 # is printed here; the host-side `spangap dev` also opens it in the OS browser.
 # ---------------------------------------------------------------------------
@@ -3621,29 +3771,36 @@ def cmd_dev(argv: list[str]) -> int:
             die("spangap dev: npm install failed")
 
     host = device_host(set_to=override)
-    # The dev server's proxy runs in the container, which can't route to the
-    # device's LAN — so, exactly like `spangap cli`, it goes through the monitor's
-    # bridge at host.docker.internal (which forwards 80/443 → the device). On a
-    # native-Linux host there's no bridge and the container reaches the LAN
-    # directly, so _connect_host hands back the device address itself.
+    # The dev server's proxy runs in the container, which on Docker Desktop can't
+    # route to the device's LAN — so it dials the host at host.docker.internal,
+    # where the host-side `spangap dev` is relaying this device's TLS port for
+    # the length of the run (SPANGAP_DEV_PROXY_PORT names the relay's port; it is
+    # this run's own, so a second run can serve a second device). On a
+    # native-Linux host the container reaches the LAN directly and _connect_host
+    # hands back the device address itself, relay or no relay.
     proxy_target = _connect_host(host, WSS_PORT)
-    # The host publishes our DEV_PORT to an ephemeral host port and passes the
-    # resulting browser URL in SPANGAP_DEV_URL — we bind 0.0.0.0:DEV_PORT inside
-    # and can't see the host mapping ourselves. Fall back to the in-container
+    relay_port = os.environ.get("SPANGAP_DEV_PROXY_PORT", "")
+    if proxy_target != host and relay_port:
+        proxy_target = f"{proxy_target}:{relay_port}"
+    # The host picks which port in the published range we bind (one per
+    # concurrent run), publishes it to an ephemeral host port, fronts that on a
+    # predictable one and passes the resulting browser URL in SPANGAP_DEV_URL —
+    # none of which we can see from in here. Both fall back to the range's first
     # port for a bare `spangap dev` run straight inside the container.
-    url = os.environ.get("SPANGAP_DEV_URL") or f"http://localhost:{DEV_PORT}/"
+    bind_port = os.environ.get("SPANGAP_DEV_BIND") or str(DEV_PORT)
+    url = os.environ.get("SPANGAP_DEV_URL") or f"http://localhost:{bind_port}/"
     print(f"\nspangap dev: serving {proj.name}, proxying the device ({host}) "
           f"via {proxy_target}. Browse to:\n\n    {url}\n", file=sys.stderr)
-    if proxy_target != host:
+    if proxy_target != host and not relay_port:
         print("(reached through the `spangap monitor` bridge — make sure a "
               "monitor is running)\n", file=sys.stderr)
 
     # SPANGAP_DEVICE tells quasar.config.ts what to proxy /auth, /state and the
     # /webrtc signaling to, so the dev origin is same-origin with the device and
-    # the session cookie / login flow work unchanged. The device https port (443)
-    # is implied; the bridge splices host.docker.internal:443 → device:443.
+    # the session cookie / login flow work unchanged. A bare host means the
+    # device's own https port (443); host:port names a relay that splices to it.
     env = {**os.environ, "SPANGAP_DEVICE": proxy_target}
-    cmd = ["npm", "run", "dev", "--", "-H", "0.0.0.0", "-p", str(DEV_PORT), *rest]
+    cmd = ["npm", "run", "dev", "--", "-H", "0.0.0.0", "-p", bind_port, *rest]
     proc = subprocess.Popen(cmd, cwd=web, env=env)
     # Ctrl-C reaches quasar directly (it's in our foreground process group); don't
     # let the SIGINT we also catch surface as a traceback — just wait quasar out
@@ -3704,6 +3861,16 @@ def main(argv: list[str] | None = None) -> int:
              f"builds against differently-sized hardware. Probe a chip's actual "
              f"flash size with `esptool.py -p <dev> flash_id`.",
     )
+    p_build.add_argument(
+        "--kconfig", action="append", default=[], metavar="CONFIG_X=y",
+        help="force a Kconfig value for this build (repeatable): a raw "
+             "`CONFIG_NAME=value` or `# CONFIG_NAME is not set` line, written to "
+             "staging/sdkconfig.spangap-overrides as the highest-priority "
+             "SDKCONFIG_DEFAULTS entry (sdkconfig is reseeded when the set "
+             "changes, so no clean is needed). This is how a build *flavour* is "
+             "expressed — a board's own hardware values belong in its `kconfig:`. "
+             "Remembered in .spangap-build alongside --with/--without.",
+    )
     for short, full in _NO_SHORTHANDS.items():
         p_build.add_argument(
             f"--no-{short}", dest=f"no_{short}", action="store_true",
@@ -3718,6 +3885,24 @@ def main(argv: list[str] | None = None) -> int:
              "(.spangap-build). TARGET + --with/--without are remembered there.",
     )
     p_build.set_defaults(func=cmd_build)
+
+    p_web = sub.add_parser(
+        "web",
+        help="regenerate the browser half only (straddles.gen.ts, app-icons, "
+             "package.json file: deps) — no IDF compile, so a running "
+             "`spangap dev` picks the change up live",
+    )
+    p_web.add_argument(
+        "-w", "--with", dest="include", action="append", default=[], metavar="STRADDLE",
+        help="stage an extra straddle's browser half for this run (repeatable). "
+             "Not remembered — with no -w/-x the staged set is the last build's.",
+    )
+    p_web.add_argument(
+        "-x", "--without", dest="exclude", action="append", default=[], metavar="STRADDLE",
+        help="drop a straddle for this run (repeatable), cascading like the "
+             "build's --without. Not remembered.",
+    )
+    p_web.set_defaults(func=cmd_web)
 
     sub.add_parser(
         "detect-build",

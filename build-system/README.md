@@ -70,7 +70,8 @@ container these verbs work directly, with the IDF env already set up:
 
 | works in here | what it does |
 |---|---|
-| `spangap build [-v] [-w/--with <straddle>] [-x/--without <straddle>] [--no-lcd/--no-web/--no-net] [--flash-size MB] [idf args…]` | resolve deps → stage → lint → `idf.py build` (+ browser build) |
+| `spangap build [-v] [-w/--with <straddle>] [-x/--without <straddle>] [--no-lcd/--no-web/--no-net] [--flash-size MB] [--kconfig CONFIG_X=y] [idf args…]` | resolve deps → stage → lint → `idf.py build` (+ browser build). `--kconfig` (repeatable) forces a Kconfig value for this build — the way a build **flavour** is expressed, where a board's own hardware values belong in its `kconfig:`. It lands in `staging/sdkconfig.spangap-overrides`, the highest-priority `SDKCONFIG_DEFAULTS` entry, and `bootstrap.cmake` reseeds `sdkconfig` when that set changes, so switching flavours in one tree needs no clean (unless `.spangap-manual-kconfig` is set — then the reseed is skipped and the flavour silently doesn't apply). Remembered in `.spangap-build` with `--with`/`--without` |
+| `spangap web [-w/--with <straddle>] [-x/--without <straddle>]` | regenerate the browser half only (`src/boot/straddles.gen.ts`, `src/app-icons/`, the `file:` deps in `package.json`, `npm install` if those changed) — no IDF compile. Bare, it uses the remembered build's straddle set |
 | `spangap menuconfig [--save]` | interactive Kconfig editor (`idf.py menuconfig`) over the staged project; `--save` writes the minimal `sdkconfig.defaults` (the "configure a board straddle, save as `hw-whatever`" step) |
 | `spangap autoconfig` | leave manual-kconfig mode (drop `.spangap-manual-kconfig`) and reseed `sdkconfig` from `sdkconfig.defaults` on the next build |
 | `spangap validate` | parse + jsonschema-check the manifest and dep graph (fast, read-only) |
@@ -80,6 +81,7 @@ container these verbs work directly, with the IDF env already set up:
 | `spangap cli [-h host] [<cmd>]` | talk to a running device over the network (ssh, else TCP CLI) |
 | `spangap flash` | **signal only** — touches `.spangap-flashme` (workspace root) and waits ≤5s for a host monitor to consume it (see below) |
 | `spangap reset` | **signal only** — touches `.spangap-resetme` (workspace root) and waits ≤5s for a host monitor to consume it; the monitor restarts with a device reset (clean reboot + boot-log capture), no reflash |
+| `spangap make-builds [entry…]` | build the image catalogue described by the `builds.yaml` in the cwd (or every catalogue below it), stamp every image of the run with one datetime, rewrite `index.html` + `timestamp`. Host-side (each image is a `spangap build`) |
 | `spangap log [-f]` | print the device serial log (`.spangap-log`); streamed from the host monitor's relay (`host.docker.internal:2324`) because the bind mount is stale inside the container (a plain `cat`/`tail` — and even `O_DIRECT` — freeze; see below); `-f` follows like `tail -f` and survives flash/reset truncations |
 
 **`spangap flash` / `spangap reset` / `spangap cli` from in here don't touch hardware
@@ -215,12 +217,14 @@ In particular `spangap log` is where you check:
 
 It's truncated on each flash, so it reflects the **current** boot.
 
-**3. Drive the device over the network.** `spangap cli [<cmd>]` reaches the device, and
-the host `spangap monitor` **owns the bridge** that fronts it (the container can't route
-to the device's LAN, so on Docker Desktop it dials `host.docker.internal` and the monitor
-splices to the real device; native Linux reaches the LAN directly). The monitor opens the
-bridge on start from the configured device address and closes it on exit, so the bridge
-only lives while a monitor is running. One workspace-root file names the device:
+**3. Drive the device over the network.** `spangap cli [<cmd>]` reaches the device through
+a **host-side relay** (the container can't route to the device's LAN, so on Docker Desktop
+it dials `host.docker.internal` and the host splices to the real device; native Linux
+reaches the LAN directly). Two verbs put that relay up, each for as long as it runs and no
+longer: `spangap monitor`, which opens its bridge on start and closes it on exit, and
+`spangap dev`, which brings up its own set (see above) so a dev session needs no monitor —
+which is the point, since the monitor holds the serial port. One workspace-root file names
+the device:
 
 - **`.spangap-tcp`** — a bare `<host-or-ip>`: the **device address**. One address, many
   ports — ssh on 22, the legacy TCP CLI on 2323, the device's TLS/wss on 443. The port
@@ -246,12 +250,78 @@ spangap cli -h 192.168.1.50               # point at a specific device, then con
 (opens the device's TCP CLI; `s.` persists it to flash). When ssh isn't available, `spangap
 cli` automatically uses that socket on the same `.spangap-tcp` address.
 
-**`spangap dev`** runs the project's Quasar web SPA (`web-interface/`) hot from Vite,
-reachable from outside the container: it starts the dev server (published to an ephemeral
-host port, so concurrent workspaces never collide) and opens it in the OS browser at the
-URL it prints, pointed at the active device address over
-wss (`?host=<addr>&port=443`). It streams the dev console until you quit it. `-h <host>`
-sets the device address first, same as `spangap cli`.
+**`spangap dev [<addr>]`** runs the project's Quasar web SPA (`web-interface/`) hot from
+Vite, reachable from outside the container at **`http://localhost:9000/`**, which it opens
+in the OS browser. The address argument (bare, or `-h <addr>`) sets the device this run
+drives, and persists it like `spangap cli`. It streams the dev console until you quit it.
+
+**The run owns every relay it needs, so nothing else has to be running.** That matters
+because the alternative — the `spangap monitor` bridge — holds the serial port, and the
+browser flasher this same dev server serves at `/flashmon` wants that port itself. On
+startup it brings up one `dev-forward` process holding:
+
+- the **dev server's own** relay: the container publishes its dev port to an ephemeral host
+  port (a fixed publish would hold that port for the container's whole life and wedge every
+  other workspace), and this fronts it on 9000 — or the next free port up, so a second run
+  lands on 9001 instead of failing;
+- the **device's** relay on a port private to this run, which is what the container's proxy
+  dials at `host.docker.internal` (Docker Desktop can't route to the LAN segment) — private
+  so two runs can serve two different devices at once;
+- the device's **well-known ports** (443, 80, 22, 2323), best-effort: whichever are free,
+  so in-container `spangap cli` reaches this device too. A port already taken is skipped —
+  the first run to want it gets it.
+
+Everything is torn down when the run exits. Concurrency is bounded by the container's
+published dev-port range (`9000-9009`), one port per concurrent run in a workspace; a
+container from before the range is recreated to get it.
+
+On a native-Linux host the container reaches the LAN directly, so the proxy dials the device
+address itself and the relays are just unused.
+
+It also mounts two workspace directories beside the app, at the paths a deployment serves
+them at: **`/flashmon`** (`flashmon/flashmon/`, the browser flasher) and **`/builds`** (the
+image catalogues). Each `web-interface`'s `quasar.config.ts` asks for them by adding
+`spangap-browser/vite/workspace-mounts` to `build.vitePlugins`; Vite has one static root,
+so extra trees can only be middleware.
+
+**Browser-side edits need no build.** The dev server runs Vite in the buildable's own
+`web-interface/`, and every straddle browser half is an npm-linked `file:` dep served as
+live source (`quasar.config.ts` keeps them out of dep pre-bundling for exactly that
+reason), so editing `web-interface/src/` or any `<straddle>/browser/src/` is picked up by
+HMR while `spangap dev` runs. Only the *generated* inputs — `src/boot/straddles.gen.ts`
+(registration dispatcher + declarative settings panels), `src/app-icons/`, and the `file:`
+deps in `package.json` — come from a build, and **`spangap web`** rewrites just those with
+no compile: run it after changing a `browser_register:`/`settings:` block or the staged
+set, and the running dev server reloads on the generated file. A full `spangap build` is
+needed only when the firmware half has to change too.
+
+**`spangap make-builds`** builds an image catalogue: run it in a `builds/<catalogue>/`
+directory holding a `builds.yaml` (or in the tree above them, for all of them). Every image
+of one run shares one datetime stamp, and it rewrites the `index.html` + `timestamp` that
+the flasher reads. Host-side, because each image is a `spangap build`. Each image is built
+with `SPANGAP_BUILD_DATETIME` (that stamp), `SPANGAP_BUILD_DIST` (the entry's `name:`) and
+`SPANGAP_BUILD_CATALOGUE` (the directory's own name) in its environment, so the running
+firmware reports back which catalogue published it and when — `sys.build.catalogue` /
+`sys.build.datetime`, and a `build: catalogue <name>` line in the boot log.
+
+**`spangap make-builds <entry> [<entry>…]`** — inside one catalogue — builds only those
+entries. The listing is still rewritten, from **what is on disk**: the boards you didn't
+name keep their previous images and stay listed at their old stamps, so a one-board rebuild
+publishes that board and disturbs nothing else. (Naming entries only works inside a single
+catalogue; a run over the tree above them refuses it.)
+
+A built entry's **older images are deleted** once the new one is in — same entry, same
+catalogue, earlier stamp. One entry in one catalogue means one image: the flasher only ever
+offers the newest per name, so the rest are download weight in the deployment and noise in
+the listing. Only entries a run actually built are pruned, and only strictly older stamps,
+so a subset run still leaves every other board alone. A build that fails prunes nothing —
+the image that is still the current one stays where it is.
+
+A catalogue directory holding a **`.unlisted`** file still builds and is still reachable by
+naming it on the flasher page (`?build=<name>`, or the settings panel's Build selector) — it
+is simply left out of the parent `index.html`.
+Catalogues differing only in flavour say so with `--kconfig` in their entries, so they build
+from the same tree with no straddle per combination.
 
 **Device CLI commands are silent on success** (`set` / `unset` / `save` print nothing when
 they work) — no output means it worked, not that it hung.
@@ -346,10 +416,13 @@ enumerate the workspace.
 4. **lint**: reject any `idf_component_register(REQUIRES …)` that hand-writes a known straddle
    repo name — cross-straddle deps MUST flow through `${SPANGAP_REQUIRES}`.
 5. `idf.py build` (which drives the browser build).
-6. on a successful plain build, write **`build/flasher.zip`** — `flasher_args.json`
-   plus every image it references (bootloader, partition table, app, data). A
-   self-contained, host-independent bundle any flasher consumes: the web flasher
-   (`flashmon`), or flashmon's `make-builds.py` collecting it into a catalogue.
+6. on a successful plain build, write **`build/flasher.zip`** — `<project>.esptool` (an
+   esptool argfile: the write_flash flags, then `<offset> <image>` per line) plus every
+   image it names (bootloader, partition table, app, data). A self-contained,
+   host-independent bundle any flasher consumes: the web flasher (`flashmon`), or
+   `spangap make-builds` collecting it into a catalogue. The argfile is generated from
+   `flasher_args.json` rather than copied from IDF's own `flash_project_args`, because the
+   in-place finalize patches the `fixed` offset into the former only.
 
 Consumer CMake idiom: `include(${CMAKE_CURRENT_LIST_DIR}/spangap_requires.cmake)` then
 `REQUIRES ${SPANGAP_REQUIRES} …`. The buildable's `main/CMakeLists.txt` reads
@@ -424,6 +497,22 @@ case in point — the board's Kconfig declares a front-end module's rating, but 
 `femInit` knows whether that part actually answered, so the slider is sized from what it
 publishes and offers the bare radio's ceiling on a board whose front end is missing. The
 `default` applies until the key exists.
+
+A row may carry **`when_kconfig: "CONFIG_X"`** (or `"!CONFIG_X"` for the inverse) beside
+its kind. The row is then emitted only when that symbol is set — **all three surfaces at
+once**, so a build that gates a feature out has no row on the display, no row in the
+browser, and no `storageDefault()` for its key: the key is absent from storage rather than
+present and inert. It is resolved at generation time from the staged set's `kconfig:`
+fragments, the same source a settings scalar's `{ kconfig: … }` reads, and carries the same
+limit — a symbol nobody set in a straddle.yaml reads as unset here even when the compiler
+sees it set from a buildable's `sdkconfig.defaults` or from `spangap menuconfig`. So a
+feature meant to ship as a build variant declares its symbol in a `kconfig:` block, the one
+place both halves of the build can see it. iface-lora's `CONFIG_LORA_NO_SUPE` is the case
+in point: the same symbol gates the code with `#if` and these rows with `when_kconfig`.
+
+A hand-written panel (`web: false`) has no such gate — it is one bundle serving either
+firmware. It asks the **device** instead: a key the firmware never seeds comes back
+undefined, which is what `LoraPanel.vue`'s `hasSupe` tests to drop its section.
 
 The three generated surfaces:
 
@@ -523,6 +612,23 @@ image build, never to the currently-running container.
 7. **Making it buildable** — add the `buildable:` block; then, per the package-lock
    policy (INTERNALS): **commit** `package-lock.json` in buildable straddles, **ignore**
    it in libraries (drop it from `.gitignore` when a straddle becomes buildable).
+8. **Board straddles only — `detect_hw()`** in `esp-idf/src/detect.cpp`: the one
+   place this board is detected. It returns its own `hw-<straddle>` string when
+   the hardware under it is that board, NULL when it is not, and is written in the
+   vocabulary of spangap-core's `detect_probe.h`. spangap-core declares the symbol
+   **weak** and calls it from `serviceRunStart()` — before the first `onStart()`,
+   which is the last moment no bus is claimed — comparing the answer with the board baked into the image; a mismatch logs an
+   error and **halts the device awake** (the task blocks forever, so the console
+   stays up and the reason stays readable), because every pin map in that image
+   then belongs to someone else's board. Nothing else in the image references the
+   function, so spangap-core keeps it on the link line with `-u detect_hw` — a
+   weak undefined reference alone does not extract an archive member, and the
+   symbol would resolve to null on a board that defines it perfectly well. A
+   board build with no `detect_hw` warns on boot rather than passing silently. The confirmed answer is published as
+   `sys.hw`, and announced on the console as `build: hw <board>` at boot and
+   whenever one attaches — which is what lets a tool learn the board without
+   asking, and without resetting the device to probe. Copy the same function into flashmon's detector (see
+   `flashmon/docs/detect.md`); the copy is manual on purpose.
 
 After any manifest/dep/CMake change, the fast in-container check is `spangap validate`
 then `spangap list-requires`; a real `spangap build` confirms staging + linking.

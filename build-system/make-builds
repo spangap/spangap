@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Build a catalogue of ready-to-flash images — the `spangap make-builds` verb.
+
+A catalogue is a directory holding a `builds.yaml` that lists what to compile.
+Run in one, it builds that catalogue; run in a directory whose children are
+catalogues, it builds every one of them.
+
+    spangap make-builds                 build this catalogue (or every child one)
+    spangap make-builds hw-x [hw-y …]   build only these entries, in a catalogue
+
+Each entry's `invocation:` is the argument list of a `spangap build`. The
+flasher.zip that build leaves behind is copied in beside the config as
+<slug>_<name>_<datetime>.zip, and every image built in one run shares that one
+datetime. That entry's earlier images in that catalogue are then deleted: one
+entry in one catalogue means one image, and the flasher only ever offers the
+newest per name, so the older ones are download weight in the deployment and
+noise in the listing. Only the entries a run actually built are pruned, and only
+strictly older stamps, so a subset run disturbs nothing else. Alongside the zips
+this writes:
+
+    index.html   the listing, and the record of which images exist at which
+                 stamp — a consumer reads it to learn what the newest image for
+                 a board is
+    timestamp    the newest stamp present, for cheap polling: a consumer that
+                 sees it change re-reads index.html
+
+A catalogue directory holding `.unlisted` still builds and is still reachable by
+name; it is simply left out of the parent listing.
+
+Runs on the host, so each `spangap build` goes through the launcher that clones
+missing dependencies. The first failing build ends the run: the entries built
+before it keep their fresh images, the listing is still rewritten to match what
+is on disk, and the exit status is non-zero.
+"""
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+CONFIG = "builds.yaml"
+UNLISTED = ".unlisted"
+
+
+def die(msg):
+    sys.exit("make-builds: " + msg)
+
+
+def find_workspace(start):
+    """Walk up from `start` for spangap's workspace marker (the same file the
+    `spangap` launcher looks for), so the built flasher.zip can be found under
+    <workspace>/<repo>/."""
+    cur = os.path.abspath(start)
+    while True:
+        if os.path.isfile(os.path.join(cur, "spangap.workspace.yaml")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            die("not inside a spangap workspace (no spangap.workspace.yaml above %s)"
+                % start)
+        cur = parent
+
+
+def slug_of(project):
+    return re.sub(r"[^a-z0-9]+", "-", (project or "").lower()).strip("-") or "builds"
+
+
+def parse_catalogue(path):
+    """Return (project, [(name, invocation), …]) from a builds.yaml. No PyYAML —
+    the host python3 isn't guaranteed to have it. Keys this doesn't use (a
+    consumer's branding, per-entry photos) are ignored rather than rejected."""
+    project = ""
+    out = []
+    name = inv = None
+    in_builds = False
+
+    def flush():
+        nonlocal name, inv
+        if name is not None:
+            if not inv:
+                die("%s: build '%s' has no invocation" % (path, name))
+            out.append((name, inv))
+        name = inv = None
+
+    for raw in open(path, encoding="utf-8"):
+        st = raw.split("#", 1)[0].strip()   # our values carry no '#'
+        if not st:
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        if indent == 0 and re.match(r"^project\s*:", st):
+            project = st.split(":", 1)[1].strip().strip("\"'")
+            in_builds = False
+            continue
+        if indent == 0 and re.match(r"^builds\s*:", st):
+            in_builds = True
+            continue
+        if indent == 0 and not st.startswith("- "):
+            in_builds = False       # a later top-level key ends the builds block
+            continue
+        if not in_builds:
+            continue
+        if st.startswith("- "):
+            flush()
+            st = st[2:].strip()
+        k, _, v = st.partition(":")
+        k, v = k.strip(), v.strip().strip("\"'")
+        if k == "name":
+            name = v
+        elif k == "invocation":
+            inv = v
+    flush()
+    return project, out
+
+
+def zips_in(d):
+    """The images in a catalogue directory, newest first. The stamp is the last
+    underscore-separated field of the name, and sorts lexicographically."""
+    def stamp(n):
+        return os.path.splitext(n)[0].rsplit("_", 1)[-1]
+    names = [n for n in os.listdir(d) if n.endswith(".zip")]
+    return sorted(names, key=lambda n: (stamp(n), n), reverse=True)
+
+
+def split_zip(name):
+    """An image filename as (entry, stamp), or None if it isn't one of ours.
+    Images are <slug>_<entry>_<stamp>.zip; the entry may carry underscores, the
+    stamp never does, so the split is from the right."""
+    base, ext = os.path.splitext(name)
+    if ext != ".zip":
+        return None
+    head, _, stamp = base.rpartition("_")
+    if not head or not stamp.isdigit():
+        return None
+    _, _, entry = head.partition("_")            # drop the project slug
+    return (entry, stamp) if entry else None
+
+
+def prune_older(d, entry, keep_stamp):
+    """Delete this entry's earlier images from this catalogue, now that a newer
+    one is in. One entry in one catalogue means one image: the older ones are the
+    same distribution at a stamp nothing will ever ask for again — the flasher
+    offers the newest per name, so they are download weight in the deployment and
+    noise in the listing.
+
+    Scoped to the entry, and only to what is strictly older, so a subset run
+    leaves every other board's images exactly as they were. The slug is ignored
+    when matching, so images from before a `project:` rename are collected too —
+    the entry name and the directory are what identify a distribution, and the
+    slug is branding that rode along."""
+    for name in sorted(os.listdir(d)):
+        got = split_zip(name)
+        if not got:
+            continue
+        e, stamp = got
+        if e != entry or stamp >= keep_stamp:
+            continue
+        try:
+            os.remove(os.path.join(d, name))
+        except OSError as exc:
+            print("make-builds:   !! could not remove %s: %s" % (name, exc), file=sys.stderr)
+            continue
+        print("make-builds:   -- removed %s/%s" % (os.path.basename(d), name), file=sys.stderr)
+
+
+def fmt_bytes(n):
+    for unit, div in (("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= div:
+            v = n / div
+            return "%s %s" % (int(v) if v == int(v) else round(v, 1), unit)
+    return "%d bytes" % n
+
+
+def html_page(title, rows):
+    """A listing page. Deliberately plain: it is read by a browser and parsed by
+    the flasher, and all a parser wants is the hrefs."""
+    items = "\n".join('<li><a href="%s">%s</a>%s</li>' % (href, text, extra)
+                      for href, text, extra in rows)
+    return ("<!doctype html>\n"
+            "<meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            "<title>%s</title>\n"
+            "<h1>%s</h1>\n"
+            "<ul>\n%s\n</ul>\n" % (title, title, items))
+
+
+def write_listing(d, project):
+    """Rewrite a catalogue's index.html + timestamp from what is on disk, so both
+    describe the images actually there — including any a subset run left alone."""
+    names = zips_in(d)
+    rows = [(n, n, " <small>(%s)</small>" % fmt_bytes(os.path.getsize(os.path.join(d, n))))
+            for n in names]
+    title = "%s builds — %s" % (project or "spangap", os.path.basename(os.path.abspath(d)))
+    with open(os.path.join(d, "index.html"), "w", encoding="utf-8") as f:
+        f.write(html_page(title, rows))
+    newest = os.path.splitext(names[0])[0].rsplit("_", 1)[-1] if names else ""
+    with open(os.path.join(d, "timestamp"), "w", encoding="utf-8") as f:
+        f.write(newest + "\n")
+    return newest
+
+
+def write_root_listing(root, catalogues):
+    """Rewrite the tree's own index.html: every catalogue except the ones marked
+    .unlisted, which stay reachable by name and out of the listing."""
+    rows = [(os.path.basename(d) + "/", os.path.basename(d), "")
+            for d in sorted(catalogues)
+            if not os.path.exists(os.path.join(d, UNLISTED))]
+    with open(os.path.join(root, "index.html"), "w", encoding="utf-8") as f:
+        f.write(html_page("builds", rows))
+
+
+def build_catalogue(d, ws, sel, run_dt):
+    """Build the selected entries of one catalogue. Returns the name of the entry
+    that failed, or None."""
+    project, entries = parse_catalogue(os.path.join(d, CONFIG))
+    if not entries:
+        die("%s: no builds" % os.path.join(d, CONFIG))
+    catalogue = {n for n, _ in entries}
+    for want in sel:
+        if want not in catalogue:
+            die("no build named '%s' in %s" % (want, os.path.join(d, CONFIG)))
+    slug = slug_of(project)
+    failed = None
+    built = 0
+    for name, inv in entries:
+        if sel and name not in sel:
+            continue
+        print("make-builds: === %s/%s: spangap build %s ==="
+              % (os.path.basename(d), name, inv), file=sys.stderr)
+        # The invocation's first token names the buildable; its repo dir holds the
+        # esp-idf/build/ where flasher.zip lands.
+        toks = shlex.split(inv)
+        repo = toks[0].split("/")[-1]
+        zip_src = os.path.join(ws, repo, "esp-idf", "build", "flasher.zip")
+        # This entry's name is the image's distribution identity: free-format, and
+        # separate from the sortable stamp because the two answer different
+        # questions — which image this is, versus whether something newer exists.
+        # The build bakes it in; the device reports it back as sys.build.dist.
+        #
+        # The catalogue's own directory name (`stable`, `dev`, …) goes in beside
+        # it: it is the channel the image was published on, which a flasher needs
+        # to know before any stamp comparison means anything — the newest image
+        # in `stable` is not newer than a `dev` image that happens to sort below
+        # it. The device reports it back as sys.build.catalogue.
+        env = {**os.environ,
+               "SPANGAP_BUILD_DATETIME": run_dt,
+               "SPANGAP_BUILD_DIST": name,
+               "SPANGAP_BUILD_CATALOGUE": os.path.basename(os.path.abspath(d))}
+        rc = subprocess.run(["spangap", "build", *toks], cwd=ws, env=env,
+                            stdin=subprocess.DEVNULL).returncode
+        if rc != 0 or not os.path.isfile(zip_src):
+            # The first failure ends the run: the remaining entries build from the
+            # same tree, so whatever broke this one most likely breaks them too,
+            # and stopping here leaves the error at the end of the output.
+            print("make-builds:   !! build failed or no flasher.zip for '%s' "
+                  "(looked in %s)" % (name, zip_src), file=sys.stderr)
+            failed = name
+            break
+        zipname = "%s_%s_%s.zip" % (slug, name, run_dt)
+        shutil.copyfile(zip_src, os.path.join(d, zipname))
+        built += 1
+        print("make-builds:   -> %s/%s" % (os.path.basename(d), zipname), file=sys.stderr)
+        # The new image is on disk, so this entry's older ones are superseded.
+        # After the copy, never before: a failed build must leave the image that
+        # is still the current one exactly where it was.
+        prune_older(d, name, run_dt)
+    newest = write_listing(d, project)
+    print("make-builds: %s: %d image(s) built, listing at stamp %s"
+          % (os.path.basename(d), built, newest or "(none)"), file=sys.stderr)
+    return failed
+
+
+def main():
+    sel = set(sys.argv[1:])
+    cwd = os.getcwd()
+    ws = find_workspace(cwd)
+    run_dt = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+    if os.path.isfile(os.path.join(cwd, CONFIG)):
+        failed = build_catalogue(cwd, ws, sel, run_dt)
+        parent = os.path.dirname(os.path.abspath(cwd))
+        siblings = [os.path.join(parent, n) for n in os.listdir(parent)
+                    if os.path.isfile(os.path.join(parent, n, CONFIG))]
+        write_root_listing(parent, siblings)
+        if failed:
+            die("build '%s' failed" % failed)
+        return
+
+    catalogues = sorted(os.path.join(cwd, n) for n in os.listdir(cwd)
+                        if os.path.isfile(os.path.join(cwd, n, CONFIG)))
+    if not catalogues:
+        die("no %s here, and no subdirectory holding one — run this in a "
+            "catalogue directory or in the tree above them" % CONFIG)
+    if sel:
+        die("naming entries only works inside a single catalogue directory "
+            "(this run covers %d of them)" % len(catalogues))
+    failed = None
+    for d in catalogues:
+        failed = build_catalogue(d, ws, sel, run_dt)
+        if failed:
+            break
+    write_root_listing(cwd, catalogues)
+    if failed:
+        die("build '%s' failed" % failed)
+
+
+if __name__ == "__main__":
+    main()

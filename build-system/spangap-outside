@@ -21,13 +21,23 @@
 #                    → print the `sshd add` line if the key's refused → ask for an
 #                    address if nothing answers. -h persists the device address to
 #                    .spangap-tcp (a bare host); subsequent calls omit it.
-#   dev [-h host]    run the project's Quasar dev server in the container
-#                    (published to an ephemeral host port) and open it in the OS
-#                    browser, pointed at the device over wss. Streams until quit.
+#   dev [<addr>|-h <addr>]
+#                    run the project's Quasar dev server in the container and
+#                    open it in the OS browser at http://localhost:9000/ (the
+#                    next free port up if that one is taken, so several can run
+#                    at once). The run owns every relay it needs — the dev server's
+#                    own, and this device's ports — so nothing else has to be
+#                    running for the page to reach the device. Streams until quit.
 #   get-deps         git-clone any missing transitive `requires:` siblings
 #                    (uses host github creds; container has none). Also runs
 #                    automatically as part of `build`.
 #   build            same dep-fetch, then forward to spangap-inside.
+#   make-builds [entry…]
+#                    build the image catalogue described by the builds.yaml in
+#                    the current directory (or by each one in the directories
+#                    below it), stamping every image of a run with one datetime
+#                    and rewriting the listing. Host-side because each image is
+#                    a `spangap build`, which clones missing deps.
 #   docker <cmd>…    docker-exec <cmd> in the build-env container, raw —
 #                    e.g. `spangap docker sh` for an unwrapped shell.
 #   shell            synonym for `spangap docker bash`: an interactive bash
@@ -260,7 +270,7 @@ remembered_build_includes() {
 first_build_positional() {
     while [ $# -gt 0 ]; do
         case $1 in
-            -w|--with|-x|--without|--flash-size)
+            -w|--with|-x|--without|--flash-size|--kconfig)
                 shift; [ $# -gt 0 ] && shift ;;
             --) shift; [ $# -gt 0 ] && { printf '%s\n' "$1"; return 0; }; return 1 ;;
             -*) shift ;;
@@ -357,8 +367,9 @@ PORT_FILE="$workspace/.spangap-port-$(uname -s)-$(uname -m)"
 # one explicitly set (via `spangap cli -h` / `spangap dev -h`), or the project's
 # <default_hostname>.local mDNS name when never set. One address, many ports: ssh
 # on 22, the legacy TCP CLI on 2323, the device's TLS/wss on 443 — each verb
-# brings its own port, so the file never stores one. `spangap monitor` owns the
-# host-side bridge that fronts the address.
+# brings its own port, so the file never stores one. The host-side relays that
+# front the address belong to whichever verb is running: `spangap monitor` for
+# its bridge, `spangap dev` for the ones it starts for its own run.
 TCP_FILE="$workspace/.spangap-tcp"   # bare "<host-or-ip>" (the device address)
 SSH_PORT=22         # device sshd (the spangap/sshd straddle)
 TCP_CLI_PORT=2323   # legacy TCP CLI socket (builds without sshd)
@@ -366,6 +377,17 @@ HTTP_PORT=80        # device web (plain HTTP)
 WSS_PORT=443        # device web — TLS/wss (https), what `spangap dev` proxies to
 DEV_PORT=9000       # `spangap dev` quasar dev server bind port inside the container
                     # (mapped to an ephemeral host port — see ensure_container)
+# Top of the in-container dev-port range the container publishes. One port per
+# concurrent `spangap dev` in this workspace, so a second run can serve a second
+# device instead of colliding with the first.
+DEV_PORT_LAST=9009
+# The flasher's own repo (see ensure_flashmon): the platform's, like the
+# build-env itself, and cloned beside the project it flashes.
+FLASHMON_REPO=spangap/flashmon
+# Host-facing dev port: where the browser is sent, fronted onto the container's
+# ephemeral publish by dev-forward. A starting point rather than a fixed port —
+# the relay scans upward from here, so the first run gets 9000 and the next 9001.
+HOST_DEV_PORT=${SPANGAP_DEV_PORT:-9000}
 # Host-side serial-log relay (see serve_log in the bridge). NOT a device port: a
 # host-local TCP server the bridge runs so the in-container `spangap log` can
 # read the live log over host.docker.internal — the workspace bind mount is
@@ -1488,12 +1510,18 @@ ensure_daemon() {
 # True if the container publishes the `spangap dev` port to the host. The mapping
 # is fixed at `docker run` time, so a container created before it existed must be
 # recreated — cheap and lossless, since all state lives in bind mounts.
+# True if the container publishes the whole `spangap dev` port range. The top of
+# the range is checked as well as the bottom, because a container from before the
+# range publishes only the first port and could serve just one dev run.
 container_publishes_dev_port() {
-    local b
-    b=$(docker inspect --format \
-        '{{ index .HostConfig.PortBindings "'"$DEV_PORT"'/tcp" }}' \
-        "$container" 2>/dev/null) || b=""
-    case $b in ""|"<no value>"|"[]") return 1 ;; *) return 0 ;; esac
+    local p b
+    for p in "$DEV_PORT" "$DEV_PORT_LAST"; do
+        b=$(docker inspect --format \
+            '{{ index .HostConfig.PortBindings "'"$p"'/tcp" }}' \
+            "$container" 2>/dev/null) || b=""
+        case $b in ""|"<no value>"|"[]") return 1 ;; esac
+    done
+    return 0
 }
 
 # The fixed host port a legacy container baked into its dev-port mapping, or ""
@@ -1555,8 +1583,8 @@ ensure_container() {
                     test -f "$container_ws/spangap.workspace.yaml" >/dev/null 2>&1; then
                 local why=""
                 if ! container_publishes_dev_port; then
-                    [ -n "$why" ] && why="$why; the dev port is unpublished" \
-                                  || why="the dev port ($DEV_PORT) is unpublished"
+                    [ -n "$why" ] && why="$why; the dev port range is unpublished" \
+                                  || why="the dev port range ($DEV_PORT-$DEV_PORT_LAST) is unpublished"
                 elif [ "$(dev_fixed_host_port)" = "$DEV_PORT" ]; then
                     # Legacy container pinned the host side to $DEV_PORT, which
                     # blocks every other workspace. Recreate it onto an ephemeral
@@ -1624,20 +1652,23 @@ ensure_container() {
     # The workspace mounts UNDER the persistent home (/home/spangap) at its
     # basename; Docker orders nested bind mounts by depth, so /home/spangap
     # lands first and $container_ws on top of it regardless of -v order.
-    # Publish the `spangap dev` port to the host loopback so the Quasar dev
-    # server (bound 0.0.0.0:$DEV_PORT inside) is reachable from this machine's
-    # browser — the one host→container path Docker Desktop gives us without host
-    # networking. Loopback-only: the dev SPA is for this machine's browser; it
-    # reaches the device over the LAN itself via the ?host= address.
+    # Publish the `spangap dev` port RANGE to the host loopback so the Quasar dev
+    # servers (each bound 0.0.0.0:<port in range> inside) are reachable from this
+    # machine's browser — the one host→container path Docker Desktop gives us
+    # without host networking. A range rather than one port because a run serves
+    # one device: two devices at once means two dev servers in this container,
+    # each needing its own way out. Loopback-only: the dev SPA is for this
+    # machine's browser, and it reaches the device through this run's own relay.
     #
-    # Empty host port (the `127.0.0.1::$DEV_PORT` form, note the double colon) —
-    # Docker assigns a free ephemeral host port per container. The mapping lives
-    # for the container's whole life (sleep infinity), not just while `spangap
-    # dev` runs; a FIXED host port would therefore wedge every other workspace's
-    # container ("Bind for 127.0.0.1:$DEV_PORT failed: port is already
-    # allocated") for as long as this one idles. Ephemeral sidesteps that — each
-    # workspace gets its own port and they never collide. `spangap dev` reads the
-    # assigned port back (see the dev verb) to build the browser URL.
+    # Empty host port (the `127.0.0.1::$RANGE` form, note the double colon) —
+    # Docker assigns a free ephemeral host port per published port. The mapping
+    # lives for the container's whole life (sleep infinity), not just while
+    # `spangap dev` runs; FIXED host ports would therefore wedge every other
+    # workspace's container ("Bind for 127.0.0.1:$DEV_PORT failed: port is
+    # already allocated") for as long as this one idles. Ephemeral sidesteps that
+    # — each workspace gets its own ports and they never collide. `spangap dev`
+    # reads the assigned port back (see the dev verb) and fronts it on a
+    # predictable one with its own relay.
     # The image bakes spangap as uid/gid 1000. On Docker Desktop the bind mount
     # remaps host uids to that, so the container and host always agree on
     # workspace ownership. On a NATIVE-Linux host the mount passes raw uids
@@ -1655,7 +1686,7 @@ ensure_container() {
 
     docker run -d --name "$container" \
         ${run_user_args[@]+"${run_user_args[@]}"} \
-        -p "127.0.0.1::$DEV_PORT" \
+        -p "127.0.0.1::$DEV_PORT-$DEV_PORT_LAST" \
         -v "$spangap_home:/home/spangap" \
         -v "$workspace:$container_ws" \
         --workdir "$container_ws" \
@@ -1722,6 +1753,20 @@ pull_dep() {
     [ -z "$SPANGAP_QUIET" ] && log "updating $bare"
     git -C "$dest" pull --ff-only --quiet >/dev/null 2>&1 \
         || log "warning: could not update $bare — building against the existing checkout"
+    return 0
+}
+
+# The flasher comes down with the project, not by hand: `spangap dev` serves it
+# beside the app and `spangap make-builds` fills the catalogue it reads, so a
+# workspace that can build a project can also flash one. Not a straddle and never
+# staged into a build — a plain checkout beside the others. Non-fatal: a
+# workspace that can't reach github still builds what's on disk.
+ensure_flashmon() {
+    [ -e "$workspace/flashmon" ] && return 0
+    command -v git >/dev/null 2>&1 || return 0
+    log "cloning $FLASHMON_REPO -> $workspace/flashmon"
+    git clone --quiet "https://github.com/${FLASHMON_REPO}.git" "$workspace/flashmon" \
+        || log "warning: could not clone $FLASHMON_REPO — the flasher won't be there to serve"
     return 0
 }
 
@@ -1937,6 +1982,7 @@ get-deps)
 --with
 $inc"
     done
+    ensure_flashmon
     # shellcheck disable=SC2086  # tokens are simple org/repo names + flags
     fetch_missing_deps "$container_cwd" $gd_flags
     # Freshly host-cloned packs can read short in the container (virtiofs
@@ -2013,6 +2059,7 @@ build)
     case $target_tok in
         */*) project_host_dir "$target_tok" >/dev/null 2>&1 || clone_spec "$target_tok" ;;
     esac
+    ensure_flashmon
 
     # Pre-clone any `--with <org>/<repo>` (slash-form) so the included straddle
     # is on disk before the container lists missing deps. The list-deps loop
@@ -2083,50 +2130,136 @@ $inc"
     [ -z "$verbose" ] && log "building $proj_name"
     # No -t: keep output non-interactive (matches the previous piped path).
     set +e
-    # SPANGAP_BUILD_DATETIME and SPANGAP_BUILD_DIST (both empty unless a caller
-    # like flashmon's make-builds.py set them) bake a catalogue build stamp and
-    # the catalogue entry's name into the image; forward them verbatim.
+    # The SPANGAP_BUILD_* trio (all empty unless a caller like `make-builds` set
+    # them) bakes a catalogue build stamp, the catalogue entry's name and the
+    # catalogue's own name into the image; forward them verbatim. Anything not
+    # named here does not cross into the container and silently reaches the
+    # compile as empty — so a new one must be added in BOTH this list and
+    # spangap-inside's build_env.
     docker exec -i -e SPANGAP_PORT="$sticky_port" -e SPANGAP_WORKSPACE="$container_ws" \
         -e SPANGAP_BUILD_DATETIME="${SPANGAP_BUILD_DATETIME:-}" \
         -e SPANGAP_BUILD_DIST="${SPANGAP_BUILD_DIST:-}" \
+        -e SPANGAP_BUILD_CATALOGUE="${SPANGAP_BUILD_CATALOGUE:-}" \
         --workdir "$container_cwd" "$container" spangap build "$@"
     rc=$?
     set -e
     exit "$rc"
     ;;
-dev)
-    # Run the project's Quasar dev server inside the container (published to an
-    # ephemeral host port) and open it in the OS browser. The page is served hot
-    # by Vite; it drives the real device over wss via the ?host= address. Streams
-    # the dev console here until you quit it.
+make-builds)
+    # Stays on the host: every image in a catalogue is a `spangap build`, and
+    # those have to go back through this launcher so missing dependencies are
+    # cloned with the host's git credentials (the container has none).
     shift
-    # Peek a leading `-h <host>` so the browser URL and the persisted address
-    # match what the in-container `spangap dev` resolves; forward args unchanged.
+    exec python3 "$skel_dir/build-system/make-builds" "$@"
+    ;;
+dev)
+    # Run the project's Quasar dev server inside the container and open it in the
+    # OS browser. The page is served hot by Vite and reverse-proxies the device,
+    # so it is same-origin with it. Streams the dev console here until you quit.
+    #
+    # This run owns every relay it needs, so nothing else has to be running: the
+    # device's ports are fronted on the host by our own dev-forward, where the
+    # container's proxy reaches them. That matters because the alternative — the
+    # `spangap monitor` bridge — holds the serial port, and the browser flasher
+    # served at /flashmon wants that port itself.
+    shift
+    # The device address, as `-h <addr>` or as a bare first argument. Both persist
+    # it (.spangap-tcp) so later verbs agree; the bare form is dropped from argv,
+    # since the container side takes only -h.
     if [ "${1:-}" = "-h" ] && [ -n "${2:-}" ]; then
         set_device_host "$2"
+    elif [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
+        set_device_host "$1"
+        shift
     fi
-    # Same-origin URL — the dev server reverse-proxies the device (see
-    # quasar.config.ts), so there's no ?host= to pass; the page IS the device as
-    # far as the browser's cookie/auth are concerned. The host port is ephemeral
-    # (see ensure_container's docker run), so ask Docker which one this
-    # container landed on; fall back to $DEV_PORT only if the lookup comes up
-    # empty (e.g. an unexpectedly old container).
-    dev_port=$(docker port "$container" "$DEV_PORT/tcp" 2>/dev/null \
+    dev_args=()
+    if [ $# -gt 0 ]; then
+        dev_args=("$@")
+    fi
+    dev_device=$(device_host) || dev_device=""
+
+    command -v python3 >/dev/null 2>&1 \
+        || die "\`spangap dev\` needs python3 on the host to front the dev server and the device"
+
+    # An in-container port from the published range, free right now — one per
+    # concurrent run in this workspace, so two devices can be served at once.
+    dev_inport=""
+    for p in $(seq "$DEV_PORT" "$DEV_PORT_LAST"); do
+        if docker exec "$container" python3 -c "
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(('0.0.0.0', $p))
+except OSError:
+    sys.exit(1)
+" >/dev/null 2>&1; then
+            dev_inport=$p
+            break
+        fi
+    done
+    [ -n "$dev_inport" ] \
+        || die "no free dev port in the container ($DEV_PORT-$DEV_PORT_LAST all in use — that many dev servers already running?)"
+    # Which host port Docker published that one to. Ephemeral by design (see
+    # ensure_container), which is exactly why the browser is never told it.
+    dev_port=$(docker port "$container" "$dev_inport/tcp" 2>/dev/null \
                  | awk -F: 'NR==1 {print $NF; exit}')
-    [ -n "$dev_port" ] || dev_port=$DEV_PORT
-    url="http://localhost:$dev_port/"
+    [ -n "$dev_port" ] || dev_port=$dev_inport
+
+    # Relay set for this run. First spec is the dev server's own, scanning up
+    # from $HOST_DEV_PORT so a second run lands on the next port instead of
+    # failing. Then the device: its own ephemeral port for this run's proxy (so
+    # two runs can serve two devices), plus the well-known ports best-effort, so
+    # `spangap cli`/`log` from in the container work with no monitor running. A
+    # well-known port already taken is skipped — the first run gets them.
+    dev_portfile="$workspace/.spangap-dev-$$.ports"
+    dev_specs=("127.0.0.1:${HOST_DEV_PORT}+:127.0.0.1:$dev_port")
+    if [ -n "$dev_device" ]; then
+        dev_specs+=("0.0.0.0:0:$dev_device:$WSS_PORT")
+        for p in "$WSS_PORT" "$HTTP_PORT" "$SSH_PORT" "$TCP_CLI_PORT"; do
+            dev_specs+=("0.0.0.0:$p?:$dev_device:$p")
+        done
+    fi
+    python3 "$skel_dir/build-system/dev-forward" --portfile "$dev_portfile" \
+        "${dev_specs[@]}" &
+    dev_fwd_pid=$!
+    trap 'kill "$dev_fwd_pid" 2>/dev/null || true; rm -f "$dev_portfile"' EXIT INT TERM
+    # The portfile appears once every listener is up; without it we know nothing
+    # about which ports we got, so there is nothing to proceed with.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [ -s "$dev_portfile" ] && break
+        sleep 0.3
+    done
+    [ -s "$dev_portfile" ] \
+        || die "the dev relays didn't come up — see the dev-forward lines above"
+    # Our own port for the dev server, and the device's ephemeral one (the
+    # `0`-port spec, i.e. the wss relay that is NOT on the well-known port).
+    host_dev_port=$(awk -v t="$dev_port" '$3 == t {print $1; exit}' "$dev_portfile")
+    dev_proxy_port=$(awk -v d="$dev_device" -v w="$WSS_PORT" \
+        '$2 == d && $3 == w && $1 != w {print $1; exit}' "$dev_portfile")
+    [ -n "$host_dev_port" ] || die "the dev server relay didn't come up"
+
+    url="http://localhost:$host_dev_port/"
     log "opening $url shortly"
     # Dead simple: give the dev server a couple seconds, then open. No port probe
     # — on a cold first compile the page may be briefly blank, and Vite reloads
     # to the ready app on its own. The opener exits fast, so nothing lingers.
     ( sleep 2; open_url "$url" ) &
-    # Hand the in-container `spangap dev` the real host-facing URL (it binds
-    # 0.0.0.0:$DEV_PORT inside and can't see the host's ephemeral mapping) so its
-    # "Browse to: …" line matches what we actually open.
+    # Hand the in-container `spangap dev` the host-facing URL (it binds
+    # 0.0.0.0:$dev_inport inside and sees neither the publish nor the relays) so
+    # its "Browse to: …" line matches what we actually open, the port to bind,
+    # and the host port its proxy should dial for the device.
+    # Not exec'd: the trap above has to run, or the relays outlive the run and
+    # hold their ports against the next one.
+    set +e
     # shellcheck disable=SC2086
-    exec docker exec $exec_flags -e SPANGAP_WORKSPACE="$container_ws" \
+    docker exec $exec_flags -e SPANGAP_WORKSPACE="$container_ws" \
         -e SPANGAP_DEV_URL="$url" \
-        --workdir "$container_cwd" "$container" spangap dev "$@"
+        -e SPANGAP_DEV_BIND="$dev_inport" \
+        -e SPANGAP_DEV_PROXY_PORT="$dev_proxy_port" \
+        --workdir "$container_cwd" "$container" spangap dev ${dev_args[@]+"${dev_args[@]}"}
+    rc=$?
+    set -e
+    exit "$rc"
     ;;
 shell)
     # Synonym for `spangap docker bash` — an interactive bash in the

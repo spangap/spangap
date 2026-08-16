@@ -81,7 +81,7 @@ container these verbs work directly, with the IDF env already set up:
 | `spangap cli [-h host] [<cmd>]` | talk to a running device over the network (ssh, else TCP CLI) |
 | `spangap flash` | **signal only** — touches `.spangap-flashme` (workspace root) and waits ≤5s for a host monitor to consume it (see below) |
 | `spangap reset` | **signal only** — touches `.spangap-resetme` (workspace root) and waits ≤5s for a host monitor to consume it; the monitor restarts with a device reset (clean reboot + boot-log capture), no reflash |
-| `spangap make-builds [entry…]` | build the image catalogue described by the `builds.yaml` in the cwd (or every catalogue below it), stamp every image of the run with one datetime, rewrite `index.html` + `timestamp`. Host-side (each image is a `spangap build`) |
+| `spangap make-builds [entry…]` | build the image catalogue described by the `builds.yaml` in the cwd (or every catalogue below it), stamp every image of the run with one datetime, rewrite `index.html` + `timestamp`. Every straddle it compiles must already be in the workspace — cloning is the host's (see below) |
 | `spangap log [-f]` | print the device serial log (`.spangap-log`); streamed from the host monitor's relay (`host.docker.internal:2324`) because the bind mount is stale inside the container (a plain `cat`/`tail` — and even `O_DIRECT` — freeze; see below); `-f` follows like `tail -f` and survives flash/reset truncations |
 
 **`spangap flash` / `spangap reset` / `spangap cli` from in here don't touch hardware
@@ -298,11 +298,34 @@ needed only when the firmware half has to change too.
 **`spangap make-builds`** builds an image catalogue: run it in a `builds/<catalogue>/`
 directory holding a `builds.yaml` (or in the tree above them, for all of them). Every image
 of one run shares one datetime stamp, and it rewrites the `index.html` + `timestamp` that
-the flasher reads. Host-side, because each image is a `spangap build`. Each image is built
-with `SPANGAP_BUILD_DATETIME` (that stamp), `SPANGAP_BUILD_DIST` (the entry's `name:`) and
+the flasher reads. Each image is a `spangap build`, run from in here like any other. Each is
+built with `SPANGAP_BUILD_DATETIME` (that stamp), `SPANGAP_BUILD_DIST` (the entry's `name:`) and
 `SPANGAP_BUILD_CATALOGUE` (the directory's own name) in its environment, so the running
 firmware reports back which catalogue published it and when — `sys.build.catalogue` /
 `sys.build.datetime`, and a `build: catalogue <name>` line in the boot log.
+
+**Every straddle a run compiles has to be in the workspace already.** Cloning one takes the
+host's git credentials, which this container has none of — so the host half of `spangap`
+reads the run's invocations first (`spangap make-builds --invocations`, a read-only parse of
+the `builds.yaml` under the cwd) and puts each of them through the same clone + `list-deps`
+loop a plain `spangap build` gets, before handing the run in here. A target still absent by
+then is a fault rather than something to fetch: the run pre-flights every entry's target,
+stops before building anything, and names the straddle together with the catalogue entries
+that want it — clone it from the host (`spangap build <org>/<repo>`, `spangap get-deps`) and
+re-run.
+
+**A clean run prints nothing but its report** — one `Catalog:` line per catalogue and one
+indented line per image, with each build's output (and the toolchain's under it) captured
+rather than streamed:
+
+```
+Catalog: stable
+  reticulous/reticulous --with spangap/hw-lilygo-tdeck --kconfig CONFIG_LORA_NO_SUPE=y ... done (3.4 MB)
+```
+
+On a failure that suppression lifts — the failing build's captured output is printed in
+full, the run stops there, the listing is still rewritten from what is on disk, and the exit
+status is non-zero.
 
 **`spangap make-builds <entry> [<entry>…]`** — inside one catalogue — builds only those
 entries. The listing is still rewritten, from **what is on disk**: the boards you didn't
@@ -488,19 +511,54 @@ is conjured, and two straddles contributing at the same path simply concatenate 
 blocks. A node's path is its stable id on both surfaces. By convention the root holds only
 children.
 
+A node with **no rows and no non-empty descendant is not rendered** — no navigation entry
+on either surface, nothing to walk into. So declaring a node is not the same as putting it
+on the screen: a straddle may name a top-level menu and give it an order while leaving it
+empty, and the menu appears the moment something contributes to it. That is what lets the
+main menus be named in one place each (see below) instead of repeated by every contributor.
+
+**Sections merge.** Blocks concatenate, but their **sections** do not: a second straddle
+writing `section: "Status"` at a node that already has one does not get a second heading —
+its rows land at the end of the existing section's rows. Rows written before any section
+join the headerless run at the top of the node. Two straddles describing the same subject
+therefore arrive under one heading instead of beside each other, which is what a node
+nobody owns is for. The match is exact (a case-only near-miss stays two headings, with a
+build warning), and it resolves here, at lowering time: each runtime receives a node's
+rows as one opaque builder, so the generator is the last place that still has the rows
+themselves. The consequence to know is that a straddle's rows can end up split across the
+pane — the section a row sits under is where it goes, not where it was written.
+
 ```yaml
 settings:
   - at:
-      - { id: net, label: "Wifi & Internet", short: "Net", order: 1 }
+      - { id: net, label: "WiFi & Network", short: "Network", order: 10 }
       - { id: wifi, label: "WiFi" }
     rows:
       - switch: { label: "Enable", key: s.wifi.enable, default: 1 }
 ```
 
 Each segment carries `id` (the lowercase slug — the merge key), and optionally `label`
-(long name), `short` (the LCD header; defaults to the label) and `order`. The **first**
-contributor, in straddle init order, to supply each of those wins; a later conflicting
-value is ignored with a build-time warning.
+(long name), `short` (the LCD header; defaults to the label) and `order`. Naming is **last
+setter wins**, per field, in straddle init order — so the buildable, which arrives last of
+all, always has the final say over the tree its image ships. A node nobody names falls back
+to its title-cased id.
+
+**Naming a menu is a convention, not a claim.** Nothing stops a straddle from labelling or
+reordering a node somebody else set up, and the merge does not warn about it. What keeps
+the tree coherent is that each menu is named **once**, by the straddle it exists for, while
+every other contribution states the bare `id:` it lands at. The four top-level menus of a
+reticulous image are named that way:
+
+| menu | id | order | named by |
+| --- | --- | --- | --- |
+| WiFi & Network | `net` | 10 | `spangap/spangap-net` |
+| Reticulum Mesh | `reticulum` | 15 | `reticulous/reticulous` (the buildable) |
+| Apps | `apps` | 20 | `spangap/spangap-core` |
+| System | `system` | 30 | `spangap/spangap-core` |
+
+Two of those are named by a straddle that contributes no rows to them at all — a bare `at:`
+with no `rows:` is a legal contribution, and with the empty-node rule above it costs
+nothing when nobody fills the menu in.
 
 **Ordering.** Anything with siblings — nodes, rows, row blocks, a collection's add
 entries — may carry `order:` (an integer). One rule everywhere: items with `order:` first,
@@ -541,9 +599,10 @@ them will need code:
 **Row kinds.** `section` / `caption` (text), `switch{label,key}`,
 `slider{label,key,min,max}`, `text{label,key,secret?,placeholder?}`,
 `dropdown{label,key,options:[{v,l}],searchable?}`, `value{label,key,copyable?}`
-(read-only live text), `button{label,do,danger?}`, and `list{…}` (a collection, below).
-Every row may carry `order:`, `when_kconfig:` and `when_key:` **beside** its kind — the
-same placement for both gates:
+(read-only live text), `button{label,do,color?}`, `buttons{align?,items:[…]}`,
+`info{rows:[…]}`, and `list{…}` (a collection, below).
+Every row may carry `order:`, `when_kconfig:`, `when_key:` and `when_surface:` **beside**
+its kind — the same placement for all three gates:
 
 ```yaml
       - value: { label: "Address", key: wifi.addr, copyable: true }
@@ -554,6 +613,61 @@ same placement for both gates:
 truthy. Inside a form or an item editor the key may be a `{field}` template referencing a
 sibling field (`when_key: "{dhcp}"`), which is answered from the local buffer instead.
 
+`when_surface: web` (or `lcd`) emits the row on **one** surface only. It is for a row whose
+action does not exist on the other: backing up and restoring hand an archive between the
+device and the machine that pressed the button, and a display has nobody on the other end
+of that. Unlike `when_kconfig` it leaves the storage defaults alone — the key is still the
+device's, it is just shown in one place. It is a **pane-row** modifier: a form field, an
+`info:` line and a collection's editor row are part of one control and go wherever that
+control goes. On a `section:` row it gates the heading, which is how a heading and its rows
+are stated together.
+
+A gate on a `section:` row survives the section merge below: the **first** writer's heading
+row is the one emitted, gates and all.
+
+**A row of buttons.** A `button:` spans its row, which is right for a single action and
+wrong for two that are one choice. `buttons:` puts several on one line, each sized to its
+label, gathered `left` (the default), `center` or `right`. A button may carry its own
+`when_key`, gating that button and not the line — a hidden one leaves the layout and the
+rest close up around it. Keep the labels short: the display wraps a line that does not
+fit rather than clipping it, but a wrapped pair is a stacked pair.
+
+```yaml
+      - buttons:
+          align: right
+          items:
+            - { label: "Create", do: { form: { … } } }
+            - { label: "Import", do: { form: { … } } }
+```
+
+**A block of readouts.** A run of `value` rows is a readout, not a list of settings, and
+the row layout — a third of the pane for the label, whatever the longest label in the pane
+needs — leaves it full of gaps. `info:` groups them: one shared label column sized to the
+widest label in the GROUP and never wider than that third, and no gap between the lines.
+
+```yaml
+      - section: "Status"
+      - info:
+          rows:
+            - value: { label: "Status", key: wifi.sta.state_text }
+            - value: { label: "IP", key: wifi.sta.ip, copyable: true }
+              when_key: wifi.sta.up
+```
+
+Read-only `value` rows only — a switch or a slider needs room the narrow column cannot
+give, so anything interactive is an ordinary row above or below the group. The group has
+no heading of its own on purpose: a `section:` row above it is the heading, which also
+lets several groups sit under one. A line may be `when_key`-gated, and the column is
+measured over every line including the hidden ones, so a line appearing never shifts it.
+A gate on the `info:` row itself hides the whole group.
+
+**Colour.** Anywhere a button is described — a `button:`, one of a `buttons:` row, a
+dialog button, a collection's per-item action — `color:` states its colour, from the one
+palette a status pill uses and through the same table on both surfaces: `red`, `green`,
+`amber`, `blue`, `grey`, or an explicit `rrggbb`. So a red button is the red a red pill
+is. State it only where the colour carries what the label does not, which in practice
+means a destructive action.
+
 **Actions.** Three kinds, accepted anywhere an action is (settings buttons, dialog buttons,
 a collection's per-item buttons):
 
@@ -562,7 +676,7 @@ a collection's per-item buttons):
   did not complete). `reboots: true` runs the shared reboot-wait behaviour afterwards — the
   web closes the session, waits and reloads; the LCD shows a modal notice. That absorbs the
   safe-mode entry flows as a named capability rather than per-panel choreography.
-- **`dialog: {text, buttons:[{label, danger?, do?}]}`** — confirmation or choice. **No
+- **`dialog: {text, buttons:[{label, color?, do?}]}`** — confirmation or choice. **No
   input fields, ever.** Every button closes the dialog; a bare label is a cancel. Buttons
   nest actions, so a choice tree is dialogs of buttons of `set`s.
 - **`form: {fields, cmd, submit?, title?}`** — the one dialog with inputs, because it fronts
@@ -671,7 +785,8 @@ description the build reads.
 The three generated surfaces:
 
 - **LCD** → simple rows stay **calls**: a `spangapGenSetPane_N(void*)` of `lcdSetting*`
-  calls per contribution, wired by `spangapSettingsGenRegister()` through
+  calls **per node** — one contribution per path, with every block at it already merged,
+  which is what lets sections join — wired by `spangapSettingsGenRegister()` through
   `lcdSettingsContribute(segs, nsegs, fn)`, emitted into
   `staging/spangap_init_dispatch.gen.cpp` and called after the `serviceRunInit()` walk.
   Collections, forms and dialogs instead lower to **static descriptor structs**

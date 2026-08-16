@@ -36,8 +36,9 @@
 #                    build the image catalogue described by the builds.yaml in
 #                    the current directory (or by each one in the directories
 #                    below it), stamping every image of a run with one datetime
-#                    and rewriting the listing. Host-side because each image is
-#                    a `spangap build`, which clones missing deps.
+#                    and rewriting the listing. The run itself is in-container;
+#                    here we clone the straddles its invocations name first,
+#                    since only the host has the git credentials.
 #   docker <cmd>…    docker-exec <cmd> in the build-env container, raw —
 #                    e.g. `spangap docker sh` for an unwrapped shell.
 #   shell            synonym for `spangap docker bash`: an interactive bash
@@ -2146,11 +2147,63 @@ $inc"
     exit "$rc"
     ;;
 make-builds)
-    # Stays on the host: every image in a catalogue is a `spangap build`, and
-    # those have to go back through this launcher so missing dependencies are
-    # cloned with the host's git credentials (the container has none).
+    # Runs inside, like every other build verb — but the straddles the run will
+    # compile are acquired HERE first. Every image in a catalogue is a `spangap
+    # build`, and a build's missing dependencies are cloned with the host's git
+    # credentials, which the container has none of. So we ask the container which
+    # invocations this run covers (a read-only parse of the builds.yaml under the
+    # cwd) and put each one through the same clone + list-deps loop the `build`
+    # case runs before dispatching. By the time the catalogue run starts, every
+    # straddle it names is on disk; one that still isn't stops it there, named.
     shift
-    exec python3 "$skel_dir/build-system/make-builds" "$@"
+    command -v git >/dev/null 2>&1 || die "git required on host PATH (for auto-clone + get-deps)"
+    mb_args=("$@")
+    # A help request names no catalogue and acquires nothing — hand it straight in.
+    for a in ${mb_args[@]+"${mb_args[@]}"}; do
+        case $a in
+            -h|--help)
+                exec docker exec -i -e SPANGAP_WORKSPACE="$container_ws" \
+                    --workdir "$container_cwd" "$container" spangap make-builds "$@" ;;
+        esac
+    done
+    mb_invocations=$(docker exec -i -e SPANGAP_WORKSPACE="$container_ws" \
+        --workdir "$container_cwd" "$container" spangap make-builds --invocations "$@") \
+        || die "could not read the catalogue (see error above)"
+    ensure_flashmon
+    while IFS= read -r inv; do
+        [ -n "$inv" ] || continue
+        # An invocation is a `spangap build` argv of simple tokens (org/repo
+        # names, flags, CONFIG_X=y) — word-splitting is safe, the same way it is
+        # for .spangap-build.
+        # shellcheck disable=SC2086
+        set -- $inv
+        mb_tok=$(first_build_positional "$@") || mb_tok=""
+        case $mb_tok in
+            */*) project_host_dir "$mb_tok" >/dev/null 2>&1 || clone_spec "$mb_tok" ;;
+        esac
+        prefetch_explicit_includes "$@"
+        # An entry whose target we can't resolve is left alone here: the run
+        # pre-flights every target itself and names the catalogue and entry that
+        # wants the missing one, which is the message worth printing.
+        mb_proj=$(project_host_dir "$mb_tok" 2>/dev/null) || continue
+        # list-deps from the buildable's own dir, with this entry's selection, so
+        # the missing-walk sees the closure the build will resolve — a --with
+        # straddle's additional_installs included.
+        mb_flags=$(emit_selection_flags "$@")
+        # shellcheck disable=SC2086  # tokens are simple org/repo names + flags
+        fetch_missing_deps "$(host_to_container "$mb_proj")" $mb_flags
+    done <<EOF
+$mb_invocations
+EOF
+    # No -t: the run's output is a plain report, and the builds under it are
+    # captured rather than streamed.
+    set +e
+    docker exec -i -e SPANGAP_WORKSPACE="$container_ws" \
+        --workdir "$container_cwd" "$container" spangap make-builds \
+        ${mb_args[@]+"${mb_args[@]}"}
+    rc=$?
+    set -e
+    exit "$rc"
     ;;
 dev)
     # Run the project's Quasar dev server inside the container and open it in the

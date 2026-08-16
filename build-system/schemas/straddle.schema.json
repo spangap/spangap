@@ -273,7 +273,7 @@
       ],
       "properties": {
         "at": {
-          "description": "Where this contribution lands, as an ordered list of path segments from the Settings root. EVERY segment names a node, and the last one is where the rows go — there is no leaf/container distinction, because a node holds rows AND children. Intermediate nodes are conjured; no node is owned, so several straddles may contribute rows at the same path and their blocks concatenate in the global order rule. Each segment carries `id` (the stable lowercase slug — the merge key, and the node's path id on both surfaces), and optionally `label` (long name), `short` (the LCD header name; defaults to the label) and `order`. The FIRST contributor (in straddle init order) to supply a label/short/order for a node wins; a later conflicting value is ignored with a build-time warning.",
+          "description": "Where this contribution lands, as an ordered list of path segments from the Settings root. EVERY segment names a node, and the last one is where the rows go — there is no leaf/container distinction, because a node holds rows AND children. Intermediate nodes are conjured; no node is owned, so several straddles may contribute rows at the same path and their blocks concatenate in the global order rule. Each segment carries `id` (the stable lowercase slug — the merge key, and the node's path id on both surfaces), and optionally `label` (long name), `short` (the LCD header name; defaults to the label) and `order`. Naming is LAST SETTER WINS per field, in straddle init order, so the buildable — last of all — always has the final say over the tree its image ships. By convention a menu is named once, by the straddle it is there for, and every other contribution states only the `id:` it lands at. A node nobody names falls back to its title-cased id. A node with no rows and no non-empty descendants is not rendered on either surface, so a straddle may declare a menu (to give it a label and an order) that stays invisible until something contributes to it.",
           "type": "array",
           "minItems": 1,
           "items": {
@@ -300,7 +300,7 @@
           }
         },
         "rows": {
-          "description": "The rows this contribution adds to the node, top to bottom. Each row is an object whose kind key (section/caption/switch/slider/text/dropdown/value/button/list) carries the spec, plus the optional `when_kconfig`/`when_key`/`order` modifiers.",
+          "description": "The rows this contribution adds to the node, top to bottom. Each row is an object whose kind key (section/caption/switch/slider/text/dropdown/value/button/list) carries the spec, plus the optional `when_kconfig`/`when_key`/`when_surface`/`order` modifiers.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/settingsRow"
@@ -362,6 +362,11 @@
         }
       ]
     },
+    "settingsColor": {
+      "description": "A colour, from the one palette both surfaces resolve through the same table — so a red button is the red a red pill is. Either a name (red, green, amber, blue, grey) or an explicit rrggbb. Omit it for the control's own colour; state it only where the colour carries meaning the label does not, which in practice is a destructive action.",
+      "type": "string",
+      "pattern": "^(red|green|amber|blue|grey|gray|[0-9a-fA-F]{6})$"
+    },
     "settingsAction": {
       "description": "What a button does. Three kinds, accepted anywhere an action is: settings buttons, dialog buttons, and a collection's per-item buttons. Template substitution inside an action is `{field}` replacement only — no expressions, no fallbacks; anything fancier is a string the firmware publishes.",
       "type": "object",
@@ -422,8 +427,8 @@
                   "label": {
                     "type": "string"
                   },
-                  "danger": {
-                    "type": "boolean"
+                  "color": {
+                    "$ref": "#/$defs/settingsColor"
                   },
                   "do": {
                     "$ref": "#/$defs/settingsAction"
@@ -439,7 +444,7 @@
       }
     },
     "settingsForm": {
-      "description": "The one dialog that carries inputs, because it fronts a command sentinel. `fields` are ordinary binding rows carrying `field:` instead of `key:` — values are collected locally, not written per keystroke. Submitting serializes the field object as JSON to `cmd`. The owning task validates: while `<cmd>.error` is non-empty the form stays open showing the reason. Success is the TARGET CHANGING — inside a collection that is the array key, so the form closes when the mutation is observed; a standalone `form:` action has no target to watch, so it closes on submit and a late rejection surfaces on the pane that owns the sentinel.",
+      "description": "The one dialog that carries inputs, because it fronts a command sentinel. `fields` are ordinary binding rows carrying `field:` instead of `key:` — values are collected locally, not written per keystroke. Submitting serializes the field object as JSON to `cmd`. The owning task validates and answers on the sentinel family's two keys: a human-readable reason on `<cmd>.error` keeps the form open showing it, and a bumped `<cmd>.done` closes it — so an edit that changes nothing still acks. The UIs clear the error key immediately before each submit, so a rejection identical to the last one still registers as a change past the storage actor's write-dedup. A handler behind a form must implement both halves, or the form hangs open on success with nothing to close it.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -466,10 +471,50 @@
         }
       }
     },
+    "settingsInfoRow": {
+      "description": "One line of an `info:` group. A value row and its modifiers, and nothing else — the group's narrow shared label column is a promise only read-only rows can keep.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value"
+      ],
+      "properties": {
+        "value": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "label",
+            "key"
+          ],
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            },
+            "copyable": {
+              "type": "boolean"
+            }
+          }
+        },
+        "when_key": {
+          "description": "Show this line only while the key is truthy. The label column is sized over every line, hidden ones included, so a line appearing never shifts the column.",
+          "type": "string"
+        },
+        "when_kconfig": {
+          "type": "string",
+          "pattern": "^!?CONFIG_[A-Z0-9_]+$"
+        },
+        "order": {
+          "type": "integer"
+        }
+      }
+    },
     "settingsRow": {
       "type": "object",
       "minProperties": 1,
-      "maxProperties": 4,
+      "maxProperties": 5,
       "additionalProperties": false,
       "anyOf": [
         {
@@ -514,6 +559,16 @@
         },
         {
           "required": [
+            "buttons"
+          ]
+        },
+        {
+          "required": [
+            "info"
+          ]
+        },
+        {
+          "required": [
             "list"
           ]
         }
@@ -531,6 +586,12 @@
         "when_key": {
           "type": "string",
           "description": "Show this row only while a storage key is TRUTHY (non-empty, non-zero). Purely runtime — both surfaces subscribe to the key — and truthiness only: never an equality test, because the firmware publishes gate keys as truthy/empty exactly so the UIs do not have to compare. Inside a collection's item editor or a form the key may use `{field}` substitution to reference a sibling field, e.g. `when_key: \"{dhcp}\"`."
+        },
+        "when_surface": {
+          "type": "string",
+          "enum": ["web", "lcd"],
+          "description": "Emit this row on ONE surface only — `web` keeps it out of the display, `lcd` out of the browser. For a row whose action only exists on one of them: the backup and restore flows hand a file to the browser that opened them, and there is nobody on the other end of that on a display. Unlike `when_kconfig` it does not touch the storage defaults — a row shown on one surface still binds the same key on the device. A pane-row modifier only: a form field, an info line and a collection's editor row are part of one control and go wherever that control goes. On a `section:` row it gates the heading, so the heading and its rows are stated together.",
+          "examples": ["web"]
         },
         "order": {
           "description": "Orders this row among its siblings. Declaration order is the default and is usually what you want; where an order is stated it wins, per the global rule (ordered first ascending, unordered after in arrival order).",
@@ -700,6 +761,7 @@
           }
         },
         "button": {
+          "description": "A button spanning the row. For several buttons sharing one line, use `buttons:`.",
           "type": "object",
           "additionalProperties": false,
           "required": [
@@ -710,11 +772,74 @@
             "label": {
               "type": "string"
             },
-            "danger": {
-              "type": "boolean"
+            "color": {
+              "$ref": "#/$defs/settingsColor"
             },
             "do": {
               "$ref": "#/$defs/settingsAction"
+            }
+          }
+        },
+        "buttons": {
+          "description": "Several buttons sharing one line. Each sizes to its label rather than spanning the row (that is what a lone `button:` does), and `align` says which edge they gather at. A button may carry its own `when_key`, gating that button and not the line — a hidden one leaves the layout and the rest close up around it.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "items"
+          ],
+          "properties": {
+            "align": {
+              "description": "Where the buttons sit across the row. Default left.",
+              "type": "string",
+              "enum": [
+                "left",
+                "center",
+                "right"
+              ]
+            },
+            "items": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "label",
+                  "do"
+                ],
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "color": {
+                    "$ref": "#/$defs/settingsColor"
+                  },
+                  "when_key": {
+                    "description": "Show this button only while the key is truthy. Same truthiness-only rule as a row's `when_key`.",
+                    "type": "string"
+                  },
+                  "do": {
+                    "$ref": "#/$defs/settingsAction"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "info": {
+          "description": "A run of read-only values as one compact block: a shared label column sized to the widest label but never wider than the third an ordinary row gives its label, and no gap between the lines. A readout of short labels therefore reads as a block rather than as a list of rows with a third of the pane empty. Read-only VALUE ROWS ONLY — a switch or a slider needs room the narrow column cannot give, so anything interactive is an ordinary row above or below the group. The group carries no heading of its own: put a `section:` row above it where one is wanted, which also lets several groups sit under one heading.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows"
+          ],
+          "properties": {
+            "rows": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/settingsInfoRow"
+              }
             }
           }
         },
@@ -811,8 +936,8 @@
                   "label": {
                     "type": "string"
                   },
-                  "danger": {
-                    "type": "boolean"
+                  "color": {
+                    "$ref": "#/$defs/settingsColor"
                   },
                   "do": {
                     "$ref": "#/$defs/settingsAction"

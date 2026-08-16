@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1163,18 +1164,23 @@ def init_order(deps: list[Manifest]) -> list[Manifest]:
 # init order, so it sorts contributions by the one global rule — `order:` first
 # ascending, everything else after it in (straddle init order, declaration
 # order) — and emits them pre-sorted, and it resolves each node's label/short/
-# order first-contributor-wins, warning on a conflict. The runtimes then only
-# need stable insertion plus that same comparator for the hand-written
-# contributions that arrive after the generated ones.
+# order last-setter-wins. The runtimes then only need stable insertion plus that
+# same comparator for the hand-written contributions that arrive after the
+# generated ones.
 # ---------------------------------------------------------------------------
 
 # Row kinds that bind a config key (carry a `default:` worth seeding).
 _SETTINGS_BINDING_KINDS = {"switch", "slider", "text", "dropdown"}
 
 # Row-level modifiers: not part of a row's kind, so they are stripped before
-# the kind is read. `when_kconfig` resolves at build time, `when_key` passes
-# straight through to both runtimes, `order` is consumed by the sort below.
-_SETTINGS_ROW_MODIFIERS = {"when_kconfig", "when_key", "order"}
+# the kind is read. `when_kconfig` and `when_surface` resolve at build time,
+# `when_key` passes straight through to both runtimes, `order` is consumed by
+# the sort below.
+_SETTINGS_ROW_MODIFIERS = {"when_kconfig", "when_key", "when_surface", "order"}
+
+# The surfaces a row may be restricted to (schema `when_surface:`). Absent, a
+# row goes to both.
+_SETTINGS_SURFACES = ("web", "lcd")
 
 
 def _cstr(s: str) -> str:
@@ -1216,6 +1222,33 @@ def _row_enabled(row: dict, cfgvals: dict[str, str]) -> bool:
     raw = cfgvals.get(name)
     is_set = raw is not None and raw not in ("n", "0", "", '""')
     return is_set == want
+
+
+def _surface_rows(rows: list[dict], surface: str) -> list[dict]:
+    """A node's rows as one SURFACE sees them — `when_surface: web` keeps the row
+    out of the display, `when_surface: lcd` out of the browser.
+
+    Reach for it where a row's action only exists on one of them: the backup and
+    restore flows hand a file to the browser that opened them, and there is
+    nobody on the other end of that on a display. It is a pane-row modifier
+    only — a form field, an info line or a collection's editor row is part of one
+    control and goes wherever that control goes.
+
+    Storage defaults are untouched: a row shown on one surface still binds the
+    same key on the device, unlike `when_kconfig`, which takes the feature out of
+    the build entirely."""
+    out: list[dict] = []
+    for row in rows:
+        want = row.get("when_surface")
+        if want is None:
+            out.append(row)
+            continue
+        if str(want) not in _SETTINGS_SURFACES:
+            die(f"settings: when_surface: {want!r} — expected one of "
+                f"{', '.join(_SETTINGS_SURFACES)}")
+        if str(want) == surface:
+            out.append(row)
+    return out
 
 
 def collect_kconfig_values(proj: Manifest, deps: list[Manifest]) -> dict[str, str]:
@@ -1317,11 +1350,14 @@ def collect_settings(proj: Manifest, deps: list[Manifest]) -> list[SettingsContr
 def _settings_node_meta(contribs: list[SettingsContribution]) -> dict[str, dict]:
     """path -> {id, label, short, order} for every node in the tree.
 
-    First contributor wins, per field, walking in arrival order: whoever names
-    a node first names it. A later contribution that states a DIFFERENT
-    label/short/order for a node it did not name is ignored with a warning —
-    silently dropping it would leave two straddles each believing they titled
-    the pane. A node nobody labels falls back to its title-cased id."""
+    LAST SETTER WINS, per field, walking in arrival order. No node is owned, so
+    naming one is not a claim on it: a straddle contributing rows to a menu
+    somebody else named may state a label or an order and it takes, and the
+    buildable — which arrives last of all — always has the final say over the
+    tree its image ships. By convention a menu's naming is stated once, by the
+    straddle the menu is there for, and everyone else names only the `id:` they
+    are contributing at. A node nobody labels falls back to its title-cased
+    id."""
     meta: dict[str, dict] = {}
     for c in contribs:
         path_ids: list[str] = []
@@ -1330,18 +1366,11 @@ def _settings_node_meta(contribs: list[SettingsContribution]) -> dict[str, dict]
             path = "/".join(path_ids)
             cur = meta.get(path)
             if cur is None:
-                cur = {"id": seg["id"], "label": None, "short": None, "order": None,
-                       "owner": c.manifest.name}
+                cur = {"id": seg["id"], "label": None, "short": None, "order": None}
                 meta[path] = cur
             for field in ("label", "short", "order"):
-                if field not in seg:
-                    continue
-                if cur[field] is None:
+                if field in seg:
                     cur[field] = seg[field]
-                elif cur[field] != seg[field]:
-                    warn(f"settings: {c.manifest.name} sets {field}={seg[field]!r} on node "
-                         f"'{path}', which {cur['owner']} already set to {cur[field]!r} "
-                         f"— ignored")
     for path, cur in meta.items():
         if cur["label"] is None:
             cur["label"] = cur["id"][:1].upper() + cur["id"][1:]
@@ -1367,6 +1396,89 @@ def _sorted_rows(rows: list[dict], cfgvals: dict[str, str]) -> list[dict]:
     return [r for _k, r in sorted(
         ((_order_key(r.get("order"), i), r) for i, r in enumerate(live)),
         key=lambda pair: pair[0])]
+
+
+def _section_runs(rows: list[dict]) -> list[tuple[str | None, dict | None, list[dict]]]:
+    """A row block split at its `section:` rows into (title, heading row, rows)
+    runs. The rows before the first section are the run titled None, whose
+    heading row is None. The heading row travels with its run so a modifier on
+    it — a `when_key` gate, a `when_surface` one — survives the merge below."""
+    runs: list[tuple[str | None, dict | None, list[dict]]] = []
+    title: str | None = None
+    head: dict | None = None
+    cur: list[dict] = []
+    for r in rows:
+        kind, spec = _row_kind(r)
+        if kind == "section":
+            if cur or title is not None:
+                runs.append((title, head, cur))
+            title, head, cur = str(spec), r, []
+        else:
+            cur.append(r)
+    if cur or title is not None:
+        runs.append((title, head, cur))
+    return runs
+
+
+def _merge_rows(blocks: list[list[dict]], path: str) -> list[dict]:
+    """Every row block at one node, as one list of rows.
+
+    Runs under the SAME SECTION TITLE join: a second straddle writing
+    `section: "Status"` does not get a second heading, its rows land at the end
+    of the existing one. Rows declared before any section join the headerless
+    run, which stays at the top of the node wherever it was written. That is
+    the whole point of a node nobody owns — two straddles describing the same
+    subject arrive under one heading instead of beside each other.
+
+    Merging has to happen HERE. Each runtime receives a node's contributions as
+    opaque per-node builders, so neither could interleave two of them; the
+    generator is the last place that still has the rows themselves."""
+    order: list[str | None] = []
+    runs: dict[str | None, list[dict]] = {}
+    heads: dict[str | None, dict] = {}
+    for rows in blocks:
+        for title, head, block_rows in _section_runs(rows):
+            if title is not None and title not in heads:
+                heads[title] = head       # the first writer's heading, gates and all
+            if title not in runs:
+                if title is not None:
+                    near = next((t for t in runs
+                                 if t is not None and t.lower() == title.lower()), None)
+                    if near is not None:
+                        warn(f"settings: node '{path}' has both {near!r} and {title!r} — "
+                             f"section titles merge on an exact match, so these stay two "
+                             f"headings")
+                runs[title] = []
+                # The headerless run is the top of the node by definition; a
+                # section is appended in the order it first appears.
+                order.insert(0, None) if title is None else order.append(title)
+            runs[title].extend(block_rows)
+    out: list[dict] = []
+    for title in order:
+        if title is not None:
+            out.append(heads[title])
+        out.extend(runs[title])
+    return out
+
+
+def _settings_nodes(contribs: list[SettingsContribution],
+                    cfgvals: dict[str, str]) -> list[tuple[list[dict], list[dict]]]:
+    """(segments, rows) per NODE — one entry per distinct path, in the order the
+    sorted contributions first mention it, with every block at that path merged.
+
+    One entry per node rather than per contribution is what lets sections merge
+    at all, and it costs the runtimes nothing: a node's position among its
+    siblings is still established by the first block that mentions it."""
+    paths: list[str] = []
+    segs: dict[str, list[dict]] = {}
+    blocks: dict[str, list[list[dict]]] = {}
+    for c in _sorted_settings(contribs):
+        if c.path not in blocks:
+            paths.append(c.path)
+            blocks[c.path] = []
+            segs[c.path] = c.segments      # ids are the path; naming comes from meta
+        blocks[c.path].append(_sorted_rows(c.rows, cfgvals))
+    return [(segs[p], _merge_rows(blocks[p], p)) for p in paths]
 
 
 def _row_binding(spec) -> tuple[str, str]:
@@ -1395,8 +1507,8 @@ def _web_action(action: dict, cfgvals: dict[str, str]) -> dict:
         buttons = []
         for b in spec["buttons"]:
             btn: dict = {"label": b["label"]}
-            if b.get("danger"):
-                btn["danger"] = True
+            if b.get("color"):
+                btn["color"] = b["color"]
             if "do" in b:
                 btn["do"] = _web_action(b["do"], cfgvals)
             buttons.append(btn)
@@ -1448,7 +1560,7 @@ def _web_collection(spec: dict, cfgvals: dict[str, str]) -> dict:
         out["remove"] = {"confirm": rm["confirm"]} if "confirm" in rm else {}
     if spec.get("actions"):
         out["actions"] = [{"label": a["label"],
-                           **({"danger": True} if a.get("danger") else {}),
+                           **({"color": a["color"]} if a.get("color") else {}),
                            "do": _web_action(a["do"], cfgvals)}
                           for a in spec["actions"]]
     if spec.get("edit"):
@@ -1464,6 +1576,29 @@ def _web_collection(spec: dict, cfgvals: dict[str, str]) -> dict:
         if "map" in cand:
             c["map"] = dict(cand["map"])
         out["candidates"] = c
+    return out
+
+
+def _info_rows(spec: dict, cfgvals: dict[str, str]) -> list[dict]:
+    """An info group's lines. Read-only values only: the group's narrow shared
+    label column is a promise a control cannot keep, so anything interactive
+    belongs in an ordinary row above or below it."""
+    rows = _sorted_rows(spec["rows"], cfgvals)
+    for r in rows:
+        kind, _spec = _row_kind(r)
+        if kind != "value":
+            die(f"settings: an info: group holds value rows, not {kind!r} — a control "
+                f"needs room the group's shared label column does not give it")
+    return rows
+
+
+def _web_button(btn: dict, cfgvals: dict[str, str]) -> dict:
+    """One button of a `buttons:` row. Its `when_key` gates that button alone."""
+    out: dict = {"label": btn["label"], "do": _web_action(btn["do"], cfgvals)}
+    if btn.get("color"):
+        out["color"] = btn["color"]
+    if "when_key" in btn:
+        out["whenKey"] = btn["when_key"]
     return out
 
 
@@ -1499,8 +1634,14 @@ def _web_row(row: dict, cfgvals: dict[str, str]) -> dict:
             out["copyable"] = True
     elif kind == "button":
         out = {"kind": "button", "label": spec["label"], "do": _web_action(spec["do"], cfgvals)}
-        if spec.get("danger"):
-            out["danger"] = True
+        if spec.get("color"):
+            out["color"] = spec["color"]
+    elif kind == "buttons":
+        out = {"kind": "buttons", "items": [_web_button(b, cfgvals) for b in spec["items"]]}
+        if spec.get("align"):
+            out["align"] = spec["align"]
+    elif kind == "info":
+        out = {"kind": "info", "rows": [_web_row(r, cfgvals) for r in _info_rows(spec, cfgvals)]}
     elif kind == "list":
         out = _web_collection(spec, cfgvals)
     else:
@@ -1526,14 +1667,14 @@ def _web_row(row: dict, cfgvals: dict[str, str]) -> dict:
 def _settings_web_nodes(contribs: list[SettingsContribution],
                         meta: dict[str, dict],
                         cfgvals: dict[str, str]) -> list[dict]:
-    """The browser-side node fragments, serialized into straddles.gen.ts. Each
-    is a path (segments carrying their resolved naming) plus one row block; the
-    settings-tree store merges them by segment id."""
+    """The browser-side node fragments, serialized into straddles.gen.ts. One
+    per node — a path (segments carrying their resolved naming) plus that node's
+    merged rows; the settings-tree store merges them by segment id."""
     out: list[dict] = []
-    for c in _sorted_settings(contribs):
+    for segments_in, rows in _settings_nodes(contribs, cfgvals):
         segments = []
         path_ids: list[str] = []
-        for seg in c.segments:
+        for seg in segments_in:
             path_ids.append(seg["id"])
             m = meta["/".join(path_ids)]
             s: dict = {"id": m["id"], "label": m["label"]}
@@ -1543,7 +1684,8 @@ def _settings_web_nodes(contribs: list[SettingsContribution],
                 s["order"] = int(m["order"])
             segments.append(s)
         out.append({"segments": segments,
-                    "rows": [_web_row(r, cfgvals) for r in _sorted_rows(c.rows, cfgvals)]})
+                    "rows": [_web_row(r, cfgvals)
+                             for r in _surface_rows(rows, "web")]})
     return out
 
 
@@ -1556,6 +1698,20 @@ _LCD_ROW_KIND = {
     "value": "LCD_ROW_VALUE", "button": "LCD_ROW_BUTTON",
     "list": "LCD_ROW_LIST",
 }
+
+_LCD_ALIGN = {"left": "LCD_ALIGN_LEFT", "center": "LCD_ALIGN_CENTER",
+              "right": "LCD_ALIGN_RIGHT"}
+
+# Row kinds that describe a whole area of a pane rather than one labelled row.
+# They exist only in a pane: a form or an item editor is a column of fields.
+_SETTINGS_PANE_ONLY_KINDS = {"buttons", "info"}
+
+
+def _ccolor(spec: dict) -> str:
+    """A colour as a C literal — the palette name straight through, since both
+    surfaces resolve it through the same table. Unstated is nullptr, which is
+    the control's own colour."""
+    return _cstr(spec["color"]) if spec.get("color") else "nullptr"
 
 
 class _LcdSettingsEmitter:
@@ -1610,7 +1766,7 @@ class _LcdSettingsEmitter:
         lines = [f"static const lcd_dlg_btn_t {bsym}[] = {{"]
         for b, act in btns:
             lines.append(f"    {{ .label = {_cstr(b['label'])}, "
-                         f".danger = {'true' if b.get('danger') else 'false'}, .act = {act} }},")
+                         f".color = {_ccolor(b)}, .act = {act} }},")
         lines.append("};")
         self.defs.append("\n".join(lines))
         sym = self._sym("Dlg")
@@ -1632,10 +1788,26 @@ class _LcdSettingsEmitter:
         self.defs.append("\n".join(lines))
         return sym, len(live)
 
+    def btn_array(self, items: list[dict]) -> tuple[str, int]:
+        """Emit an lcd_btn_t[] for a `buttons:` row; returns (symbol, count)."""
+        btns = [(b, self.action(b["do"])) for b in items]   # actions first
+        sym = self._sym("Btns")
+        lines = [f"static const lcd_btn_t {sym}[] = {{"]
+        for b, act in btns:
+            when = _cstr(b["when_key"]) if "when_key" in b else "nullptr"
+            lines.append(f"    {{ .label = {_cstr(b['label'])}, .color = {_ccolor(b)}, "
+                         f".when_key = {when}, .act = {act} }},")
+        lines.append("};")
+        self.defs.append("\n".join(lines))
+        return sym, len(btns)
+
     def row_struct(self, row: dict) -> str:
         """One lcd_row_t initializer line (fields in declaration order, so the
         designated initializers stay legal C++)."""
         kind, spec = _row_kind(row)
+        if kind in _SETTINGS_PANE_ONLY_KINDS:
+            die(f"settings: a {kind}: row describes an area of a pane — a form or an "
+                f"item editor is a column of fields, so it cannot hold one")
         f: dict[str, str] = {"kind": _LCD_ROW_KIND[kind]}
         if kind in ("section", "caption"):
             f["label"] = _cstr(spec)
@@ -1710,7 +1882,7 @@ class _LcdSettingsEmitter:
             lines = [f"static const lcd_item_action_t {acts_sym}[] = {{"]
             for a, asym in acts:
                 lines.append(f"    {{ .label = {_cstr(a['label'])}, "
-                             f".danger = {'true' if a.get('danger') else 'false'}, .act = {asym} }},")
+                             f".color = {_ccolor(a)}, .act = {asym} }},")
             lines.append("};")
             self.defs.append("\n".join(lines))
 
@@ -1785,7 +1957,14 @@ class _LcdSettingsEmitter:
         elif kind == "value":
             call = f"lcdSettingValue(p, {_cstr(spec['label'])}, {_cstr(spec['key'])})"
         elif kind == "button":
-            call = f"lcdSettingAction(p, {_cstr(spec['label'])}, {self.action(spec['do'])})"
+            call = (f"lcdSettingAction(p, {_cstr(spec['label'])}, "
+                    f"{self.action(spec['do'])}, {_ccolor(spec)})")
+        elif kind == "buttons":
+            sym, n = self.btn_array(spec["items"])
+            align = _LCD_ALIGN[spec.get("align", "left")]
+            call = f"lcdSettingActionRow(p, {align}, {sym}, {n})"
+        elif kind == "info":
+            return self.info_block(row, spec)
         elif kind == "list":
             call = f"lcdSettingCollection(p, {self.collection(spec)})"
         else:
@@ -1794,14 +1973,34 @@ class _LcdSettingsEmitter:
             call = f"lcdSettingWhenKey({call}, {_cstr(row['when_key'])})"
         return f"    {call};"
 
-    def contribution(self, idx: int, c: SettingsContribution,
-                     meta: dict[str, dict]) -> tuple[str, str]:
-        """(segment-array symbol, builder symbol or 'nullptr') for one
-        contribution; its descriptors and builder land in self.defs."""
+    def info_block(self, row: dict, spec: dict) -> str:
+        """An info group, as its own braced scope. The group is three calls —
+        open, a line per value, then fit — because the shared label column is
+        only knowable once every label exists; the braces let `g` keep the same
+        name in every group of a pane. A gate on the group rides the group
+        object, exactly as a gate on a row rides the row."""
+        lines = ["    {", "        lv_obj_t* g = lcdSettingInfo(p);"]
+        for r in _info_rows(spec, self.cfgvals):
+            _k, s = _row_kind(r)
+            call = f"lcdSettingInfoValue(g, {_cstr(s['label'])}, {_cstr(s['key'])})"
+            if "when_key" in r:
+                call = f"lcdSettingWhenKey({call}, {_cstr(r['when_key'])})"
+            lines.append(f"        {call};")
+        lines.append("        lcdSettingInfoFit(g);")
+        if "when_key" in row:
+            lines.append(f"        lcdSettingWhenKey(g, {_cstr(row['when_key'])});")
+        lines.append("    }")
+        return "\n".join(lines)
+
+    def node(self, idx: int, segments: list[dict], rows: list[dict],
+             meta: dict[str, dict]) -> tuple[str, str]:
+        """(segment-array symbol, builder symbol or 'nullptr') for one NODE —
+        every block at that path already merged; its descriptors and builder
+        land in self.defs."""
         seg_sym = f"spangapGenSetSegs_{idx}"
         lines = [f"static const lcd_seg_t {seg_sym}[] = {{"]
         path_ids: list[str] = []
-        for seg in c.segments:
+        for seg in segments:
             path_ids.append(seg["id"])
             m = meta["/".join(path_ids)]
             order = "0, .has_order = false" if m["order"] is None \
@@ -1811,7 +2010,6 @@ class _LcdSettingsEmitter:
         lines.append("};")
         self.defs.append("\n".join(lines))
 
-        rows = _sorted_rows(c.rows, self.cfgvals)
         if not rows:
             return seg_sym, "nullptr"
         calls = [self.pane_call(r) for r in rows]   # emits nested descriptors first
@@ -1827,13 +2025,14 @@ def _settings_lcd_cpp(contribs: list[SettingsContribution],
                       meta: dict[str, dict],
                       cfgvals: dict[str, str]) -> tuple[str, str]:
     """(static descriptors + builder defs, body of spangapSettingsGenRegister)
-    for the LCD half."""
+    for the LCD half. One contribution per node, not per block — the blocks are
+    merged before they get here, which is what lets two straddles' rows share a
+    section heading."""
     em = _LcdSettingsEmitter(cfgvals)
     reg: list[str] = []
-    for idx, c in enumerate(_sorted_settings(contribs)):
-        seg_sym, fn = em.contribution(idx, c, meta)
-        reg.append(f"    lcdSettingsContribute({seg_sym}, "
-                   f"{len(c.segments)}, {fn});")
+    for idx, (segments, rows) in enumerate(_settings_nodes(contribs, cfgvals)):
+        seg_sym, fn = em.node(idx, segments, _surface_rows(rows, "lcd"), meta)
+        reg.append(f"    lcdSettingsContribute({seg_sym}, {len(segments)}, {fn});")
     return "\n\n".join(em.defs), "\n".join(reg)
 
 
@@ -3393,7 +3592,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         "SPANGAP_BUILD_STRADDLE": proj.name,
         "SPANGAP_BUILD_VERSION": proj.version,
         "SPANGAP_BUILD_ARGS": getattr(args, "spangap_invocation", "") or "spangap build",
-        # A catalogue build stamp, when a caller (flashmon's make-builds.py) set it
+        # A catalogue build stamp, when a caller (`spangap make-builds`) set it
         # in the environment; empty otherwise. Passed through so the image logs the
         # exact stamp it's published under.
         "SPANGAP_BUILD_DATETIME": os.environ.get("SPANGAP_BUILD_DATETIME", ""),
@@ -4211,6 +4410,338 @@ def cmd_web(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# `spangap make-builds [entry…]` — build an image catalogue.
+#
+# A catalogue is a directory holding a `builds.yaml` that lists what to compile.
+# Run in one, it builds that catalogue; run in a directory whose children are
+# catalogues, it builds every one of them.
+#
+#     spangap make-builds                 build this catalogue (or every child one)
+#     spangap make-builds hw-x [hw-y …]   build only these entries, in a catalogue
+#
+# Each entry's `invocation:` is the argument list of a `spangap build`. The
+# flasher.zip that build leaves behind is copied in beside the config as
+# <slug>_<name>_<datetime>.zip, and every image built in one run shares that one
+# datetime. That entry's earlier images in that catalogue are then deleted: one
+# entry in one catalogue means one image, and the flasher only ever offers the
+# newest per name, so the older ones are download weight in the deployment and
+# noise in the listing. Only the entries a run actually built are pruned, and
+# only strictly older stamps, so a subset run disturbs nothing else. Alongside
+# the zips this writes:
+#
+#     index.html   the listing, and the record of which images exist at which
+#                  stamp — a consumer reads it to learn what the newest image for
+#                  a board is
+#     timestamp    the newest stamp present, for cheap polling: a consumer that
+#                  sees it change re-reads index.html
+#
+# A catalogue directory holding `.unlisted` still builds and is still reachable
+# by name; it is simply left out of the parent listing.
+#
+# **Every straddle a run compiles has to be in the workspace already.** Cloning
+# one is the host's job and only the host's: a missing dependency is fetched with
+# the host's git credentials, which this container does not have. So the host
+# dispatcher asks a run for the invocations it covers (`--invocations`) and puts
+# each of them through its clone + list-deps loop before handing the run in here.
+# A target still absent by then is an operator-visible fault rather than
+# something to paper over, so the pre-flight in cmd_make_builds names it and
+# stops before anything is built.
+#
+# A clean run prints one line per catalogue and one per image, and nothing else:
+# each build's output is captured. The first failing build ends the run — the
+# entries built before it keep their fresh images, the listing is still rewritten
+# to match what is on disk, the captured output of the failure is printed so it
+# can be diagnosed, and the exit status is non-zero.
+# ---------------------------------------------------------------------------
+
+CATALOGUE_CONFIG = "builds.yaml"
+CATALOGUE_UNLISTED = ".unlisted"
+
+
+def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str, str]]:
+    """Return (project, [(name, invocation), …], {name: onboarding}) from a
+    builds.yaml. Keys this doesn't use (a consumer's branding, per-entry photos)
+    are ignored rather than rejected.
+
+    `onboarding:` is the one optional per-entry key that ends up in the listing:
+    `device` says this image sets a fresh node up from its own screen, so a
+    flasher has nothing to ask and should get out of the way once the image is
+    written. Anything else (and the absence of the key) means the flasher asks —
+    which is the only safe default, since a build that cannot ask for itself and
+    is never asked is a node nobody ever set up.
+    """
+    try:
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        die(f"{path}: {exc}")
+    if not isinstance(doc, dict):
+        die(f"{path}: expected a mapping with a `builds:` list")
+    project = str(doc.get("project") or "")
+    entries: list[tuple[str, str]] = []
+    onboarding: dict[str, str] = {}
+    for n, raw in enumerate(doc.get("builds") or [], 1):
+        if not isinstance(raw, dict) or not raw.get("name"):
+            die(f"{path}: build #{n} has no name")
+        name = str(raw["name"])
+        if not raw.get("invocation"):
+            die(f"{path}: build '{name}' has no invocation")
+        entries.append((name, str(raw["invocation"])))
+        if raw.get("onboarding"):
+            onboarding[name] = str(raw["onboarding"])
+    return project, entries, onboarding
+
+
+def _catalogue_slug(project: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", project.lower()).strip("-") or "builds"
+
+
+def _catalogue_zips(d: Path) -> list[str]:
+    """The images in a catalogue directory, newest first. The stamp is the last
+    underscore-separated field of the name, and sorts lexicographically."""
+    names = [p.name for p in d.iterdir() if p.suffix == ".zip"]
+    return sorted(names, key=lambda n: (n[:-4].rsplit("_", 1)[-1], n), reverse=True)
+
+
+def _split_image_name(name: str) -> tuple[str, str] | None:
+    """An image filename as (entry, stamp), or None if it isn't one of ours.
+    Images are <slug>_<entry>_<stamp>.zip; the entry may carry underscores, the
+    stamp never does, so the split is from the right."""
+    if not name.endswith(".zip"):
+        return None
+    head, _, stamp = name[:-4].rpartition("_")
+    if not head or not stamp.isdigit():
+        return None
+    _, _, entry = head.partition("_")            # drop the project slug
+    return (entry, stamp) if entry else None
+
+
+def _prune_older_images(d: Path, entry: str, keep_stamp: str) -> None:
+    """Delete this entry's earlier images from this catalogue, now that a newer
+    one is in. One entry in one catalogue means one image: the older ones are the
+    same distribution at a stamp nothing will ever ask for again — the flasher
+    offers the newest per name, so they are download weight in the deployment and
+    noise in the listing.
+
+    Scoped to the entry, and only to what is strictly older, so a subset run
+    leaves every other board's images exactly as they were. The slug is ignored
+    when matching, so images from before a `project:` rename are collected too —
+    the entry name and the directory are what identify a distribution, and the
+    slug is branding that rode along."""
+    for name in sorted(p.name for p in d.iterdir()):
+        got = _split_image_name(name)
+        if not got:
+            continue
+        e, stamp = got
+        if e != entry or stamp >= keep_stamp:
+            continue
+        try:
+            (d / name).unlink()
+        except OSError as exc:
+            warn(f"make-builds: could not remove {name}: {exc}")
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit, div in (("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= div:
+            v = n / div
+            return "%s %s" % (int(v) if v == int(v) else round(v, 1), unit)
+    return f"{n} bytes"
+
+
+def _listing_page(title: str, rows: list[tuple[str, str, str, str]]) -> str:
+    """A listing page. Deliberately plain: it is read by a browser and parsed by
+    the flasher, and all a parser wants is the hrefs.
+
+    A row may carry attributes on its anchor (`attrs`) — facts about that image
+    the flasher needs BEFORE it fetches it. They go on the anchor rather than
+    into an HTML comment because a comment is only ever near the row it is about,
+    while an attribute is part of it: one parser pass reads the href and the
+    facts together, and no amount of reordering or reformatting can separate
+    them. A browser shows the page exactly as before."""
+    items = "\n".join('<li><a href="%s"%s>%s</a>%s</li>' % (href, attrs, text, extra)
+                      for href, text, extra, attrs in rows)
+    return ("<!doctype html>\n"
+            "<meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            "<title>%s</title>\n"
+            "<h1>%s</h1>\n"
+            "<ul>\n%s\n</ul>\n" % (title, title, items))
+
+
+def _write_listing(d: Path, project: str, onboarding: dict[str, str]) -> None:
+    """Rewrite a catalogue's index.html + timestamp from what is on disk, so both
+    describe the images actually there — including any a subset run left alone.
+
+    `onboarding` maps entry name → the mode declared in builds.yaml, and each
+    image whose entry declares one carries it as `data-onboarding` on its link.
+    Derived from the config rather than from the zip, so an entry that changes
+    its answer is re-described by the next run over that catalogue even if the
+    image itself was not rebuilt."""
+    names = _catalogue_zips(d)
+    rows = []
+    for n in names:
+        got = _split_image_name(n)
+        mode = onboarding.get(got[0]) if got else None
+        rows.append((n, n,
+                     " <small>(%s)</small>" % _fmt_bytes((d / n).stat().st_size),
+                     ' data-onboarding="%s"' % mode if mode else ""))
+    title = "%s builds — %s" % (project or "spangap", d.name)
+    (d / "index.html").write_text(_listing_page(title, rows), encoding="utf-8")
+    newest = names[0][:-4].rsplit("_", 1)[-1] if names else ""
+    (d / "timestamp").write_text(newest + "\n", encoding="utf-8")
+
+
+def _write_root_listing(root: Path, catalogues: list[Path]) -> None:
+    """Rewrite the tree's own index.html: every catalogue except the ones marked
+    .unlisted, which stay reachable by name and out of the listing."""
+    rows = [(d.name + "/", d.name, "", "")
+            for d in sorted(catalogues)
+            if not (d / CATALOGUE_UNLISTED).exists()]
+    (root / "index.html").write_text(_listing_page("builds", rows), encoding="utf-8")
+
+
+def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
+                     onboarding: dict[str, str], all_straddles: dict[str, Manifest],
+                     run_dt: str) -> str | None:
+    """Build the selected entries of one catalogue. Returns the name of the entry
+    that failed, or None."""
+    slug = _catalogue_slug(project)
+    failed = None
+    print(f"Catalog: {d.name}", flush=True)
+    for name, inv in chosen:
+        toks = shlex.split(inv)
+        # The invocation leads with the buildable (the pre-flight resolved it);
+        # its own straddle dir is where the build leaves esp-idf/build/flasher.zip.
+        target = resolve_target_straddle(toks[0], all_straddles)
+        assert target is not None
+        zip_src = target.firmware_dir / "build" / "flasher.zip"
+        sys.stdout.write(f"  {inv} ...")
+        sys.stdout.flush()
+        # This entry's name is the image's distribution identity: free-format, and
+        # separate from the sortable stamp because the two answer different
+        # questions — which image this is, versus whether something newer exists.
+        # The build bakes it in; the device reports it back as sys.build.dist.
+        #
+        # The catalogue's own directory name (`stable`, `dev`, …) goes in beside
+        # it: it is the channel the image was published on, which a flasher needs
+        # to know before any stamp comparison means anything — the newest image
+        # in `stable` is not newer than a `dev` image that happens to sort below
+        # it. The device reports it back as sys.build.catalogue.
+        env = {**os.environ,
+               "SPANGAP_BUILD_DATETIME": run_dt,
+               "SPANGAP_BUILD_DIST": name,
+               "SPANGAP_BUILD_CATALOGUE": d.name}
+        # The `spangap` wrapper rather than this file, so each image is compiled
+        # by exactly the command an operator would type, with the IDF environment
+        # set up the way every other build gets it. Output is captured, not
+        # streamed: a clean run says nothing beyond the line above.
+        proc = subprocess.run(
+            ["spangap", "build", *toks], cwd=WORKSPACE, env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True,
+        )
+        if proc.returncode != 0 or not zip_src.is_file():
+            # The first failure ends the run: the remaining entries build from the
+            # same tree, so whatever broke this one most likely breaks them too,
+            # and stopping here leaves the error at the end of the output. The
+            # suppression lifts with it — a build nobody can see fail is worse
+            # than a noisy one.
+            sys.stdout.write(" FAILED\n")
+            sys.stdout.flush()
+            sys.stderr.write(proc.stdout or "")
+            reason = (f"exited {proc.returncode}" if proc.returncode
+                      else f"left no {zip_src}")
+            sys.stderr.write(f"spangap: make-builds: `spangap build {inv}` {reason}\n")
+            failed = name
+            break
+        zipname = f"{slug}_{name}_{run_dt}.zip"
+        shutil.copyfile(zip_src, d / zipname)
+        sys.stdout.write(" done (%.1f MB)\n" % ((d / zipname).stat().st_size / (1 << 20)))
+        sys.stdout.flush()
+        # The new image is on disk, so this entry's older ones are superseded.
+        # After the copy, never before: a failed build must leave the image that
+        # is still the current one exactly where it was.
+        _prune_older_images(d, name, run_dt)
+    _write_listing(d, project, onboarding)
+    return failed
+
+
+def cmd_make_builds(args: argparse.Namespace) -> int:
+    sel = set(args.entries or [])
+    cwd = Path.cwd()
+    run_dt = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+    # One catalogue (a builds.yaml here) or every catalogue below us. Either way
+    # the parent of the catalogues gets its own listing rewritten, so a run in
+    # one of them still leaves the tree's index describing all of them.
+    if (cwd / CATALOGUE_CONFIG).is_file():
+        catalogues = [cwd]
+        root = cwd.parent
+    else:
+        catalogues = sorted(p for p in cwd.iterdir()
+                            if (p / CATALOGUE_CONFIG).is_file())
+        if not catalogues:
+            die(f"make-builds: no {CATALOGUE_CONFIG} here, and no subdirectory "
+                f"holding one — run this in a catalogue directory or in the tree "
+                f"above them")
+        if sel:
+            die(f"make-builds: naming entries only works inside a single "
+                f"catalogue directory (this run covers {len(catalogues)} of them)")
+        root = cwd
+    siblings = sorted(p for p in root.iterdir() if (p / CATALOGUE_CONFIG).is_file())
+
+    plan = []
+    for d in catalogues:
+        project, entries, onboarding = _catalogue_config(d / CATALOGUE_CONFIG)
+        if not entries:
+            die(f"make-builds: {d / CATALOGUE_CONFIG}: no builds")
+        known = {n for n, _ in entries}
+        for want in sorted(sel - known):
+            die(f"make-builds: no build named '{want}' in {d / CATALOGUE_CONFIG}")
+        plan.append((d, project, [e for e in entries if not sel or e[0] in sel],
+                     onboarding))
+
+    if args.invocations:
+        # The host dispatcher's shopping list: what this exact run would compile,
+        # so it can clone each invocation's straddles before the run itself.
+        for _, _, chosen, _ in plan:
+            for _, inv in chosen:
+                print(inv)
+        return 0
+
+    # Pre-flight. Nothing here clones — the host does that, with the credentials
+    # this container hasn't got — so a target that is not on disk ends the run
+    # before it starts, naming what is missing and who wants it.
+    all_straddles = scan_workspace_straddles()
+    absent: dict[str, list[str]] = {}
+    for d, _, chosen, _ in plan:
+        for name, inv in chosen:
+            toks = shlex.split(inv)
+            if not toks or toks[0].startswith("-"):
+                die(f"make-builds: {d.name}/{name}: an entry's invocation must "
+                    f"start with the straddle it builds ({inv!r})")
+            if resolve_target_straddle(toks[0], all_straddles) is None:
+                absent.setdefault(toks[0], []).append(f"{d.name}/{name}")
+    if absent:
+        die("make-builds: not in the workspace: "
+            + "; ".join(f"{t} (wanted by {', '.join(w)})"
+                        for t, w in sorted(absent.items()))
+            + "\n       Clone it from the HOST — `spangap build <org>/<repo>` or "
+              "`spangap get-deps` there fetches with the host's git credentials. "
+              "This container has none, so it cannot fetch it for you.")
+
+    failed = None
+    for d, project, chosen, onboarding in plan:
+        failed = _build_catalogue(d, project, chosen, onboarding, all_straddles, run_dt)
+        if failed:
+            break
+    _write_root_listing(root, siblings)
+    if failed:
+        die(f"make-builds: build '{failed}' failed")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # `spangap dev [-h <host>]` — run the project's Quasar dev server, reachable
 # from outside the container.
 #
@@ -4382,6 +4913,30 @@ def main(argv: list[str] | None = None) -> int:
              "build's --without. Not remembered.",
     )
     p_web.set_defaults(func=cmd_web)
+
+    p_mb = sub.add_parser(
+        "make-builds",
+        help="build the image catalogue described by the builds.yaml in cwd "
+             "(or every catalogue below it): one datetime stamp across the run, "
+             "index.html + timestamp rewritten from what is on disk",
+    )
+    p_mb.add_argument(
+        "entries", nargs="*", metavar="ENTRY",
+        help="build only these entries of the catalogue (default: all of them). "
+             "The listing is still rewritten from what is on disk, so the "
+             "entries you don't name keep their images at their old stamps. "
+             "Only inside a single catalogue — a run over the tree above them "
+             "refuses it.",
+    )
+    p_mb.add_argument(
+        "--invocations", action="store_true",
+        help="print the `spangap build` argument list of every entry this run "
+             "would compile, one per line, and exit. Read by the host "
+             "dispatcher, which clones each one's missing straddles with the "
+             "host's git credentials (this container has none) before handing "
+             "the run in here.",
+    )
+    p_mb.set_defaults(func=cmd_make_builds)
 
     sub.add_parser(
         "detect-build",

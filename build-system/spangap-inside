@@ -1147,18 +1147,34 @@ def init_order(deps: list[Manifest]) -> list[Manifest]:
 # ---------------------------------------------------------------------------
 # Declarative settings codegen (straddle.yaml `settings:`).
 #
-# One descriptor per pane is lowered into THREE surfaces, all from the same
-# block: the on-device LCD pane (lcdRegisterSettings + lcdSetting* calls, only
-# when spangap-lcd is staged), the persisted storage defaults (storageDefault()
-# for every `default:` whose key starts with `s.`), and the browser panel (a
-# JSON descriptor inlined into straddles.gen.ts, rendered by GeneratedPanel.vue).
-# The firmware halves (panes + defaults) ride in the generated init dispatch
-# (write_init_dispatch); the web half rides in the browser dispatch
-# (write_browser_dispatch). This kills the old three-way hand-duplication.
+# The `settings:` blocks across the staged set describe ONE tree. Every node in
+# it holds rows and children (rows first, children as navigation entries), and
+# no node is owned: a contribution names a path with `at:`, intermediate nodes
+# are conjured, and blocks contributed at the same path concatenate. That tree
+# is lowered into THREE surfaces from the same source: the on-device LCD node
+# (lcdSettingsContribute + lcdSetting* calls, only when spangap-lcd is staged),
+# the persisted storage defaults (storageDefault() for every binding row with a
+# `default:` on an `s.` key), and the browser node fragments (JSON inlined into
+# straddles.gen.ts, interpreted by the NodePane renderer). The firmware halves
+# ride in the generated init dispatch (write_init_dispatch); the web half rides
+# in the browser dispatch (write_browser_dispatch).
+#
+# ORDERING AND NAMING ARE RESOLVED HERE, not at runtime. The generator knows
+# init order, so it sorts contributions by the one global rule — `order:` first
+# ascending, everything else after it in (straddle init order, declaration
+# order) — and emits them pre-sorted, and it resolves each node's label/short/
+# order first-contributor-wins, warning on a conflict. The runtimes then only
+# need stable insertion plus that same comparator for the hand-written
+# contributions that arrive after the generated ones.
 # ---------------------------------------------------------------------------
 
 # Row kinds that bind a config key (carry a `default:` worth seeding).
 _SETTINGS_BINDING_KINDS = {"switch", "slider", "text", "dropdown"}
+
+# Row-level modifiers: not part of a row's kind, so they are stripped before
+# the kind is read. `when_kconfig` resolves at build time, `when_key` passes
+# straight through to both runtimes, `order` is consumed by the sort below.
+_SETTINGS_ROW_MODIFIERS = {"when_kconfig", "when_key", "order"}
 
 
 def _cstr(s: str) -> str:
@@ -1167,15 +1183,14 @@ def _cstr(s: str) -> str:
     return f'"{esc}"'
 
 
-# The row-level Kconfig gate (schema `when_kconfig:`). It is NOT part of a row's
-# kind, so it is stripped before the kind is read.
+# The row-level Kconfig gate (schema `when_kconfig:`).
 _SETTINGS_GATE_KEY = "when_kconfig"
 
 
 def _row_kind(row: dict) -> tuple[str, Any]:
-    """(kind, spec) of a settings row, ignoring the gate key."""
+    """(kind, spec) of a settings row, ignoring the modifier keys."""
     for k, v in row.items():
-        if k != _SETTINGS_GATE_KEY:
+        if k not in _SETTINGS_ROW_MODIFIERS:
             return k, v
     die(f"settings row has no kind: {row!r}")
 
@@ -1258,114 +1273,598 @@ def _settings_bound(spec_val, cfgvals: dict[str, str], where: str) -> tuple[int,
     return _settings_scalar(spec_val, cfgvals, where), None
 
 
-def collect_settings(proj: Manifest, deps: list[Manifest]) -> list[tuple[Manifest, dict]]:
-    """Every settings panel across the staged set, in init order (buildable
-    last). A panel is gated purely by its straddle being staged — there is no
-    per-panel `when:`; the LCD lowering is gated globally on spangap-lcd."""
-    ordered = init_order(deps) + [proj]
-    out: list[tuple[Manifest, dict]] = []
-    for m in ordered:
-        for panel in m.settings:
-            out.append((m, panel))
+class SettingsContribution:
+    """One `settings:` entry, with everything the lowering needs attached: the
+    straddle it came from, its arrival index (init order, then declaration
+    order within the straddle) and its `order:`, if any."""
+
+    __slots__ = ("manifest", "arrival", "segments", "rows", "order")
+
+    def __init__(self, manifest: "Manifest", arrival: int, block: dict):
+        self.manifest = manifest
+        self.arrival = arrival
+        self.segments = list(block["at"])
+        self.rows = list(block.get("rows") or [])
+        self.order = block.get("order")
+
+    @property
+    def path(self) -> str:
+        return "/".join(seg["id"] for seg in self.segments)
+
+
+def _order_key(order, arrival: int) -> tuple[int, int, int]:
+    """THE sort key, used for everything that has siblings — nodes, rows, row
+    blocks, list add-actions. Items carrying `order:` come first, ascending;
+    everything without one follows in arrival order (straddle init order, then
+    declaration order within the straddle). There are no placement buckets and
+    no alphabetic tier: an unstated position means "after the stated ones, where
+    I was declared", which is the order a reader of the yaml already sees."""
+    return (0, int(order), arrival) if order is not None else (1, 0, arrival)
+
+
+def collect_settings(proj: Manifest, deps: list[Manifest]) -> list[SettingsContribution]:
+    """Every settings contribution across the staged set, in arrival order
+    (init order, buildable last; declaration order within a straddle). A
+    contribution is gated purely by its straddle being staged — there is no
+    per-block `when:`; the LCD lowering is gated globally on spangap-lcd."""
+    out: list[SettingsContribution] = []
+    for m in init_order(deps) + [proj]:
+        for block in m.settings:
+            out.append(SettingsContribution(m, len(out), block))
     return out
 
 
-def _panel_lcd_path(panel: dict) -> tuple[str, str, int]:
-    """(slash-joined LCD path of segment labels, leaf label, leaf placement)."""
-    menu = panel["menu"]
-    path = "/".join(seg["label"] for seg in menu)
-    leaf = menu[-1]
-    return path, leaf["label"], int(leaf.get("placement", 0))
+def _settings_node_meta(contribs: list[SettingsContribution]) -> dict[str, dict]:
+    """path -> {id, label, short, order} for every node in the tree.
+
+    First contributor wins, per field, walking in arrival order: whoever names
+    a node first names it. A later contribution that states a DIFFERENT
+    label/short/order for a node it did not name is ignored with a warning —
+    silently dropping it would leave two straddles each believing they titled
+    the pane. A node nobody labels falls back to its title-cased id."""
+    meta: dict[str, dict] = {}
+    for c in contribs:
+        path_ids: list[str] = []
+        for seg in c.segments:
+            path_ids.append(seg["id"])
+            path = "/".join(path_ids)
+            cur = meta.get(path)
+            if cur is None:
+                cur = {"id": seg["id"], "label": None, "short": None, "order": None,
+                       "owner": c.manifest.name}
+                meta[path] = cur
+            for field in ("label", "short", "order"):
+                if field not in seg:
+                    continue
+                if cur[field] is None:
+                    cur[field] = seg[field]
+                elif cur[field] != seg[field]:
+                    warn(f"settings: {c.manifest.name} sets {field}={seg[field]!r} on node "
+                         f"'{path}', which {cur['owner']} already set to {cur[field]!r} "
+                         f"— ignored")
+    for path, cur in meta.items():
+        if cur["label"] is None:
+            cur["label"] = cur["id"][:1].upper() + cur["id"][1:]
+        if cur["short"] is None:
+            cur["short"] = cur["label"]
+    return meta
 
 
-def _settings_lcd_cpp(panels: list[tuple[Manifest, dict]], cfgvals: dict[str, str]) -> tuple[str, str]:
-    """(pane builder function defs, body of spangapSettingsGenRegister) for the
-    LCD half. Each pane becomes a `static void spangapGenPane_N(void*)` filled
-    with lcdSetting* calls; the register fn wires them via lcdRegisterSettings.
-    Buttons emit a tiny storageSet callback each."""
-    defs: list[str] = []
-    reg: list[str] = []
-    for idx, (_m, panel) in enumerate(panels):
-        path, label, placement = _panel_lcd_path(panel)
-        btn_defs: list[str] = []
-        lines = [f"static void spangapGenPane_{idx}(void* arg) {{",
-                 "    lv_obj_t* p = static_cast<lv_obj_t*>(arg);"]
-        bidx = 0
-        for row in panel["rows"]:
-            if not _row_enabled(row, cfgvals):
-                continue
-            kind, spec = _row_kind(row)
-            if kind == "section":
-                lines.append(f"    lcdSettingSection(p, {_cstr(spec)});")
-            elif kind == "caption":
-                lines.append(f"    lcdSettingCaption(p, {_cstr(spec)});")
-            elif kind == "switch":
-                lines.append(f"    lcdSettingSwitch(p, {_cstr(spec['label'])}, {_cstr(spec['key'])});")
-            elif kind == "slider":
-                where = f"{_m.name} slider {spec['key']}"
-                lo, lo_key = _settings_bound(spec["min"], cfgvals, where)
-                hi, hi_key = _settings_bound(spec["max"], cfgvals, where)
-                args = f"{lo}, {hi}"
-                if lo_key or hi_key:
-                    args += f", {_cstr(lo_key) if lo_key else 'nullptr'}"
-                    args += f", {_cstr(hi_key) if hi_key else 'nullptr'}"
-                lines.append(f"    lcdSettingSlider(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}, "
-                             f"{args});")
-            elif kind == "text":
-                secret = ", true" if spec.get("secret") else ""
-                lines.append(f"    lcdSettingText(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}{secret});")
-            elif kind == "dropdown":
-                csv = ",".join(str(o["v"]) for o in spec["options"])
-                lines.append(f"    lcdSettingDropdown(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}, {_cstr(csv)});")
-            elif kind == "value":
-                lines.append(f"    lcdSettingValue(p, {_cstr(spec['label'])}, {_cstr(spec['key'])});")
-            elif kind == "button":
-                fn = f"spangapGenBtn_{idx}_{bidx}"
-                bidx += 1
-                payload = _cstr(spec.get("payload", "1"))
-                btn_defs.append(
-                    f"static void {fn}(void*) {{ storageSet({_cstr(spec['cmd'])}, {payload}); }}")
-                lines.append(f"    lcdSettingButton(p, {_cstr(spec['label'])}, {fn});")
-            elif kind == "list":
-                # A `list` (array-of-objects in storage) is add/remove-edited on
-                # the web side (GeneratedListRow). The LCD shows a note rather
-                # than the editor — matching the existing TCP-peers pane ("edit
-                # peers in web UI"); the core storage API exposes no array reader
-                # to the LCD, and a small keypad is a poor array editor anyway.
-                # A straddle can still surface live per-item status via `value`
-                # rows alongside this list.
-                lines.append('    lcdSettingCaption(p, "Manage this list in the web UI.");')
-        lines.append("}")
-        defs.extend(btn_defs)
-        defs.append("\n".join(lines))
-        if placement:
-            reg.append(f"    lcdRegisterSettings({_cstr(path)}, {_cstr(label)}, spangapGenPane_{idx}, {placement});")
+def _sorted_settings(contribs: list[SettingsContribution]) -> list[SettingsContribution]:
+    """Contributions in the order the runtimes should see them. Sorting here
+    rather than in each runtime is what lets the runtime stores be plain
+    insert-in-arrival-order structures: a node's position among its siblings is
+    established by the first block that mentions it, and blocks at one node
+    stay in their sorted relative order."""
+    return sorted(contribs, key=lambda c: _order_key(c.order, c.arrival))
+
+
+def _sorted_rows(rows: list[dict], cfgvals: dict[str, str]) -> list[dict]:
+    """A row block's surviving rows, in the global sort order. Declaration
+    order is the default; `order:` on a row jumps it ahead of the unordered
+    ones."""
+    live = [r for r in rows if _row_enabled(r, cfgvals)]
+    return [r for _k, r in sorted(
+        ((_order_key(r.get("order"), i), r) for i, r in enumerate(live)),
+        key=lambda pair: pair[0])]
+
+
+def _row_binding(spec) -> tuple[str, str]:
+    """(key, field) of a binding row: rows in a pane bind a storage `key:`,
+    rows in a form or an item editor bind a local `field:`. Exactly one."""
+    if not isinstance(spec, dict):
+        return "", ""
+    return str(spec.get("key", "")), str(spec.get("field", ""))
+
+
+# ---- web lowering -------------------------------------------------------
+
+def _web_action(action: dict, cfgvals: dict[str, str]) -> dict:
+    """An action as the browser's runAction() consumes it. Passed through as
+    data — the same three shapes the yaml declares."""
+    if "set" in action:
+        spec = action["set"]
+        out = {"set": {"key": spec["key"], "value": str(spec["value"])}}
+        if spec.get("edge"):
+            out["set"]["edge"] = True
+        if spec.get("reboots"):
+            out["set"]["reboots"] = True
+        return out
+    if "dialog" in action:
+        spec = action["dialog"]
+        buttons = []
+        for b in spec["buttons"]:
+            btn: dict = {"label": b["label"]}
+            if b.get("danger"):
+                btn["danger"] = True
+            if "do" in b:
+                btn["do"] = _web_action(b["do"], cfgvals)
+            buttons.append(btn)
+        return {"dialog": {"text": spec["text"], "buttons": buttons}}
+    if "form" in action:
+        return {"form": _web_form(action["form"], cfgvals)}
+    die(f"settings action has no kind: {action!r}")
+
+
+def _form_cmd(form: dict, default: str | None, where: str) -> str:
+    """A form's sentinel. A collection's add form inherits `<cmd>.add` rather
+    than restating it — the four sentinel keys stay derived from the one `cmd`
+    name the collection declares."""
+    cmd = form.get("cmd") or default
+    if not cmd:
+        die(f"{where}: a form: action needs a cmd: — the sentinel it submits to")
+    return cmd
+
+
+def _web_form(form: dict, cfgvals: dict[str, str], cmd: str | None = None) -> dict:
+    out = {"fields": [_web_row(r, cfgvals) for r in _sorted_rows(form["fields"], cfgvals)],
+           "cmd": _form_cmd(form, cmd, "settings form")}
+    if "submit" in form:
+        out["submit"] = form["submit"]
+    if "title" in form:
+        out["title"] = form["title"]
+    return out
+
+
+def _web_collection(spec: dict, cfgvals: dict[str, str]) -> dict:
+    out: dict = {"kind": "list", "k": spec["key"], "id": spec["id"],
+                 "item": spec["item"], "cmd": spec["cmd"]}
+    for src, dst in (("label", "label"), ("subtitle", "subtitle"),
+                     ("status", "status"), ("empty", "empty")):
+        if src in spec:
+            out[dst] = spec[src]
+    if spec.get("orderable"):
+        out["orderable"] = True
+    adds = spec.get("add") or []
+    ordered_adds = [a for _k, a in sorted(
+        ((_order_key(a.get("order"), i), a) for i, a in enumerate(adds)),
+        key=lambda pair: pair[0])]
+    if ordered_adds:
+        out["add"] = [{"label": a["label"],
+                       "form": _web_form(a["form"], cfgvals, spec["cmd"] + ".add")}
+                      for a in ordered_adds]
+    if "remove" in spec:
+        rm = spec["remove"] or {}
+        out["remove"] = {"confirm": rm["confirm"]} if "confirm" in rm else {}
+    if spec.get("actions"):
+        out["actions"] = [{"label": a["label"],
+                           **({"danger": True} if a.get("danger") else {}),
+                           "do": _web_action(a["do"], cfgvals)}
+                          for a in spec["actions"]]
+    if spec.get("edit"):
+        out["edit"] = [_web_row(r, cfgvals) for r in _sorted_rows(spec["edit"], cfgvals)]
+    if "candidates" in spec:
+        cand = spec["candidates"]
+        c: dict = {"k": cand["key"], "item": cand["item"]}
+        if "subtitle" in cand:
+            c["subtitle"] = cand["subtitle"]
+        if "refresh" in cand:
+            c["refresh"] = {"label": cand["refresh"]["label"],
+                            "do": _web_action(cand["refresh"]["do"], cfgvals)}
+        if "map" in cand:
+            c["map"] = dict(cand["map"])
+        out["candidates"] = c
+    return out
+
+
+def _web_row(row: dict, cfgvals: dict[str, str]) -> dict:
+    kind, spec = _row_kind(row)
+    if kind in ("section", "caption"):
+        out: dict = {"kind": kind, "text": spec}
+    elif kind == "switch":
+        out = {"kind": "switch", "label": spec["label"]}
+    elif kind == "slider":
+        where = f"slider {spec.get('key') or spec.get('field')}"
+        lo, lo_key = _settings_bound(spec["min"], cfgvals, where)
+        hi, hi_key = _settings_bound(spec["max"], cfgvals, where)
+        out = {"kind": "slider", "label": spec["label"], "min": lo, "max": hi}
+        if lo_key:
+            out["minKey"] = lo_key
+        if hi_key:
+            out["maxKey"] = hi_key
+    elif kind == "text":
+        out = {"kind": "text", "label": spec["label"]}
+        if spec.get("secret"):
+            out["secret"] = True
+        if "placeholder" in spec:
+            out["placeholder"] = spec["placeholder"]
+    elif kind == "dropdown":
+        out = {"kind": "dropdown", "label": spec["label"],
+               "options": [{"value": str(o["v"]), "label": o["l"]} for o in spec["options"]]}
+        if spec.get("searchable"):
+            out["searchable"] = True
+    elif kind == "value":
+        out = {"kind": "value", "label": spec["label"], "k": spec["key"]}
+        if spec.get("copyable"):
+            out["copyable"] = True
+    elif kind == "button":
+        out = {"kind": "button", "label": spec["label"], "do": _web_action(spec["do"], cfgvals)}
+        if spec.get("danger"):
+            out["danger"] = True
+    elif kind == "list":
+        out = _web_collection(spec, cfgvals)
+    else:
+        die(f"settings: unknown row kind {kind!r}")
+
+    if kind in _SETTINGS_BINDING_KINDS:
+        key, field = _row_binding(spec)
+        if key:
+            out["k"] = key
+        if field:
+            out["field"] = field
+        if "default" in spec and field:
+            # Form/item-editor prefill. Never seeded into storage; a template
+            # over sibling fields is resolved live by the form until the
+            # operator edits the field.
+            dv = spec["default"]
+            out["dflt"] = str(int(dv)) if isinstance(dv, bool) else str(dv)
+    if "when_key" in row:
+        out["whenKey"] = row["when_key"]
+    return out
+
+
+def _settings_web_nodes(contribs: list[SettingsContribution],
+                        meta: dict[str, dict],
+                        cfgvals: dict[str, str]) -> list[dict]:
+    """The browser-side node fragments, serialized into straddles.gen.ts. Each
+    is a path (segments carrying their resolved naming) plus one row block; the
+    settings-tree store merges them by segment id."""
+    out: list[dict] = []
+    for c in _sorted_settings(contribs):
+        segments = []
+        path_ids: list[str] = []
+        for seg in c.segments:
+            path_ids.append(seg["id"])
+            m = meta["/".join(path_ids)]
+            s: dict = {"id": m["id"], "label": m["label"]}
+            if m["short"] != m["label"]:
+                s["short"] = m["short"]
+            if m["order"] is not None:
+                s["order"] = int(m["order"])
+            segments.append(s)
+        out.append({"segments": segments,
+                    "rows": [_web_row(r, cfgvals) for r in _sorted_rows(c.rows, cfgvals)]})
+    return out
+
+
+# ---- LCD lowering -------------------------------------------------------
+
+_LCD_ROW_KIND = {
+    "section": "LCD_ROW_SECTION", "caption": "LCD_ROW_CAPTION",
+    "switch": "LCD_ROW_SWITCH", "slider": "LCD_ROW_SLIDER",
+    "text": "LCD_ROW_TEXT", "dropdown": "LCD_ROW_DROPDOWN",
+    "value": "LCD_ROW_VALUE", "button": "LCD_ROW_BUTTON",
+    "list": "LCD_ROW_LIST",
+}
+
+
+class _LcdSettingsEmitter:
+    """Lowers the settings tree to the LCD half.
+
+    Simple rows stay CALLS — one `lcdSetting*` per row inside a per-contribution
+    builder function, which is what a hand-written pane writes by hand and what
+    keeps the two indistinguishable. Collections, forms and dialogs instead
+    become static DESCRIPTOR STRUCTS consumed by generic runtime functions:
+    generating data rather than logic keeps the generated file small and puts
+    the behaviour in one reviewable place, the same argument that chose a
+    runtime-interpreted descriptor over generated Vue components on the web
+    side. Every string is emitted as a literal, so the settings helpers'
+    by-pointer key-lifetime rule holds for free."""
+
+    def __init__(self, cfgvals: dict[str, str]):
+        self.cfgvals = cfgvals
+        self.defs: list[str] = []      # static descriptors, in dependency order
+        self.n = 0                     # unique-symbol counter
+
+    def _sym(self, stem: str) -> str:
+        self.n += 1
+        return f"spangapGenSet{stem}_{self.n}"
+
+    # -- descriptors --
+
+    def action(self, action: dict) -> str:
+        """Emit an lcd_action_t and return its address expression."""
+        kind, key, value, edge, reboots = "LCD_ACT_SET", "nullptr", "nullptr", "false", "false"
+        dialog, form = "nullptr", "nullptr"
+        if "set" in action:
+            spec = action["set"]
+            key, value = _cstr(spec["key"]), _cstr(str(spec["value"]))
+            edge = "true" if spec.get("edge") else "false"
+            reboots = "true" if spec.get("reboots") else "false"
+        elif "dialog" in action:
+            kind, dialog = "LCD_ACT_DIALOG", self.dialog(action["dialog"])
+        elif "form" in action:
+            kind, form = "LCD_ACT_FORM", self.form(action["form"])
         else:
-            reg.append(f"    lcdRegisterSettings({_cstr(path)}, {_cstr(label)}, spangapGenPane_{idx});")
-    return "\n\n".join(defs), "\n".join(reg)
+            die(f"settings action has no kind: {action!r}")
+        sym = self._sym("Act")
+        self.defs.append(
+            f"static const lcd_action_t {sym} = {{ .kind = {kind}, .key = {key},\n"
+            f"    .value = {value}, .edge = {edge}, .reboots = {reboots},\n"
+            f"    .dialog = {dialog}, .form = {form} }};")
+        return f"&{sym}"
+
+    def dialog(self, spec: dict) -> str:
+        btns = [(b, self.action(b["do"]) if "do" in b else "nullptr") for b in spec["buttons"]]
+        bsym = self._sym("DlgBtns")
+        lines = [f"static const lcd_dlg_btn_t {bsym}[] = {{"]
+        for b, act in btns:
+            lines.append(f"    {{ .label = {_cstr(b['label'])}, "
+                         f".danger = {'true' if b.get('danger') else 'false'}, .act = {act} }},")
+        lines.append("};")
+        self.defs.append("\n".join(lines))
+        sym = self._sym("Dlg")
+        self.defs.append(
+            f"static const lcd_dialog_t {sym} = {{ .text = {_cstr(spec['text'])},\n"
+            f"    .buttons = {bsym}, .nbuttons = {len(btns)} }};")
+        return f"&{sym}"
+
+    def rows_array(self, rows: list[dict]) -> tuple[str, int]:
+        """Emit an lcd_row_t[] (form fields / item-editor rows) and return
+        (symbol, count). Unlike a pane's rows these are DATA — the runtime
+        builds them against a local field buffer, not against storage."""
+        live = _sorted_rows(rows, self.cfgvals)
+        inner = [self.row_struct(r) for r in live]   # emit nested descriptors first
+        sym = self._sym("Rows")
+        lines = [f"static const lcd_row_t {sym}[] = {{"]
+        lines.extend(inner)
+        lines.append("};")
+        self.defs.append("\n".join(lines))
+        return sym, len(live)
+
+    def row_struct(self, row: dict) -> str:
+        """One lcd_row_t initializer line (fields in declaration order, so the
+        designated initializers stay legal C++)."""
+        kind, spec = _row_kind(row)
+        f: dict[str, str] = {"kind": _LCD_ROW_KIND[kind]}
+        if kind in ("section", "caption"):
+            f["label"] = _cstr(spec)
+        else:
+            f["label"] = _cstr(spec["label"])
+        if isinstance(spec, dict):
+            key, field = _row_binding(spec)
+            if key:
+                f["key"] = _cstr(key)
+            if field:
+                f["field"] = _cstr(field)
+        if "when_key" in row:
+            f["when_key"] = _cstr(row["when_key"])
+        if kind == "slider":
+            where = f"slider {spec.get('key') or spec.get('field')}"
+            lo, lo_key = _settings_bound(spec["min"], self.cfgvals, where)
+            hi, hi_key = _settings_bound(spec["max"], self.cfgvals, where)
+            f["min"], f["max"] = str(lo), str(hi)
+            if lo_key:
+                f["min_key"] = _cstr(lo_key)
+            if hi_key:
+                f["max_key"] = _cstr(hi_key)
+        if kind == "text":
+            if spec.get("secret"):
+                f["secret"] = "true"
+            if "placeholder" in spec:
+                f["placeholder"] = _cstr(spec["placeholder"])
+        if kind == "value" and spec.get("copyable"):
+            f["copyable"] = "true"
+        if kind == "dropdown":
+            f["options"] = _cstr("\n".join(str(o["v"]) for o in spec["options"]))
+            f["opt_labels"] = _cstr("\n".join(str(o["l"]) for o in spec["options"]))
+        if isinstance(spec, dict) and "default" in spec and spec.get("field"):
+            dv = spec["default"]
+            f["dflt"] = _cstr("1" if dv is True else "0" if dv is False else str(dv))
+        if kind == "button":
+            f["act"] = self.action(spec["do"])
+        if kind == "list":
+            f["coll"] = self.collection(spec)
+        body = ", ".join(f".{k} = {v}" for k, v in f.items())
+        return f"    {{ {body} }},"
+
+    def form(self, spec: dict, cmd: str | None = None) -> str:
+        rows_sym, n = self.rows_array(spec["fields"])
+        sym = self._sym("Form")
+        self.defs.append(
+            f"static const lcd_form_t {sym} = {{ .fields = {rows_sym}, .nfields = {n},\n"
+            f"    .cmd = {_cstr(_form_cmd(spec, cmd, 'settings form'))}, "
+            f".submit = {_cstr(spec.get('submit', 'Save'))}, "
+            f".title = {_cstr(spec.get('title', ''))} }};")
+        return f"&{sym}"
+
+    def collection(self, spec: dict) -> str:
+        adds = spec.get("add") or []
+        ordered_adds = [a for _k, a in sorted(
+            ((_order_key(a.get("order"), i), a) for i, a in enumerate(adds)),
+            key=lambda pair: pair[0])]
+        adds_sym = "nullptr"
+        if ordered_adds:
+            forms = [(a, self.form(a["form"], spec["cmd"] + ".add")) for a in ordered_adds]
+            adds_sym = self._sym("Adds")
+            lines = [f"static const lcd_add_t {adds_sym}[] = {{"]
+            for a, fsym in forms:
+                lines.append(f"    {{ .label = {_cstr(a['label'])}, .form = {fsym} }},")
+            lines.append("};")
+            self.defs.append("\n".join(lines))
+
+        acts_sym = "nullptr"
+        if spec.get("actions"):
+            acts = [(a, self.action(a["do"])) for a in spec["actions"]]
+            acts_sym = self._sym("ItemActs")
+            lines = [f"static const lcd_item_action_t {acts_sym}[] = {{"]
+            for a, asym in acts:
+                lines.append(f"    {{ .label = {_cstr(a['label'])}, "
+                             f".danger = {'true' if a.get('danger') else 'false'}, .act = {asym} }},")
+            lines.append("};")
+            self.defs.append("\n".join(lines))
+
+        edit_sym, nedit = ("nullptr", 0)
+        if spec.get("edit"):
+            edit_sym, nedit = self.rows_array(spec["edit"])
+
+        cand_sym = "nullptr"
+        if "candidates" in spec:
+            cand = spec["candidates"]
+            refresh = self.action(cand["refresh"]["do"]) if "refresh" in cand else "nullptr"
+            # candidate-field -> add-form-field renames, as "from:to,from:to".
+            mapping = ",".join(f"{k}:{v}" for k, v in (cand.get("map") or {}).items())
+            cand_sym = self._sym("Cand")
+            self.defs.append(
+                f"static const lcd_candidates_t {cand_sym} = {{ .key = {_cstr(cand['key'])},\n"
+                f"    .item = {_cstr(cand['item'])}, "
+                f".subtitle = {_cstr(cand.get('subtitle', ''))},\n"
+                f"    .refresh_label = "
+                f"{_cstr(cand['refresh']['label']) if 'refresh' in cand else 'nullptr'},\n"
+                f"    .refresh = {refresh}, .map = {_cstr(mapping)} }};")
+            cand_sym = f"&{cand_sym}"
+
+        rm = spec.get("remove")
+        sym = self._sym("Coll")
+        self.defs.append(
+            f"static const lcd_collection_t {sym} = {{\n"
+            f"    .label = {_cstr(spec.get('label', ''))}, .key = {_cstr(spec['key'])},\n"
+            f"    .id = {_cstr(spec['id'])}, .item = {_cstr(spec['item'])},\n"
+            f"    .subtitle = {_cstr(spec.get('subtitle', ''))}, "
+            f".status = {_cstr(spec.get('status', ''))},\n"
+            f"    .empty = {_cstr(spec.get('empty', ''))}, "
+            f".orderable = {'true' if spec.get('orderable') else 'false'},\n"
+            f"    .cmd = {_cstr(spec['cmd'])},\n"
+            f"    .adds = {adds_sym}, .nadds = {len(ordered_adds)},\n"
+            f"    .has_remove = {'true' if rm is not None else 'false'},\n"
+            f"    .remove_confirm = {_cstr((rm or {}).get('confirm', ''))},\n"
+            f"    .actions = {acts_sym}, .nactions = {len(spec.get('actions') or [])},\n"
+            f"    .edit = {edit_sym}, .nedit = {nedit},\n"
+            f"    .candidates = {cand_sym} }};")
+        return f"&{sym}"
+
+    # -- pane builders --
+
+    def pane_call(self, row: dict) -> str:
+        """The lcdSetting* call for one pane row, wrapped in the `when_key`
+        visibility helper when the row carries one (every helper returns its
+        row object, so the wrap composes)."""
+        kind, spec = _row_kind(row)
+        if kind == "section":
+            call = f"lcdSettingSection(p, {_cstr(spec)})"
+        elif kind == "caption":
+            call = f"lcdSettingCaption(p, {_cstr(spec)})"
+        elif kind == "switch":
+            call = f"lcdSettingSwitch(p, {_cstr(spec['label'])}, {_cstr(spec['key'])})"
+        elif kind == "slider":
+            where = f"slider {spec['key']}"
+            lo, lo_key = _settings_bound(spec["min"], self.cfgvals, where)
+            hi, hi_key = _settings_bound(spec["max"], self.cfgvals, where)
+            args = f"{lo}, {hi}"
+            if lo_key or hi_key:
+                args += f", {_cstr(lo_key) if lo_key else 'nullptr'}"
+                args += f", {_cstr(hi_key) if hi_key else 'nullptr'}"
+            call = f"lcdSettingSlider(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}, {args})"
+        elif kind == "text":
+            secret = ", true" if spec.get("secret") else ""
+            call = f"lcdSettingText(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}{secret})"
+        elif kind == "dropdown":
+            csv = ",".join(str(o["v"]) for o in spec["options"])
+            call = (f"lcdSettingDropdown(p, {_cstr(spec['label'])}, "
+                    f"{_cstr(spec['key'])}, {_cstr(csv)})")
+        elif kind == "value":
+            call = f"lcdSettingValue(p, {_cstr(spec['label'])}, {_cstr(spec['key'])})"
+        elif kind == "button":
+            call = f"lcdSettingAction(p, {_cstr(spec['label'])}, {self.action(spec['do'])})"
+        elif kind == "list":
+            call = f"lcdSettingCollection(p, {self.collection(spec)})"
+        else:
+            die(f"settings: unknown row kind {kind!r}")
+        if "when_key" in row:
+            call = f"lcdSettingWhenKey({call}, {_cstr(row['when_key'])})"
+        return f"    {call};"
+
+    def contribution(self, idx: int, c: SettingsContribution,
+                     meta: dict[str, dict]) -> tuple[str, str]:
+        """(segment-array symbol, builder symbol or 'nullptr') for one
+        contribution; its descriptors and builder land in self.defs."""
+        seg_sym = f"spangapGenSetSegs_{idx}"
+        lines = [f"static const lcd_seg_t {seg_sym}[] = {{"]
+        path_ids: list[str] = []
+        for seg in c.segments:
+            path_ids.append(seg["id"])
+            m = meta["/".join(path_ids)]
+            order = "0, .has_order = false" if m["order"] is None \
+                else f"{int(m['order'])}, .has_order = true"
+            lines.append(f"    {{ .id = {_cstr(m['id'])}, .label = {_cstr(m['label'])}, "
+                         f".shortName = {_cstr(m['short'])}, .order = {order} }},")
+        lines.append("};")
+        self.defs.append("\n".join(lines))
+
+        rows = _sorted_rows(c.rows, self.cfgvals)
+        if not rows:
+            return seg_sym, "nullptr"
+        calls = [self.pane_call(r) for r in rows]   # emits nested descriptors first
+        fn = f"spangapGenSetPane_{idx}"
+        self.defs.append(
+            f"static void {fn}(void* arg) {{\n"
+            f"    lv_obj_t* p = static_cast<lv_obj_t*>(arg);\n"
+            + "\n".join(calls) + "\n}")
+        return seg_sym, fn
 
 
-def _settings_defaults_cpp(panels: list[tuple[Manifest, dict]], cfgvals: dict[str, str]) -> str:
+def _settings_lcd_cpp(contribs: list[SettingsContribution],
+                      meta: dict[str, dict],
+                      cfgvals: dict[str, str]) -> tuple[str, str]:
+    """(static descriptors + builder defs, body of spangapSettingsGenRegister)
+    for the LCD half."""
+    em = _LcdSettingsEmitter(cfgvals)
+    reg: list[str] = []
+    for idx, c in enumerate(_sorted_settings(contribs)):
+        seg_sym, fn = em.contribution(idx, c, meta)
+        reg.append(f"    lcdSettingsContribute({seg_sym}, "
+                   f"{len(c.segments)}, {fn});")
+    return "\n\n".join(em.defs), "\n".join(reg)
+
+
+# ---- storage defaults ---------------------------------------------------
+
+def _settings_defaults_cpp(contribs: list[SettingsContribution],
+                           cfgvals: dict[str, str]) -> str:
     """Body of spangapSettingsGenDefaults — one storageDefault() per binding row
     that carries a `default:` and whose key is persisted config (`s.` prefix).
-    Bare/ephemeral keys (value rows) and secrets are never seeded here."""
+
+    Ephemeral keys, secrets and FORM FIELDS are never seeded: a form field's
+    `default:` is prefill for the dialog, not a value the device should hold
+    before anyone submits one."""
     lines: list[str] = []
+    seen: set[str] = set()
 
     def walk(rows: list[dict]) -> None:
         for row in rows:
             if not _row_enabled(row, cfgvals):
                 continue
             kind, spec = _row_kind(row)
-            if kind == "list":
-                walk(spec.get("fields", []))
-                continue
             if kind not in _SETTINGS_BINDING_KINDS or not isinstance(spec, dict):
-                continue
+                continue          # a list's own rows are all `field:` rows
             if "default" not in spec:
                 continue
-            key = spec["key"]
-            if not key.startswith("s."):
+            key = spec.get("key")
+            if not key or not key.startswith("s."):
                 continue
+            if key in seen:
+                continue
+            seen.add(key)
             dv = spec["default"]
             if isinstance(dv, bool):
                 lit = "1" if dv else "0"
@@ -1377,81 +1876,9 @@ def _settings_defaults_cpp(panels: list[tuple[Manifest, dict]], cfgvals: dict[st
                 lit = _cstr(str(dv))
             lines.append(f"    storageDefault({_cstr(key)}, {lit});")
 
-    for _m, panel in panels:
-        walk(panel["rows"])
+    for c in contribs:
+        walk(c.rows)
     return "\n".join(lines)
-
-
-def _settings_web_descriptors(panels: list[tuple[Manifest, dict]], cfgvals: dict[str, str]) -> list[dict]:
-    """The browser-side descriptor objects (serialized into straddles.gen.ts).
-    Carries the web menu path/containers and normalized rows the GeneratedPanel
-    interprets at runtime."""
-    def web_row(row: dict) -> dict:
-        kind, spec = _row_kind(row)
-        if kind in ("section", "caption"):
-            return {"kind": kind, "text": spec}
-        if kind == "switch":
-            return {"kind": "switch", "label": spec["label"], "k": spec["key"]}
-        if kind == "slider":
-            lo, lo_key = _settings_bound(spec["min"], cfgvals, f"slider {spec['key']}")
-            hi, hi_key = _settings_bound(spec["max"], cfgvals, f"slider {spec['key']}")
-            r = {"kind": "slider", "label": spec["label"], "k": spec["key"],
-                 "min": lo, "max": hi}
-            if lo_key: r["minKey"] = lo_key
-            if hi_key: r["maxKey"] = hi_key
-            return r
-        if kind == "text":
-            r = {"kind": "text", "label": spec["label"], "k": spec["key"]}
-            if spec.get("secret"):
-                r["secret"] = True
-            return r
-        if kind == "dropdown":
-            return {"kind": "dropdown", "label": spec["label"], "k": spec["key"],
-                    "options": [{"value": str(o["v"]), "label": o["l"]} for o in spec["options"]]}
-        if kind == "value":
-            return {"kind": "value", "label": spec["label"], "k": spec["key"]}
-        if kind == "button":
-            r = {"kind": "button", "label": spec["label"], "cmd": spec["cmd"]}
-            if "payload" in spec:
-                r["payload"] = spec["payload"]
-            return r
-        if kind == "list":
-            return {"kind": "list", "k": spec["key"], "itemLabel": spec["item_label"],
-                    "add": spec.get("add", {}).get("cmd", ""),
-                    "remove": spec.get("remove", {}).get("cmd", ""),
-                    "fields": [web_row(f) for f in spec.get("fields", [])
-                               if _row_enabled(f, cfgvals)]}
-        return {"kind": kind}
-
-    out: list[dict] = []
-    for _m, panel in panels:
-        # web: false suppresses the generated web panel — the straddle keeps a
-        # hand-written *Panel.vue at the same menu leaf (rich custom UI a static
-        # descriptor can't express). The LCD pane + storage defaults are still
-        # generated from this same block; only the web surface is opted out.
-        if not panel.get("web", True):
-            continue
-        menu = panel["menu"]
-        ids = [seg["id"] for seg in menu]
-        leaf = menu[-1]
-        containers = []
-        for i, seg in enumerate(menu[:-1]):
-            c = {"path": "settings/" + "/".join(ids[:i + 1]), "label": seg["label"]}
-            # Only carry placement when the descriptor sets it — otherwise we'd
-            # clobber a container's placement that another straddle established.
-            if "placement" in seg:
-                c["placement"] = int(seg["placement"])
-            containers.append(c)
-        entry = {
-            "id": "settings/" + "/".join(ids),
-            "label": leaf["label"],
-            "containers": containers,
-            "rows": [web_row(r) for r in panel["rows"] if _row_enabled(r, cfgvals)],
-        }
-        if "placement" in leaf:
-            entry["placement"] = int(leaf["placement"])
-        out.append(entry)
-    return out
 
 
 def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
@@ -1624,16 +2051,17 @@ def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
     #   spangapSettingsGenDefaults() — storageDefault() seeding, ALWAYS emitted
     #     (web-only/headless builds seed defaults too); called after spangapInit()
     #     so the values exist before any straddle init reads them.
-    #   spangapSettingsGenRegister() — the LCD panes (lcdRegisterSettings + the
-    #     lcdSetting* calls), emitted with a body ONLY when spangap-lcd is staged
-    #     (else an empty stub); called after the serviceRunInit() walk so the lcd
-    #     task and the "Internet"/"Mesh Network" submenus already exist.
-    panels = collect_settings(proj, deps)
+    #   spangapSettingsGenRegister() — the LCD tree (lcdSettingsContribute + the
+    #     lcdSetting* calls and the collection/form/dialog descriptors), emitted
+    #     with a body ONLY when spangap-lcd is staged (else an empty stub);
+    #     called after the serviceRunInit() walk so the lcd task is up.
+    contribs = collect_settings(proj, deps)
     cfgvals = collect_kconfig_values(proj, deps)
+    node_meta = _settings_node_meta(contribs)
     lcd_staged = "spangap/spangap-lcd" in staged_names
-    defaults_body = _settings_defaults_cpp(panels, cfgvals)
+    defaults_body = _settings_defaults_cpp(contribs, cfgvals)
     if lcd_staged:
-        pane_defs, register_body = _settings_lcd_cpp(panels, cfgvals)
+        pane_defs, register_body = _settings_lcd_cpp(contribs, node_meta, cfgvals)
         lcd_include = '#include \"lcd.h\"\n'
     else:
         pane_defs, register_body = "", ""
@@ -1807,20 +2235,22 @@ def write_browser_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
                       for pkg, module, call in regs)
     body_calls = "".join(f"  {call}()\n" for _, _, call in regs)
 
-    # Declarative settings (straddle.yaml `settings:`) web half: the panel
-    # descriptors, serialized as a JS object literal and registered at runtime
-    # by spangap-web's GeneratedPanel renderer. No separate asset, no YAML parser
-    # in the SPA — it tree-shakes with the module. Registered LAST so the
-    # containers other straddles' register* hooks set up already exist.
-    panels = _settings_web_descriptors(collect_settings(proj, deps), collect_kconfig_values(proj, deps))
+    # Declarative settings (straddle.yaml `settings:`) web half: the node-tree
+    # fragments, serialized as a JS array literal and merged at runtime into the
+    # settings-tree store, which one renderer interprets. No separate asset, no
+    # YAML parser in the SPA — it tree-shakes with the module. Registered LAST
+    # so nodes other straddles' register* hooks named already exist.
+    _contribs = collect_settings(proj, deps)
+    nodes = _settings_web_nodes(_contribs, _settings_node_meta(_contribs),
+                                collect_kconfig_values(proj, deps))
     gen_import = ""
     gen_decl = ""
     gen_call = ""
-    if panels:
-        gen_import = "import { registerGeneratedPanels } from 'spangap-browser/lib/generatedPanels'\n"
-        gen_decl = ("\nconst GENERATED_PANELS = "
-                    + json.dumps(panels, indent=2) + "\n")
-        gen_call = "  registerGeneratedPanels(GENERATED_PANELS)\n"
+    if nodes:
+        gen_import = "import { registerSettingsNodes } from 'spangap-browser/lib/settingsNodes'\n"
+        gen_decl = ("\nconst SETTINGS_NODES = "
+                    + json.dumps(nodes, indent=2) + "\n")
+        gen_call = "  registerSettingsNodes(SETTINGS_NODES)\n"
 
     # Dock app icons: glob the staged src/app-icons/*.svg as raw strings so they
     # bundle INTO app.js (the only thing the device webroot ships) and register
@@ -1840,8 +2270,9 @@ def write_browser_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
         " *   ... registerStraddles()\n"
         " * Staging a browser_register straddle is enough to surface its pane — no\n"
         " * edit here, no modules.ts edit. `when:`-gated hooks appear only when\n"
-        " * their gating straddle is staged. GENERATED_PANELS holds the declarative\n"
-        " * `settings:` descriptors, rendered at runtime by GeneratedPanel.vue;\n"
+        " * their gating straddle is staged. SETTINGS_NODES holds the declarative\n"
+        " * `settings:` tree fragments, merged into the settings-tree store and\n"
+        " * rendered at runtime by NodePane.vue;\n"
         " * APP_ICONS are the launcher SVGs bundled for the bottom Dock. */\n"
         f"{imports}"
         f"{gen_import}"

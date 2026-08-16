@@ -5,7 +5,11 @@
   "description": "Distributable feature/app unit that spans firmware + browser. See docs/plans/straddles.md.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["name", "prefix", "version"],
+  "required": [
+    "name",
+    "prefix",
+    "version"
+  ],
   "properties": {
     "schema_version": {
       "description": "Schema revision; reserved for future evolution.",
@@ -56,8 +60,15 @@
       "description": "Which build platforms this straddle's firmware half supports. Today: just idf.",
       "type": "array",
       "minItems": 1,
-      "items": { "type": "string", "enum": ["idf"] },
-      "default": ["idf"]
+      "items": {
+        "type": "string",
+        "enum": [
+          "idf"
+        ]
+      },
+      "default": [
+        "idf"
+      ]
     },
     "requires": {
       "description": "Other straddles this one HARD-depends on — every build that pulls in this straddle must also pull in these. Each entry is '<org>/<repo>' optionally followed by '@<ref>' (tag/branch/SHA). A missing requires: target is a build error.",
@@ -80,7 +91,9 @@
           {
             "type": "object",
             "additionalProperties": false,
-            "required": ["install"],
+            "required": [
+              "install"
+            ],
             "properties": {
               "install": {
                 "description": "The straddle to stage — same '<org>/<repo>[@ref]' spec as the plain-string form.",
@@ -104,7 +117,9 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["call"],
+        "required": [
+          "call"
+        ],
         "properties": {
           "call": {
             "description": "Start function symbol, e.g. 'tdeckStart'. A plain global `void <name>()` (default C++ linkage) defined in this straddle's firmware half — same convention as init:'s xInit. The dispatcher forward-declares it with C++ linkage and calls it, so no header wiring and no `extern \"C\"` wrapper is needed (a C-linkage symbol from a .c file would need one to match).",
@@ -126,7 +141,9 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["call"],
+        "required": [
+          "call"
+        ],
         "properties": {
           "call": {
             "description": "Init function symbol, e.g. 'sshdInit'. A plain global `void <name>()` (default C++ linkage) defined in this straddle's firmware half — the same convention every straddle's xInit() already follows. The dispatcher forward-declares it with C++ linkage and calls it, so no header wiring and no `extern \"C\"` wrapper is needed (a C-linkage symbol from a .c file would need one to match).",
@@ -148,7 +165,9 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["call"],
+        "required": [
+          "call"
+        ],
         "properties": {
           "call": {
             "description": "Exported registration function to import and call, e.g. 'registerWg'. A named export of this straddle's browser package, conventionally from the modules/<repo> entry point (see `module`). Its job is to register the straddle's UI (menu panes via useMenuStore().register, etc.). The casing is not derivable from the repo name (e.g. duckdns exports registerDuckDns), which is why it is declared explicitly.",
@@ -181,7 +200,10 @@
           {
             "type": "object",
             "additionalProperties": false,
-            "required": ["when", "set"],
+            "required": [
+              "when",
+              "set"
+            ],
             "properties": {
               "when": {
                 "type": "string",
@@ -203,13 +225,17 @@
     "services": {
       "description": "Boot-registered Service objects (see spangap-core service.h) this straddle contributes. The modern replacement for start:/init: free-function hooks: instead of declaring a bare `void xInit()` symbol, declare a Service SUBCLASS and the generated boot code constructs it and appends it to the ordered registry (serviceRegister) at the straddle's init_order position. The object participates in a boot phase purely by overriding that phase's virtual (onStart pre-spangapInit / onInit post-spangapInit) — the generator never learns which phases a class overrides. spangap-inside emits, per entry, a per-straddle trampoline TU (staging/components/<repo>/spangap_services.gen.cpp) that #includes the class header and defines spangapService_<Class>() { serviceRegister(new <Class>()); }; the generated app_main forward-declares and calls that symbol in boot order. The trampoline rides SPANGAP_CONDITIONAL_SRCS (the straddle's CMakeLists must already compile ${SPANGAP_CONDITIONAL_SRCS} in SRCS — the same list conditional/ code uses), and the class header must be on the component's include path (e.g. a public include/ header, or a conditional/<name>/include header when the class is gated). Class requirements: external linkage, GLOBAL (no namespace — the codebase disambiguates by symbol prefix), default-constructible with an ECOSYSTEM-FREE ctor (member init only — storage/fs/log/cli/ITS are NOT up when ctors run at the very top of app_main). An LcdApp is a Service, so an on-device app is just a services: entry. Same `when:` gating as init:. Within one straddle, legacy init: entries register before services: entries.",
       "type": "array",
-      "items": { "$ref": "#/$defs/serviceEntry" },
+      "items": {
+        "$ref": "#/$defs/serviceEntry"
+      },
       "default": []
     },
     "settings": {
-      "description": "Declarative settings panels — one descriptor per settings pane. spangap-inside lowers each panel into THREE generated surfaces from this single source: (1) the on-device LCD pane (lcdRegisterSettings + lcdSetting* calls, gated on spangap-lcd being staged), (2) the browser panel (serialized as a JSON descriptor inlined into straddles.gen.ts and rendered at runtime by spangap-web's GeneratedPanel.vue, registered through the menu store), and (3) the persisted storage defaults (storageDefault() for every row carrying a `default:` whose key starts with `s.`). This replaces the three-way hand-duplication of a setting across a *_lcd.cpp pane fn, a *Panel.vue, and scattered storageDefault() calls. A straddle declaring a settings: block deletes those three copies. Custom interaction flows, computed/conditional rows, and rich live-status panels stay hand-written (register a pane the old way) — the descriptor is for the static rows. The default-seeding is emitted into the firmware init band (runs on headless/web-only builds too), the LCD pane only when spangap-lcd is staged.",
+      "description": "Declarative settings — a list of CONTRIBUTIONS to one shared settings tree. Every node in that tree may hold both key/value rows and sub-nodes (rows render first, then the children as navigation entries), and no node is owned: a contribution names a path with `at:`, every intermediate node on the way is conjured, and several straddles contributing at the same path simply concatenate their row blocks. spangap-inside lowers the collected tree into THREE generated surfaces from this single source: (1) the on-device LCD node (lcdSettingsContribute + lcdSetting* calls, gated on spangap-lcd being staged), (2) the browser node fragment (serialized into straddles.gen.ts and interpreted at runtime by spangap-web's NodePane renderer), and (3) the persisted storage defaults (storageDefault() for every binding row carrying a `default:` whose key starts with `s.`). Two conventions carry the expressiveness: firmware publishes FINISHED STRINGS (any derived display value — signal wording, composed counters, formatted percentages — is written to an ephemeral key as the exact text to show, and gate keys are truthy/empty; UIs never compute or compare), and firmware VALIDATES IN SENTINEL HANDLERS (a mutation lands on a command key, the owning task validates it and on rejection writes a human-readable reason to `<cmd>.error`, cleared on the next successful write; UIs submit and display, they never validate).",
       "type": "array",
-      "items": { "$ref": "#/$defs/settingsPanel" },
+      "items": {
+        "$ref": "#/$defs/settingsPanel"
+      },
       "default": []
     }
   },
@@ -217,7 +243,10 @@
     "serviceEntry": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["class", "header"],
+      "required": [
+        "class",
+        "header"
+      ],
       "properties": {
         "class": {
           "description": "The Service subclass to construct and register, e.g. 'MapsApp'. GLOBAL (no namespace), external linkage, default-constructible with an ecosystem-free ctor. Its instance is `new`'d once at boot and lives forever. The generated trampoline symbol is spangapService_<class>.",
@@ -239,45 +268,72 @@
     "settingsPanel": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["menu", "rows"],
+      "required": [
+        "at"
+      ],
       "properties": {
-        "web": {
-          "type": "boolean",
-          "description": "Whether to generate the browser-side GeneratedPanel for this block (default true). Set false when the straddle ships a hand-written *Panel.vue at the same menu leaf — rich custom UI (array editors, secret fields, computed status, autocomplete) a static descriptor can't express. With web:false the LCD pane and storage defaults are still generated from this block; only the web surface is opted out, so the hand-written panel keeps owning the leaf and is not overwritten."
-        },
-        "menu": {
-          "description": "The panel's location, as an ordered list of path segments from the Settings root to the leaf (the last segment is the leaf, the rest are containers). A single segment is a top-level pane sitting at the Settings root (no container), matching a hand-written lcdRegisterSettings(\"Maps\", ...). Each segment carries an `id` (the stable lowercase slug, used to build the web menu path 'settings/<id>/<id>/...' and to merge with containers other straddles register at the same id) and a `label` (the human title — joined with '/' to form the LCD lcdRegisterSettings path, e.g. 'Mesh Network/RNS Interfaces/LoRa'). This dual representation is required because the two surfaces genuinely differ: the web menu store keys containers by lowercase id and overrides their labels via setMenu, while the LCD settings tree keys by the human label directly.",
+        "at": {
+          "description": "Where this contribution lands, as an ordered list of path segments from the Settings root. EVERY segment names a node, and the last one is where the rows go — there is no leaf/container distinction, because a node holds rows AND children. Intermediate nodes are conjured; no node is owned, so several straddles may contribute rows at the same path and their blocks concatenate in the global order rule. Each segment carries `id` (the stable lowercase slug — the merge key, and the node's path id on both surfaces), and optionally `label` (long name), `short` (the LCD header name; defaults to the label) and `order`. The FIRST contributor (in straddle init order) to supply a label/short/order for a node wins; a later conflicting value is ignored with a build-time warning.",
           "type": "array",
           "minItems": 1,
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["id", "label"],
+            "required": [
+              "id"
+            ],
             "properties": {
-              "id": { "type": "string", "pattern": "^[a-z0-9_-]+$" },
-              "label": { "type": "string" },
-              "placement": { "type": "integer" }
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z0-9_-]+$"
+              },
+              "label": {
+                "type": "string"
+              },
+              "short": {
+                "type": "string"
+              },
+              "order": {
+                "type": "integer"
+              }
             }
           }
         },
         "rows": {
-          "description": "The pane's rows, top to bottom. Each row is a single-key object whose key is the row kind (section/caption/switch/slider/text/dropdown/value/button/list).",
+          "description": "The rows this contribution adds to the node, top to bottom. Each row is an object whose kind key (section/caption/switch/slider/text/dropdown/value/button/list) carries the spec, plus the optional `when_kconfig`/`when_key`/`order` modifiers.",
           "type": "array",
-          "items": { "$ref": "#/$defs/settingsRow" }
+          "items": {
+            "$ref": "#/$defs/settingsRow"
+          },
+          "default": []
+        },
+        "order": {
+          "description": "Orders this contribution's row block among the other blocks at the same node. Follows the global rule: blocks with `order:` first, ascending; blocks without it after them, in (straddle init order, declaration order).",
+          "type": "integer"
         }
       }
     },
     "settingsScalar": {
       "description": "A settings integer, either literal or { kconfig: CONFIG_NAME, default: N } — resolved at build time from the staged set's collected kconfig: fragments, so a board can size a control to its hardware. The default applies when no straddle sets the symbol.",
       "oneOf": [
-        { "type": "integer" },
+        {
+          "type": "integer"
+        },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kconfig", "default"],
+          "required": [
+            "kconfig",
+            "default"
+          ],
           "properties": {
-            "kconfig": { "type": "string", "pattern": "^CONFIG_[A-Z0-9_]+$" },
-            "default": { "type": "integer" }
+            "kconfig": {
+              "type": "string",
+              "pattern": "^CONFIG_[A-Z0-9_]+$"
+            },
+            "default": {
+              "type": "integer"
+            }
           }
         }
       ]
@@ -285,136 +341,535 @@
     "settingsBound": {
       "description": "A slider bound: a settingsScalar, or { key: <storage key>, default: N } — read from a value the device publishes at run time rather than fixed at build time. Use it when the firmware knows the real limit and the build does not, e.g. a capability detected on the hardware itself. The default applies until the key exists.",
       "oneOf": [
-        { "$ref": "#/$defs/settingsScalar" },
+        {
+          "$ref": "#/$defs/settingsScalar"
+        },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["key", "default"],
+          "required": [
+            "key",
+            "default"
+          ],
           "properties": {
-            "key": { "type": "string" },
-            "default": { "type": "integer" }
+            "key": {
+              "type": "string"
+            },
+            "default": {
+              "type": "integer"
+            }
           }
         }
       ]
     },
+    "settingsAction": {
+      "description": "What a button does. Three kinds, accepted anywhere an action is: settings buttons, dialog buttons, and a collection's per-item buttons. Template substitution inside an action is `{field}` replacement only — no expressions, no fallbacks; anything fancier is a string the firmware publishes.",
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "set": {
+          "description": "Write a key.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "key",
+            "value"
+          ],
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "value": {
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "edge": {
+              "type": "boolean",
+              "description": "Write 0 first, then the value, forcing a change event past the storage actor's dedup. Needed by command flags that may be left set by an attempt that did not complete — without the edge, the second press writes the value the key already holds, nothing changes, and no subscriber ever fires."
+            },
+            "reboots": {
+              "type": "boolean",
+              "description": "The write reboots the device. The web client then runs the shared reboot-wait behaviour (close the session, wait, reload) and the LCD shows a modal notice, instead of every caller carrying its own choreography."
+            }
+          }
+        },
+        "dialog": {
+          "description": "A confirmation or choice. NO input fields, ever — that is what `form` is for. Every button closes the dialog; a button with no `do:` is a cancel. Buttons nest actions, so a choice tree is dialogs of buttons of sets.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "text",
+            "buttons"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "buttons": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "label"
+                ],
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "danger": {
+                    "type": "boolean"
+                  },
+                  "do": {
+                    "$ref": "#/$defs/settingsAction"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "form": {
+          "$ref": "#/$defs/settingsForm"
+        }
+      }
+    },
+    "settingsForm": {
+      "description": "The one dialog that carries inputs, because it fronts a command sentinel. `fields` are ordinary binding rows carrying `field:` instead of `key:` — values are collected locally, not written per keystroke. Submitting serializes the field object as JSON to `cmd`. The owning task validates: while `<cmd>.error` is non-empty the form stays open showing the reason. Success is the TARGET CHANGING — inside a collection that is the array key, so the form closes when the mutation is observed; a standalone `form:` action has no target to watch, so it closes on submit and a late rejection surfaces on the pane that owns the sentinel.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fields"
+      ],
+      "properties": {
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/settingsRow"
+          }
+        },
+        "cmd": {
+          "type": "string",
+          "description": "The command sentinel this form submits to. Required for a standalone `form:` action; inside a collection's `add:` it defaults to `<cmd>.add`, so the sentinel family stays derived from the collection's one `cmd` name."
+        },
+        "submit": {
+          "type": "string",
+          "description": "Submit-button label (default \"Save\")."
+        },
+        "title": {
+          "type": "string"
+        }
+      }
+    },
     "settingsRow": {
       "type": "object",
       "minProperties": 1,
-      "maxProperties": 2,
+      "maxProperties": 4,
       "additionalProperties": false,
       "anyOf": [
-        { "required": ["section"] }, { "required": ["caption"] },
-        { "required": ["switch"] },  { "required": ["slider"] },
-        { "required": ["text"] },    { "required": ["dropdown"] },
-        { "required": ["value"] },   { "required": ["button"] },
-        { "required": ["list"] }
+        {
+          "required": [
+            "section"
+          ]
+        },
+        {
+          "required": [
+            "caption"
+          ]
+        },
+        {
+          "required": [
+            "switch"
+          ]
+        },
+        {
+          "required": [
+            "slider"
+          ]
+        },
+        {
+          "required": [
+            "text"
+          ]
+        },
+        {
+          "required": [
+            "dropdown"
+          ]
+        },
+        {
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "required": [
+            "button"
+          ]
+        },
+        {
+          "required": [
+            "list"
+          ]
+        }
       ],
       "properties": {
         "when_kconfig": {
           "type": "string",
           "pattern": "^!?CONFIG_[A-Z0-9_]+$",
-          "description": "Emit this row only when a Kconfig symbol is set — `CONFIG_X`, or `!CONFIG_X` for only when it is NOT set. Gates all three lowered surfaces at once: the LCD pane row, the browser panel row, and the storageDefault() seeding — so a build that gates a feature out has no key for it in storage and no mention of it in either UI. Resolved at generation time against the staged set's `kconfig:` fragments, exactly like a settings scalar's `{ kconfig: … }` form, and with the same limit: a symbol nobody set in a straddle.yaml reads as unset here, even if the compiler sees it set from sdkconfig.defaults or `spangap menuconfig`. A feature meant to ship as a build variant therefore declares its symbol in a `kconfig:` block, which is the one place both halves of the build can see it.",
-          "examples": ["!CONFIG_LORA_NO_SUPE", "CONFIG_SPANGAP_USB_CDC"]
+          "description": "Emit this row only when a Kconfig symbol is set — `CONFIG_X`, or `!CONFIG_X` for only when it is NOT set. Gates all three lowered surfaces at once: the LCD row, the browser row, and the storageDefault() seeding — so a build that gates a feature out has no key for it in storage and no mention of it in either UI. Resolved at generation time against the staged set's `kconfig:` fragments, exactly like a settings scalar's `{ kconfig: … }` form, and with the same limit: a symbol nobody set in a straddle.yaml reads as unset here, even if the compiler sees it set from sdkconfig.defaults or `spangap menuconfig`. A feature meant to ship as a build variant therefore declares its symbol in a `kconfig:` block, which is the one place both halves of the build can see it.",
+          "examples": [
+            "!CONFIG_LORA_NO_SUPE",
+            "CONFIG_SPANGAP_USB_CDC"
+          ]
         },
-        "section": { "type": "string" },
-        "caption": { "type": "string" },
+        "when_key": {
+          "type": "string",
+          "description": "Show this row only while a storage key is TRUTHY (non-empty, non-zero). Purely runtime — both surfaces subscribe to the key — and truthiness only: never an equality test, because the firmware publishes gate keys as truthy/empty exactly so the UIs do not have to compare. Inside a collection's item editor or a form the key may use `{field}` substitution to reference a sibling field, e.g. `when_key: \"{dhcp}\"`."
+        },
+        "order": {
+          "description": "Orders this row among its siblings. Declaration order is the default and is usually what you want; where an order is stated it wins, per the global rule (ordered first ascending, unordered after in arrival order).",
+          "type": "integer"
+        },
+        "section": {
+          "type": "string"
+        },
+        "caption": {
+          "type": "string"
+        },
         "switch": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["label", "key"],
+          "required": [
+            "label"
+          ],
           "properties": {
-            "label": { "type": "string" },
-            "key": { "type": "string" },
-            "default": { "type": ["integer", "boolean"] }
+            "label": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            },
+            "field": {
+              "type": "string",
+              "description": "Bind to a form/item-editor field of this name instead of a storage key."
+            },
+            "default": {
+              "type": [
+                "integer",
+                "boolean"
+              ]
+            }
           }
         },
         "slider": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["label", "key", "min", "max"],
+          "required": [
+            "label",
+            "min",
+            "max"
+          ],
           "properties": {
-            "label": { "type": "string" },
-            "key": { "type": "string" },
-            "min": { "$ref": "#/$defs/settingsBound" },
-            "max": { "$ref": "#/$defs/settingsBound" },
-            "default": { "$ref": "#/$defs/settingsScalar" }
+            "label": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            },
+            "field": {
+              "type": "string"
+            },
+            "min": {
+              "$ref": "#/$defs/settingsBound"
+            },
+            "max": {
+              "$ref": "#/$defs/settingsBound"
+            },
+            "default": {
+              "$ref": "#/$defs/settingsScalar"
+            }
           }
         },
         "text": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["label", "key"],
+          "required": [
+            "label"
+          ],
           "properties": {
-            "label": { "type": "string" },
-            "key": { "type": "string" },
-            "default": { "type": ["string", "integer"] },
-            "secret": { "type": "boolean" }
+            "label": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            },
+            "field": {
+              "type": "string"
+            },
+            "default": {
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "secret": {
+              "type": "boolean"
+            },
+            "placeholder": {
+              "type": "string"
+            }
           }
         },
         "dropdown": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["label", "key", "options"],
+          "required": [
+            "label",
+            "options"
+          ],
           "properties": {
-            "label": { "type": "string" },
-            "key": { "type": "string" },
-            "default": { "type": ["string", "integer"] },
+            "label": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            },
+            "field": {
+              "type": "string"
+            },
+            "default": {
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "searchable": {
+              "type": "boolean",
+              "description": "Render as a type-to-filter picker rather than a plain select. For option lists too long to scan (timezones, countries)."
+            },
             "options": {
               "type": "array",
               "minItems": 1,
               "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["v", "l"],
+                "required": [
+                  "v",
+                  "l"
+                ],
                 "properties": {
-                  "v": { "type": ["string", "integer"] },
-                  "l": { "type": "string" }
+                  "v": {
+                    "type": [
+                      "string",
+                      "integer"
+                    ]
+                  },
+                  "l": {
+                    "type": "string"
+                  }
                 }
               }
             }
           }
         },
         "value": {
+          "description": "A read-only row showing whatever string the key holds. The firmware publishes the FINISHED text — the UI never formats, composes or compares.",
           "type": "object",
           "additionalProperties": false,
-          "required": ["label", "key"],
+          "required": [
+            "label",
+            "key"
+          ],
           "properties": {
-            "label": { "type": "string" },
-            "key": { "type": "string" }
+            "label": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            },
+            "copyable": {
+              "type": "boolean",
+              "description": "Web: a click-to-copy affordance and select-all styling (for hashes, addresses, URLs). LCD: no change beyond the existing focus/marquee behaviour."
+            }
           }
         },
         "button": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["label", "cmd"],
+          "required": [
+            "label",
+            "do"
+          ],
           "properties": {
-            "label": { "type": "string" },
-            "cmd": { "type": "string" },
-            "payload": { "type": "string" }
+            "label": {
+              "type": "string"
+            },
+            "danger": {
+              "type": "boolean"
+            },
+            "do": {
+              "$ref": "#/$defs/settingsAction"
+            }
           }
         },
         "list": {
+          "description": "A collection: an array-of-objects in storage, rendered as titled item rows with an editor, add forms, removal and optional reordering. The UI NEVER mutates the array — every mutation is a write to a command sentinel under `cmd`, and the owning task is the only writer.",
           "type": "object",
           "additionalProperties": false,
-          "required": ["key", "item_label"],
+          "required": [
+            "key",
+            "id",
+            "item",
+            "cmd"
+          ],
           "properties": {
-            "key": { "type": "string" },
-            "item_label": { "type": "string" },
+            "label": {
+              "type": "string"
+            },
+            "key": {
+              "description": "The array key. Items are per-field objects under it; a packed multi-field string does not bind, so an owner adopting this block migrates its storage shape.",
+              "type": "string"
+            },
+            "id": {
+              "description": "The field identifying an item in sentinel payloads and status keys.",
+              "type": "string"
+            },
+            "item": {
+              "description": "Row title, a `{field}` template over the item.",
+              "type": "string"
+            },
+            "subtitle": {
+              "description": "Optional second line (monospace, dimmer), same templating.",
+              "type": "string"
+            },
+            "status": {
+              "description": "Optional ephemeral key template (e.g. \"rns_tcp.peer.{id}\") holding a status pill as packed \"text|color\" — the firmware publishes both halves finished.",
+              "type": "string"
+            },
+            "empty": {
+              "description": "Caption shown when the array is empty.",
+              "type": "string"
+            },
+            "orderable": {
+              "description": "Enable reordering. The UI writes the complete id order to `<cmd>.order` as a comma-joined list; the firmware treats it as a PREFERENCE PERMUTATION — reorder recognized ids into that relative order, ignore unknown ids, leave unmentioned ids in place — which keeps it idempotent and benign under concurrent edits.",
+              "type": "boolean"
+            },
+            "cmd": {
+              "description": "Sentinel base. `<cmd>.add` takes a JSON item, `<cmd>.remove` an item id, `<cmd>.set` a JSON item including its id (the OLD id when the id field itself was edited), `<cmd>.order` the id list. Rejections land on `<cmd>.error`.",
+              "type": "string"
+            },
             "add": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["cmd"],
-              "properties": { "cmd": { "type": "string" } }
+              "description": "One or more add entry points, each a form submitting to `<cmd>.add`.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "label",
+                  "form"
+                ],
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "order": {
+                    "type": "integer"
+                  },
+                  "form": {
+                    "$ref": "#/$defs/settingsForm"
+                  }
+                }
+              }
             },
             "remove": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["cmd"],
-              "properties": { "cmd": { "type": "string" } }
+              "properties": {
+                "confirm": {
+                  "description": "Confirmation text, `{field}`-templated over the item. Omit for no confirmation.",
+                  "type": "string"
+                }
+              }
             },
-            "fields": {
+            "actions": {
+              "description": "Per-item action buttons. `{field}` templates in the action resolve against the item, and `{id}` against its id field.",
               "type": "array",
-              "items": { "$ref": "#/$defs/settingsRow" }
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "label",
+                  "do"
+                ],
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "danger": {
+                    "type": "boolean"
+                  },
+                  "do": {
+                    "$ref": "#/$defs/settingsAction"
+                  }
+                }
+              }
+            },
+            "edit": {
+              "description": "The item editor — rows binding item-relative `field:`s, rendered as a dialog on web and a sub-pane on the LCD. Semantically a child node over the item's key scope, so every row feature works here, `when_key` with `{field}` included. Commits go through `<cmd>.set`.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/settingsRow"
+              }
+            },
+            "candidates": {
+              "description": "Scan-and-adopt: an ephemeral array the owning task publishes, rendered like list rows. Picking one opens the collection's first add form, prefilled. Runtime contract: when the pane holding this clause stops being visible the runtime clears the refresh target key, so no straddle carries a visibility timer for \"stop scanning on leave\".",
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "key",
+                "item"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string"
+                },
+                "item": {
+                  "description": "Row template over whatever fields the task publishes, pre-rendered bars and lock markers included.",
+                  "type": "string"
+                },
+                "subtitle": {
+                  "type": "string"
+                },
+                "refresh": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "label",
+                    "do"
+                  ],
+                  "properties": {
+                    "label": {
+                      "type": "string"
+                    },
+                    "do": {
+                      "$ref": "#/$defs/settingsAction"
+                    }
+                  }
+                },
+                "map": {
+                  "description": "candidate-field → add-form-field renames. Same-name fields map implicitly; this is only for the ones that differ.",
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                }
+              }
             }
           }
         }

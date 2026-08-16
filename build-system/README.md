@@ -475,20 +475,166 @@ READMEs — see the stale-doc caveats below.)
 
 ### Declarative settings (the `settings:` block)
 
-A `settings:` block in a `straddle.yaml` is the **single source** for a settings pane;
-`spangap-inside` lowers it into **three** surfaces at build time — LCD pane, web panel,
-and storage defaults — written once, not thrice (search `collect_settings`,
-`_settings_lcd_cpp`, `_settings_defaults_cpp`, `_settings_web_descriptors`). Prefer it
-over hand-writing all three for any pane that's just static rows.
+The `settings:` blocks across a build describe **one tree**, and `spangap-inside` lowers
+that tree into **three** surfaces — LCD nodes, browser nodes, storage defaults — written
+once, not thrice (search `collect_settings`, `_settings_lcd_cpp`, `_settings_defaults_cpp`,
+`_settings_web_nodes`). It is expressive enough for a whole pane, editors and confirmation
+flows included; hand-writing a settings pane is now the exception that needs a reason.
 
-The block is a **list of panels**, each `{ menu: [{id, label, placement?}, …], rows: […] }`.
-The `menu` segment carries **both** an `id` and a `label` because the two UIs address panes
-differently: `id`s join into the **web** menu path (`settings/<id>/…`, also the container
-merge key), while `label`s join into the **LCD** `lcdRegisterSettings` path. Row kinds:
-`section` / `caption` (text), `switch{label,key}`, `slider{label,key,min,max}`,
-`text{label,key,secret?}`, `dropdown{label,key,options:[{v,l}]}`, `value{label,key}`
-(read-only live value), `button{label,cmd,payload?}` (payload defaults `"1"`), and
-`list{key,item_label,add,remove,fields}` (array-of-objects).
+**The tree.** Every node holds key/value **rows** *and* **children**, rendered rows first
+and children after as navigation entries. There is no leaf/container distinction and **no
+node is owned**: a contribution names a path with `at:`, every intermediate node on the way
+is conjured, and two straddles contributing at the same path simply concatenate their row
+blocks. A node's path is its stable id on both surfaces. By convention the root holds only
+children.
+
+```yaml
+settings:
+  - at:
+      - { id: net, label: "Wifi & Internet", short: "Net", order: 1 }
+      - { id: wifi, label: "WiFi" }
+    rows:
+      - switch: { label: "Enable", key: s.wifi.enable, default: 1 }
+```
+
+Each segment carries `id` (the lowercase slug — the merge key), and optionally `label`
+(long name), `short` (the LCD header; defaults to the label) and `order`. The **first**
+contributor, in straddle init order, to supply each of those wins; a later conflicting
+value is ignored with a build-time warning.
+
+**Ordering.** Anything with siblings — nodes, rows, row blocks, a collection's add
+entries — may carry `order:` (an integer). One rule everywhere: items with `order:` first,
+ascending; everything else after them, in (straddle init order, declaration order). Init
+order is `init_order()` (platform band, then dependency topology), so platform
+contributions naturally precede consumer ones. This is resolved **at lowering time** — the
+generator knows init order, so it emits contributions pre-sorted and the runtimes only need
+stable insertion.
+
+**Two firmware conventions** carry as much weight as the schema, and a pane that fights
+them will need code:
+
+1. **Firmware publishes finished strings.** Any derived display value — signal-quality
+   wording, a composed traffic counter, a formatted percentage, a capability's yes/no — is
+   published to an ephemeral key as the exact text to show. No UI computes, compares or
+   concatenates. Gate keys are published truthy/empty, and `when_key` tests truthiness
+   only, never equality.
+2. **Firmware validates in sentinel handlers, and answers on two keys.** A mutation
+   arrives on a command-sentinel key; the owning task validates it and answers on the
+   sentinel family's shared **error** and **ack** keys — for a collection that is
+   `<cmd>.error` / `<cmd>.done` (one pair for `.add`/`.set`/`.remove`/`.order`), for a
+   bare form `<form-cmd>.error` / `<form-cmd>.done`. A rejection is a human-readable
+   sentence on the error key (the form shows it and stays open); an **accepted** mutation
+   bumps the ack key (the form closes). The ack is a monotonic per-boot counter kept in a
+   local variable — never a read-increment of the key, because storage writes are applied
+   by the actor asynchronously and a read may still see the previous value. The UIs clear
+   the error key immediately before each submit (in order, on the same actor), so a
+   rejection identical to the last one still registers as a change past the actor's
+   write-dedup. Submit-and-error replaces per-keystroke validation everywhere; every
+   handler behind a form **must** implement both halves, or the form hangs open on
+   success with nothing to close it.
+
+   **Sentinel keys are ephemeral and live beside the values they manage, never beneath
+   one.** A dot-path write under a scalar key replaces the scalar with an object,
+   destroying it — so a sentinel updating `s.ntp.tz` is `ntp.tz.set`, not
+   `s.ntp.tz.set`. A sentinel's `cmd:` is a fixed key, not a template.
+
+**Row kinds.** `section` / `caption` (text), `switch{label,key}`,
+`slider{label,key,min,max}`, `text{label,key,secret?,placeholder?}`,
+`dropdown{label,key,options:[{v,l}],searchable?}`, `value{label,key,copyable?}`
+(read-only live text), `button{label,do,danger?}`, and `list{…}` (a collection, below).
+Every row may carry `order:`, `when_kconfig:` and `when_key:` **beside** its kind — the
+same placement for both gates:
+
+```yaml
+      - value: { label: "Address", key: wifi.addr, copyable: true }
+        when_key: "wifi.up"
+```
+
+`when_key` is purely runtime: both surfaces subscribe, and the row exists while the key is
+truthy. Inside a form or an item editor the key may be a `{field}` template referencing a
+sibling field (`when_key: "{dhcp}"`), which is answered from the local buffer instead.
+
+**Actions.** Three kinds, accepted anywhere an action is (settings buttons, dialog buttons,
+a collection's per-item buttons):
+
+- **`set: {key, value}`** — write a key. `edge: true` writes `0` first, forcing a change
+  past the storage actor's dedup (needed by flags that may be left set by an attempt that
+  did not complete). `reboots: true` runs the shared reboot-wait behaviour afterwards — the
+  web closes the session, waits and reloads; the LCD shows a modal notice. That absorbs the
+  safe-mode entry flows as a named capability rather than per-panel choreography.
+- **`dialog: {text, buttons:[{label, danger?, do?}]}`** — confirmation or choice. **No
+  input fields, ever.** Every button closes the dialog; a bare label is a cancel. Buttons
+  nest actions, so a choice tree is dialogs of buttons of `set`s.
+- **`form: {fields, cmd, submit?, title?}`** — the one dialog with inputs, because it fronts
+  a sentinel. `fields` are ordinary binding rows carrying `field:` instead of `key:`; values
+  are collected locally and serialized as one JSON object to `cmd` on submit. The handler's
+  answer keys (convention 2 above) drive it: the error key showing a reason keeps it open,
+  the ack key moving closes it — an edit that changes nothing still acks. A string
+  `default:` on a field may be a `{field}` template over its siblings, tracking them until
+  the operator edits that field. Prefill treats an **empty** stored field as unseeded, so a
+  field with a `default:` shows the default again when its stored value is empty — give a
+  field a default only where "empty" and "the default" mean the same thing.
+
+Template substitution everywhere is `{field}` replacement only — no expressions, no
+fallback chains, no slicing. Anything fancier is a string the firmware publishes.
+
+A dropdown's option list is **static** — fixed at lowering time, no options-from-a-key.
+A choice over device data (the timezone list is the case in point: a 600-entry file on the
+device) is a `form` whose handler validates the submitted name, not a dropdown.
+
+**Collections** (`list`) are arrays-of-objects with a full editor:
+
+```yaml
+      - list:
+          label: "Peers"
+          key: s.rns_tcp.peers      # per-field objects; packed strings don't bind
+          id: host                  # the field identifying an item
+          item: "{name}"            # row title
+          subtitle: "{host}:{port}" # optional second line
+          status: "rns_tcp.peer.{id}"   # ephemeral key holding packed "text|color"
+          empty: "No peers configured."
+          orderable: true
+          cmd: rns_tcp.peer         # sentinel base
+          add:  [ { label: "Add peer", form: { fields: [...] } } ]
+          remove: { confirm: "Remove {name}?" }
+          actions: [ { label: "Connect", do: { set: { key: wifi.connect, value: "{id}" } } } ]
+          edit: [ { text: { label: "Host", field: host } } ]
+```
+
+The UI **never mutates the array**. It writes `<cmd>.add` (a JSON item), `<cmd>.remove` (an
+item id), `<cmd>.set` (the JSON item, plus `_id` naming the item it is committing against —
+so editing the id field itself is an ordinary edit) and `<cmd>.order`; the owning task is
+the array's only writer, answering every one of them on the shared `<cmd>.error` /
+`<cmd>.done` pair (convention 2 above). An add form's `cmd:` defaults to `<cmd>.add`, so
+the whole sentinel family stays derived from the one name. A handler consumes its sentinel
+by deleting it (`storageUnset` / `storageDeleteTree`) after reading, which is what lets an
+identical payload be submitted twice — a cleared key can't dedup the next write.
+
+**Per-item secrets** stay out of the synced item object when they matter: the form carries
+an ordinary `field:` with `secret: true`, and the handler routes that field to an
+**id-keyed** side store (iface-tcp: `secrets.tcp.peer_ifac.<id>`) instead of writing it
+into the item. Id-keyed, never slot-keyed — slots shift on remove and permute on reorder.
+The field is write-only: the editor prefills nothing for it, and the handler treats an
+empty submit as *unchanged*, so saving an untouched form never erases a secret. (A secret
+the operator may freely read back — a WiFi password — can instead live in the item as a
+plain `secret: true` field.)
+
+`orderable` writes the complete id order to `<cmd>.order` as a comma-joined list — the
+natural output of both a web drag-drop and an LCD up/down press. Firmware treats the payload
+as a **preference permutation**: reorder recognized ids into that relative order, ignore
+unknown ids, keep unmentioned ids in place. That makes it idempotent and benign under
+concurrent edits, which is what lets the web list hold an optimistic order until the
+re-published array lands.
+
+The **item editor** (`edit:`) is the same mechanism as a form: a pane over a key scope, a
+dialog on the web and a sub-pane on the LCD, with every row feature available including
+`when_key` over sibling fields.
+
+A **`candidates:`** clause turns a collection into scan-and-adopt: an ephemeral array the
+task publishes, rendered like list rows, where picking one opens the first add form
+prefilled (same-name fields map implicitly; `map:` is only for renames). Runtime contract:
+when the pane stops being visible the runtime **clears the `refresh` target key**, so no
+straddle carries a visibility timer for "stop scanning on leave".
 
 A slider's `min`/`max`/`default` may also be `{ kconfig: CONFIG_NAME, default: N }`:
 resolved at lowering time from the staged set's collected `kconfig:` fragments
@@ -506,55 +652,64 @@ case in point — the board's Kconfig declares a front-end module's rating, but 
 publishes and offers the bare radio's ceiling on a board whose front end is missing. The
 `default` applies until the key exists.
 
-A row may carry **`when_kconfig: "CONFIG_X"`** (or `"!CONFIG_X"` for the inverse) beside
-its kind. The row is then emitted only when that symbol is set — **all three surfaces at
-once**, so a build that gates a feature out has no row on the display, no row in the
-browser, and no `storageDefault()` for its key: the key is absent from storage rather than
-present and inert. It is resolved at generation time from the staged set's `kconfig:`
-fragments, the same source a settings scalar's `{ kconfig: … }` reads, and carries the same
-limit — a symbol nobody set in a straddle.yaml reads as unset here even when the compiler
-sees it set from a buildable's `sdkconfig.defaults` or from `spangap menuconfig`. So a
-feature meant to ship as a build variant declares its symbol in a `kconfig:` block, the one
-place both halves of the build can see it. iface-lora's `CONFIG_LORA_NO_SUPE` is the case
-in point: the same symbol gates the code with `#if` and these rows with `when_kconfig`.
+**`when_kconfig: "CONFIG_X"`** (or `"!CONFIG_X"`) emits a row only when that symbol is set —
+**all three surfaces at once**, so a build that gates a feature out has no row on the
+display, no row in the browser, and no `storageDefault()` for its key: the key is absent
+from storage rather than present and inert. It is resolved at generation time from the
+staged set's `kconfig:` fragments, the same source a settings scalar's `{ kconfig: … }`
+reads, and carries the same limit — a symbol nobody set in a straddle.yaml reads as unset
+here even when the compiler sees it set from a buildable's `sdkconfig.defaults` or from
+`spangap menuconfig`. So a feature meant to ship as a build variant declares its symbol in
+a `kconfig:` block, the one place both halves of the build can see it. iface-lora's
+`CONFIG_LORA_NO_SUPE` is the case in point: the same symbol gates the code with `#if` and
+these rows with `when_kconfig`.
 
-A hand-written panel (`web: false`) has no such gate — it is one bundle serving either
-firmware. It asks the **device** instead: a key the firmware never seeds comes back
-undefined, which is what `LoraPanel.vue`'s `hasSupe` tests to drop its section.
+A hand-written panel has no such gate — one browser bundle serves either firmware — which
+is one more reason a pane belongs in the yaml: `when_kconfig` is only available to a
+description the build reads.
 
 The three generated surfaces:
 
-- **LCD pane** → static `spangapGenPane_N(void*)` functions of `lcdSetting*` calls plus a
-  `spangapSettingsGenRegister()` that wires them via `lcdRegisterSettings`, emitted into
-  `staging/spangap_init_dispatch.gen.cpp` and called after the `serviceRunInit()` walk. The
-  body is emitted **only when `spangap-lcd` is staged** (gated globally, not per-panel).
+- **LCD** → simple rows stay **calls**: a `spangapGenSetPane_N(void*)` of `lcdSetting*`
+  calls per contribution, wired by `spangapSettingsGenRegister()` through
+  `lcdSettingsContribute(segs, nsegs, fn)`, emitted into
+  `staging/spangap_init_dispatch.gen.cpp` and called after the `serviceRunInit()` walk.
+  Collections, forms and dialogs instead lower to **static descriptor structs**
+  (`lcd_settings_desc.h`) consumed by generic runtime functions in
+  `spangap-lcd`'s `lcd_settings_desc.cpp` — generating data rather than logic keeps the
+  generated file small and puts the behaviour in one reviewable place. The body is emitted
+  **only when `spangap-lcd` is staged** (gated globally, not per-contribution).
 - **Storage defaults** → `spangapSettingsGenDefaults()` (also in that gen file), one
   `storageDefault()` per binding row (`switch`/`slider`/`text`/`dropdown`) that carries a
   `default:` **and** whose key is persisted config (`s.` prefix); the C literal type follows
   the YAML value's type. **Always emitted** (headless/web builds seed defaults too), and
-  called after `spangapInit`, before the `serviceRunInit()` walk. Bare/ephemeral keys and
-  secrets are never seeded.
-- **Web panel** → a JSON descriptor inlined into `<browser>/src/boot/straddles.gen.ts` as
-  `GENERATED_PANELS`; `registerGeneratedPanels()` (`spangap-web`'s `lib/generatedPanels`)
-  registers each at its menu path against **one shared** `GeneratedPanel.vue` interpreted at
-  runtime — no per-pane SFC codegen (a runtime-interpreted descriptor is far less fragile
-  than generating Vue components).
+  called after `spangapInit`, before the `serviceRunInit()` walk. Ephemeral keys, secrets
+  and form fields are never seeded — a form field's `default:` is dialog prefill, not a
+  value the device should hold before anyone submits one.
+- **Web** → node-tree fragments inlined into `<browser>/src/boot/straddles.gen.ts` as
+  `SETTINGS_NODES`; `registerSettingsNodes()` (`spangap-web`'s `lib/settingsNodes`) merges
+  them into the `settingsTree` store, which one runtime renderer (`NodePane.vue`)
+  interprets — no per-pane SFC codegen (a runtime-interpreted descriptor is far less
+  fragile than generating Vue components).
 
-**Escape hatch:** a panel with `web: false` suppresses only its generated web panel (the
-straddle keeps a hand-written `*Panel.vue` at the same menu leaf for rich UI a static
-descriptor can't express — WiFi scan, ACME, WireGuard, ssh); the LCD pane and storage
-defaults still generate from the same block. **`list` rows are web-only to edit**: the web
-side edits the array (`GeneratedListRow.vue`, mutations routed through the owning task's
-`cmd` storage sentinels, never mutating the array from the UI), while the LCD pane just
-shows a "manage this list in the web UI" caption (the core storage API exposes no array
-*editor* to the LCD; a straddle can still surface per-item status via `value` rows).
+**Escape hatch.** A pane a descriptor genuinely cannot express — one that draws, streams,
+or is an application in its own right — still reaches the tree: the menu store forwards
+`register('settings/…', {type:'panel', component})` into it as a component-typed row, and
+it renders among the declared rows at that node. Every straddle in this workspace has been
+converted, so the hatch is currently used only by out-of-tree apps (seccam's camera panes);
+reach for it when you have a reason, not when a block would be tedious to write.
 
-Panel gating is purely **presence** — a panel appears iff its straddle is staged; there is
-no per-panel `when:`. The schema lives in `$defs/settingsPanel` + `$defs/settingsRow` of
-`build-system/schemas/straddle.schema.json`. Many straddles already carry a `settings:`
-block (enumerate with `grep -l '^settings:' <workspace>/*/straddle.yaml`); don't assume a
-fixed converted-set. `storageSet` is **async** (it queues to the owning actor) — rely on
-operation ordering, not an immediate read-back.
+Contribution gating is purely **presence** — a block appears iff its straddle is staged;
+there is no per-block `when:`. The schema lives in `$defs/settingsPanel`, `$defs/settingsRow`,
+`$defs/settingsAction` and `$defs/settingsForm` of
+`build-system/schemas/straddle.schema.json`.
+
+Every settings surface in this workspace is described this way — enumerate them with
+`grep -l '^settings:' <workspace>/*/straddle.yaml`, and read one before writing a new
+one: spangap-net's WiFi block is the collection-with-candidates worked example, iface-tcp's
+peers the smaller one, lxmf's the case where a fixed slot set is `when_key`-gated rows
+rather than a collection. `storageSet` is **async** (it queues to the owning actor) — rely
+on operation ordering, not an immediate read-back.
 
 ## Editing the build system from inside this container
 

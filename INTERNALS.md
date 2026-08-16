@@ -567,18 +567,29 @@ webrtcSession.registerChannel((pc) => {
 });
 ```
 
-### Add a UI settings panel
+### Add a settings pane
 
-1. Create `web-interface/src/modules/panels/MyPanel.vue` in the
-   consuming app (or in the straddle's own `browser/src/panels/`).
-2. Register: `menuRegistry.register({ group: 'My Group', id: 'my-panel',
-   label: 'My Panel', component: () => import('./panels/MyPanel.vue') })`.
-3. Use spangap's `SettingToggle` / `SettingSlider` / `SettingSelect` /
-   `SettingText` components for config-bound controls.
-4. For the on-device equivalent (`CONFIG_SPANGAP_LCD` builds), register
-   a pane with `lcdRegisterSettings("Group/Item", "Item", fn)` and build
-   it with the `lcdSetting*` helpers — gate the call behind
-   `#if CONFIG_SPANGAP_LCD`.
+Write a `settings:` block in the straddle's `straddle.yaml`. The build lowers it
+to the browser tree, the on-device tree and the storage defaults; there is no
+code to write on either surface, and no `#if` to place. Every settings surface in
+this workspace is built this way — see
+[build-system/README.md](build-system/README.md#declarative-settings-the-settings-block).
+
+Two conventions come with it, and a pane that fights them will need code:
+
+- **Publish finished strings.** Anything derived — a state in words, a composed
+  counter, a formatted percentage — goes to an ephemeral key as the exact text
+  to show. Gate keys are truthy or empty, because `when_key` tests truthiness
+  and never equality.
+- **Validate in the sentinel handler.** A collection's mutations and a form's
+  submissions arrive on command keys; the owning task checks them and writes the
+  reason for a rejection to `<cmd>.error`. Neither UI validates, which is what
+  keeps one rule from being written twice.
+
+A pane that genuinely cannot be described — one that draws, streams, or is an
+application in its own right — still has the escape hatch: register a component
+at a `settings/…` path in the browser (the menu store forwards it into the tree)
+and contribute a builder with `lcdSettingsContribute` on the device.
 
 ### Add a cron entry from a module
 

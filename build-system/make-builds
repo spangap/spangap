@@ -68,21 +68,32 @@ def slug_of(project):
 
 
 def parse_catalogue(path):
-    """Return (project, [(name, invocation), …]) from a builds.yaml. No PyYAML —
-    the host python3 isn't guaranteed to have it. Keys this doesn't use (a
-    consumer's branding, per-entry photos) are ignored rather than rejected."""
+    """Return (project, [(name, invocation), …], {name: onboarding}) from a
+    builds.yaml. No PyYAML — the host python3 isn't guaranteed to have it. Keys
+    this doesn't use (a consumer's branding, per-entry photos) are ignored rather
+    than rejected.
+
+    `onboarding:` is the one optional per-entry key that ends up in the listing:
+    `device` says this image sets a fresh node up from its own screen, so a
+    flasher has nothing to ask and should get out of the way once the image is
+    written. Anything else (and the absence of the key) means the flasher asks —
+    which is the only safe default, since a build that cannot ask for itself and
+    is never asked is a node nobody ever set up."""
     project = ""
     out = []
-    name = inv = None
+    onboarding = {}
+    name = inv = onb = None
     in_builds = False
 
     def flush():
-        nonlocal name, inv
+        nonlocal name, inv, onb
         if name is not None:
             if not inv:
                 die("%s: build '%s' has no invocation" % (path, name))
             out.append((name, inv))
-        name = inv = None
+            if onb:
+                onboarding[name] = onb
+        name = inv = onb = None
 
     for raw in open(path, encoding="utf-8"):
         st = raw.split("#", 1)[0].strip()   # our values carry no '#'
@@ -110,8 +121,10 @@ def parse_catalogue(path):
             name = v
         elif k == "invocation":
             inv = v
+        elif k == "onboarding":
+            onb = v
     flush()
-    return project, out
+    return project, out, onboarding
 
 
 def zips_in(d):
@@ -174,9 +187,16 @@ def fmt_bytes(n):
 
 def html_page(title, rows):
     """A listing page. Deliberately plain: it is read by a browser and parsed by
-    the flasher, and all a parser wants is the hrefs."""
-    items = "\n".join('<li><a href="%s">%s</a>%s</li>' % (href, text, extra)
-                      for href, text, extra in rows)
+    the flasher, and all a parser wants is the hrefs.
+
+    A row may carry attributes on its anchor (`attrs`) — facts about that image
+    the flasher needs BEFORE it fetches it. They go on the anchor rather than
+    into an HTML comment because a comment is only ever near the row it is about,
+    while an attribute is part of it: one parser pass reads the href and the
+    facts together, and no amount of reordering or reformatting can separate
+    them. A browser shows the page exactly as before."""
+    items = "\n".join('<li><a href="%s"%s>%s</a>%s</li>' % (href, attrs, text, extra)
+                      for href, text, extra, attrs in rows)
     return ("<!doctype html>\n"
             "<meta charset=\"utf-8\">\n"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
@@ -185,12 +205,23 @@ def html_page(title, rows):
             "<ul>\n%s\n</ul>\n" % (title, title, items))
 
 
-def write_listing(d, project):
+def write_listing(d, project, onboarding=None):
     """Rewrite a catalogue's index.html + timestamp from what is on disk, so both
-    describe the images actually there — including any a subset run left alone."""
+    describe the images actually there — including any a subset run left alone.
+
+    `onboarding` maps entry name → the mode declared in builds.yaml, and each
+    image whose entry declares one carries it as `data-onboarding` on its link.
+    Derived from the config rather than from the zip, so an entry that changes
+    its answer is re-described by the next run over that catalogue even if the
+    image itself was not rebuilt."""
     names = zips_in(d)
-    rows = [(n, n, " <small>(%s)</small>" % fmt_bytes(os.path.getsize(os.path.join(d, n))))
-            for n in names]
+    rows = []
+    for n in names:
+        got = split_zip(n)
+        mode = (onboarding or {}).get(got[0]) if got else None
+        rows.append((n, n,
+                     " <small>(%s)</small>" % fmt_bytes(os.path.getsize(os.path.join(d, n))),
+                     ' data-onboarding="%s"' % mode if mode else ""))
     title = "%s builds — %s" % (project or "spangap", os.path.basename(os.path.abspath(d)))
     with open(os.path.join(d, "index.html"), "w", encoding="utf-8") as f:
         f.write(html_page(title, rows))
@@ -203,7 +234,7 @@ def write_listing(d, project):
 def write_root_listing(root, catalogues):
     """Rewrite the tree's own index.html: every catalogue except the ones marked
     .unlisted, which stay reachable by name and out of the listing."""
-    rows = [(os.path.basename(d) + "/", os.path.basename(d), "")
+    rows = [(os.path.basename(d) + "/", os.path.basename(d), "", "")
             for d in sorted(catalogues)
             if not os.path.exists(os.path.join(d, UNLISTED))]
     with open(os.path.join(root, "index.html"), "w", encoding="utf-8") as f:
@@ -213,7 +244,7 @@ def write_root_listing(root, catalogues):
 def build_catalogue(d, ws, sel, run_dt):
     """Build the selected entries of one catalogue. Returns the name of the entry
     that failed, or None."""
-    project, entries = parse_catalogue(os.path.join(d, CONFIG))
+    project, entries, onboarding = parse_catalogue(os.path.join(d, CONFIG))
     if not entries:
         die("%s: no builds" % os.path.join(d, CONFIG))
     catalogue = {n for n, _ in entries}
@@ -265,7 +296,7 @@ def build_catalogue(d, ws, sel, run_dt):
         # After the copy, never before: a failed build must leave the image that
         # is still the current one exactly where it was.
         prune_older(d, name, run_dt)
-    newest = write_listing(d, project)
+    newest = write_listing(d, project, onboarding)
     print("make-builds: %s: %d image(s) built, listing at stamp %s"
           % (os.path.basename(d), built, newest or "(none)"), file=sys.stderr)
     return failed

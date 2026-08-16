@@ -121,13 +121,21 @@ PLATFORM_ORDER = [
 # The prefix of PLATFORM_ORDER that a SAFE-MODE boot brings up (spangap-core
 # service.h, service_band_t). A safe-mode boot exists to back up, restore, or
 # wipe the state store with nothing else touching it, so it runs storage, the
-# IP stack and the HTTP server — and stops there. lcd and the whole straddle
-# band register in SERVICE_BAND_FULL and simply never have their onInit called.
+# IP stack, the HTTP server and the screen — and stops there. The whole straddle
+# band registers in SERVICE_BAND_FULL and simply never has its onInit called.
 # The band is emitted per registration below; no straddle opts in or out.
+#
+# The screen is in the band because a boot that erases the store can take
+# minutes, and on a device that has a panel the panel is where an operator looks
+# to find out whether it is working — the wipe's own progress bar
+# (spangap-lcd's safe_screen.cpp) is the only report a headless-of-network
+# device gets. It touches no store: it reads an ephemeral percentage and draws.
+# The shell it brings up is covered by that screen and never reachable.
 SAFE_BAND = {
     CORE_NAME,
     "spangap/spangap-net",
     "spangap/spangap-web",
+    "spangap/spangap-lcd",
 }
 
 
@@ -2641,6 +2649,42 @@ def print_partition_layout(csv_path: Path) -> None:
     print(f"  {'user state':<22}{state}")
 
 
+# The SPI-flash flags, in the one spelling every esptool takes. esptool 4 knows
+# only `--flash_mode`; esptool 5 renamed it to `--flash-mode` and takes the
+# underscore form solely as a deprecated alias, warning on every use and dropping
+# it at the next major. The two-letter forms have meant the same thing since
+# esptool 2 and are deprecated nowhere, so the argfile is written in those and
+# needs no guess about which esptool reads it.
+ESPTOOL_SHORT_FLAGS = {"flash_mode": "-fm", "flash_freq": "-ff", "flash_size": "-fs"}
+
+
+def portable_flash_flags(write_flash_args: list[str]) -> list[str]:
+    """IDF's write_flash_args, rewritten to the flag spelling every esptool
+    version accepts. Anything not in ESPTOOL_SHORT_FLAGS passes through
+    untouched: this knows about the three flags whose names moved, not about
+    every flag IDF might emit."""
+    out: list[str] = []
+    i = 0
+    while i < len(write_flash_args):
+        tok = write_flash_args[i]
+        short = ESPTOOL_SHORT_FLAGS.get(tok.lstrip("-").replace("-", "_")) \
+            if tok.startswith("-") else None
+        if short:
+            # A project that pins none of the three leaves IDF emitting the flag
+            # with an empty value; written out that way the flag would eat the
+            # next token. Dropped instead — esptool then defaults to `keep` and
+            # takes all three from the bootloader header, which is what the
+            # empty value meant.
+            value = write_flash_args[i + 1] if i + 1 < len(write_flash_args) else ""
+            if value:
+                out += [short, value]
+            i += 2
+        else:
+            out.append(tok)
+            i += 1
+    return out
+
+
 def esptool_argfile(write_flash_args: list[str], flash_files: dict[str, str]) -> str:
     """An esptool argfile for `write_flash`: the flags on the first line, then one
     `<offset> <file>` pair per image, lowest offset first.
@@ -2650,8 +2694,12 @@ def esptool_argfile(write_flash_args: list[str], flash_files: dict[str, str]) ->
     flasher_args.json alone, so IDF's copy can name an offset the images no
     longer live at. Generated from flasher_args.json instead — one source, and
     always the offsets the zip actually ships.
+
+    Carries no comments: esptool expands an argfile with shlex.split() per line
+    and does not treat `#` as one, so a comment would reach it as arguments.
     """
-    lines = [" ".join(write_flash_args)] if write_flash_args else []
+    flags = portable_flash_flags(write_flash_args)
+    lines = [" ".join(flags)] if flags else []
     lines += [f"{off} {fname}" for off, fname
               in sorted(flash_files.items(), key=lambda kv: int(kv[0], 16))]
     return "\n".join(lines) + "\n"

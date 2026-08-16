@@ -423,6 +423,12 @@ enumerate the workspace.
    `spangap make-builds` collecting it into a catalogue. The argfile is generated from
    `flasher_args.json` rather than copied from IDF's own `flash_project_args`, because the
    in-place finalize patches the `fixed` offset into the former only.
+   The SPI-flash flags are written short — `-fm dio -ff 80m -fs 16MB` — the one spelling
+   every esptool takes: esptool 4 knows only `--flash_mode`, esptool 5 renamed it to
+   `--flash-mode` and keeps the underscore form as a deprecated alias it warns on and drops
+   at the next major. So `esptool ... write_flash "@<project>.esptool"` runs clean on any
+   version, and the file carries no comments (esptool `shlex.split`s each line and does not
+   strip `#`).
 
 Consumer CMake idiom: `include(${CMAKE_CURRENT_LIST_DIR}/spangap_requires.cmake)` then
 `REQUIRES ${SPANGAP_REQUIRES} …`. The buildable's `main/CMakeLists.txt` reads
@@ -439,11 +445,13 @@ before `spangapInit()`) then `serviceRunInit()` (after, ecosystem up). Registrat
 come up before it; you do **not** list any bring-up by hand.
 
 Each registration also carries a `service_band_t` derived from that same order (`SAFE_BAND`
-in `spangap-inside`): core/net/web get `SERVICE_BAND_SAFE`, everything else
+in `spangap-inside`): core/net/web/lcd get `SERVICE_BAND_SAFE`, everything else
 `SERVICE_BAND_FULL`. A **safe-mode** boot — the recovery boot that backs the state store up,
 restores one, or factory-resets the device — runs the SAFE band only. No straddle declares
-this and none can opt in or out; it is a property of where it sits in the order. See
-spangap-core's `docs/safe-mode.md`.
+this and none can opt in or out; it is a property of where it sits in the order. The screen is
+in the band because a wipe can take minutes and the panel is where an operator looks to find
+out whether the device is working; it touches no store, reading an ephemeral percentage and
+drawing. See spangap-core's `docs/safe-mode.md`.
 
 A straddle contributes boot code two ways:
 

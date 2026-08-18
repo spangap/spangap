@@ -278,7 +278,13 @@ Common verbs:
 - `spangap show` — list the project straddle + its deps in init order (bare
   `spangap` with no subcommand does the same; `show` stays as an explicit alias)
 - `spangap reset` — touch `.spangap-resetme` so a running monitor resets the device
-- `spangap reset-workspace` — tear down the container + image and rebuild fresh
+- `spangap reset-workspace` — tear down the container + image and rebuild fresh.
+  This is the only verb that kills live container sessions: everywhere else,
+  when `ensure_container` must replace a container that still hosts exec
+  sessions (a `spangap shell`, a dev server), it renames the old one aside
+  (`<name>-retired-<cid>`) instead of `rm -f`, starts the replacement under
+  the canonical name, and removes retirees (plus their now-untagged images)
+  once their last session ends
 - `spangap get-deps` — host-side `git clone` of any missing transitive
   `requires:` (also runs implicitly as the first phase of `build`)
 - `spangap cli [-h <host>] <cmd>…` — talk to the device's TCP CLI

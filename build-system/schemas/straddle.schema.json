@@ -549,6 +549,11 @@
         },
         {
           "required": [
+            "timezone"
+          ]
+        },
+        {
+          "required": [
             "value"
           ]
         },
@@ -684,6 +689,10 @@
             },
             "placeholder": {
               "type": "string"
+            },
+            "placeholder_key": {
+              "description": "A storage key holding the placeholder text, for a hint only the device knows \u2014 the MAC it would use, the port it would pick. Read when the field is built; wins over a literal `placeholder`.",
+              "type": "string"
             }
           }
         },
@@ -736,6 +745,27 @@
                   }
                 }
               }
+            }
+          }
+        },
+        "timezone": {
+          "description": "An IANA timezone picker. Deliberately optionless: each surface sources its own zone list — the browser from the client's Intl database (type-to-filter), the LCD from the firmware's built-in zone table (region dropdown, then zone dropdown) — so the yaml states no list and neither surface fetches the other's. A form field only, because the picked name must go through a sentinel whose handler resolves it against that table before storing.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "label",
+            "field"
+          ],
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "field": {
+              "type": "string"
+            },
+            "placeholder_key": {
+              "description": "A storage key holding the currently applied zone; its value seeds the picker's initial selection.",
+              "type": "string"
             }
           }
         },
@@ -939,6 +969,10 @@
                   "color": {
                     "$ref": "#/$defs/settingsColor"
                   },
+                  "when_key": {
+                    "description": "Show this action only while the key is truthy; `{field}` templates against the item and `{id}` against its id. Truthiness only \u2014 the firmware publishes the gate, so \"hide Connect on the network we are already on\" is a key it sets on the others, never a comparison here.",
+                    "type": "string"
+                  },
                   "do": {
                     "$ref": "#/$defs/settingsAction"
                   }
@@ -946,19 +980,20 @@
               }
             },
             "edit": {
-              "description": "The item editor — rows binding item-relative `field:`s, rendered as a dialog on web and a sub-pane on the LCD. Semantically a child node over the item's key scope, so every row feature works here, `when_key` with `{field}` included. Commits go through `<cmd>.set`.",
+              "description": "The item editor — rows binding item-relative `field:`s. Semantically a child node over the item's key scope, so every row feature works here, `when_key` with `{field}` included, and `section:`/`caption:` text templating the same way (\"SSID: {ssid}\"). Commits go through `<cmd>.set`. On the LCD it is the item's DETAIL PAGE: tapping anywhere on the row opens it, and it carries `actions:` and `remove` too, so the row itself holds nothing but the item. The browser has room for those on the row and keeps them there, opening this as a dialog.",
               "type": "array",
               "items": {
                 "$ref": "#/$defs/settingsRow"
               }
             },
             "candidates": {
-              "description": "Scan-and-adopt: an ephemeral array the owning task publishes, rendered like list rows. Picking one opens the collection's first add form, prefilled. Runtime contract: when the pane holding this clause stops being visible the runtime clears the refresh target key, so no straddle carries a visibility timer for \"stop scanning on leave\".",
+              "description": "Scan-and-adopt: an ephemeral array the owning task publishes, rendered like list rows. Picking one opens the collection's first add form, prefilled. The `refresh` button is how the list is reached — on the LCD it opens as a popup over the pane, since what the device can SEE is a transient answer to a question just asked, not part of what it is configured for. Runtime contract: closing that popup, or leaving the pane, clears the refresh target key, so no straddle carries a visibility timer for \"stop scanning on leave\".",
               "type": "object",
               "additionalProperties": false,
               "required": [
                 "key",
-                "item"
+                "item",
+                "refresh"
               ],
               "properties": {
                 "key": {
@@ -969,6 +1004,10 @@
                   "type": "string"
                 },
                 "subtitle": {
+                  "type": "string"
+                },
+                "found": {
+                  "description": "Heading over the results, where they are shown as a popup (the LCD). Titled for what is on screen rather than for the button that opened it. Defaults to the refresh label.",
                   "type": "string"
                 },
                 "refresh": {

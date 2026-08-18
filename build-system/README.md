@@ -597,8 +597,15 @@ them will need code:
    `s.ntp.tz.set`. A sentinel's `cmd:` is a fixed key, not a template.
 
 **Row kinds.** `section` / `caption` (text), `switch{label,key}`,
-`slider{label,key,min,max}`, `text{label,key,secret?,placeholder?}`,
-`dropdown{label,key,options:[{v,l}],searchable?}`, `value{label,key,copyable?}`
+`slider{label,key,min,max}`, `text{label,key,secret?,placeholder?,placeholder_key?}`,
+`dropdown{label,key,options:[{v,l}],searchable?}`,
+`timezone{label,field,placeholder_key?}` (an IANA zone picker, form fields only:
+optionless in the yaml, because each surface brings its own list — the browser
+its Intl database as a type-to-filter select, the LCD region+zone dropdowns from
+the firmware's built-in zone table; `placeholder_key` names the key whose value
+seeds the initial selection, and the submitted name must go through a sentinel
+that resolves it against that table before storing),
+`value{label,key,copyable?}`
 (read-only live text), `button{label,do,color?}`, `buttons{align?,items:[…]}`,
 `info{rows:[…]}`, and `list{…}` (a collection, below).
 Every row may carry `order:`, `when_kconfig:`, `when_key:` and `when_surface:` **beside**
@@ -612,6 +619,15 @@ its kind — the same placement for all three gates:
 `when_key` is purely runtime: both surfaces subscribe, and the row exists while the key is
 truthy. Inside a form or an item editor the key may be a `{field}` template referencing a
 sibling field (`when_key: "{dhcp}"`), which is answered from the local buffer instead.
+
+A text row's **`placeholder_key:`** names a key holding the placeholder text, for a hint
+only the device can supply — the MAC it would use if the field is left blank, the port it
+would pick. It wins over a literal `placeholder:`, and like every other published string it
+is shown verbatim.
+
+Inside a form or an item editor a **`section:` / `caption:` text templates too**, over the
+same local buffer (`section: "SSID: {ssid}"`), and tracks the field as it is edited. That is
+how an editor says which item it is editing without the surrounding pane having to.
 
 `when_surface: web` (or `lcd`) emits the row on **one** surface only. It is for a row whose
 action does not exist on the other: backing up and restoring hand an archive between the
@@ -711,7 +727,9 @@ device) is a `form` whose handler validates the submitted name, not a dropdown.
           cmd: rns_tcp.peer         # sentinel base
           add:  [ { label: "Add peer", form: { fields: [...] } } ]
           remove: { confirm: "Remove {name}?" }
-          actions: [ { label: "Connect", do: { set: { key: wifi.connect, value: "{id}" } } } ]
+          actions:                  # each may carry when_key, templated over the item
+            - { label: "Connect", when_key: "rns_tcp.joinable.{id}",
+                do: { set: { key: wifi.connect, value: "{id}" } } }
           edit: [ { text: { label: "Host", field: host } } ]
 ```
 
@@ -723,6 +741,14 @@ the array's only writer, answering every one of them on the shared `<cmd>.error`
 the whole sentinel family stays derived from the one name. A handler consumes its sentinel
 by deleting it (`storageUnset` / `storageDeleteTree`) after reading, which is what lets an
 identical payload be submitted twice — a cleared key can't dedup the next write.
+
+**On `.set`, absent is not empty.** A field the editor carries and the operator left blank
+arrives as an empty string and erases what was stored — that is how a fixed IP is handed
+back to DHCP. A field the editor does not carry *at all* is not being edited, and the
+handler must fill it in from the item before validating or writing. That is what lets an
+`edit:` block leave a field out: spangap-net's detail page shows the SSID in its
+`section:` heading rather than as a row, and a handler that read absent as empty would
+erase the SSID on every Save and then reject the entry for having none.
 
 **Per-item secrets** stay out of the synced item object when they matter: the form carries
 an ordinary `field:` with `secret: true`, and the handler routes that field to an
@@ -741,14 +767,36 @@ concurrent edits, which is what lets the web list hold an optimistic order until
 re-published array lands.
 
 The **item editor** (`edit:`) is the same mechanism as a form: a pane over a key scope, a
-dialog on the web and a sub-pane on the LCD, with every row feature available including
-`when_key` over sibling fields.
+dialog on the web and a modal on the LCD, with every row feature available including
+`when_key` over sibling fields and `{field}` templating in a `section:` heading.
+
+On the **LCD it is the item's detail page**, and it is where everything that acts on one
+item lives: tapping anywhere on a list row opens it, and it carries the `actions:` buttons
+and Delete alongside Save and Cancel. A list row itself shows the item and nothing else —
+title, subtitle, status pill, and the reorder arrows when `orderable`, because those are
+about the row's place rather than the item. Five buttons on a 320 px row is a row nobody
+can hit. The browser has the width for them and keeps them on the row.
+
+An action's **`when_key`** is what takes a button off that page when it has nothing to do:
+the template builds a KEY out of the item (`"wifi.netjoinable.{id}"`, unlike a row's gate
+where a template names a sibling field's *value*), and the owning task publishes it truthy
+on the items where the action applies. Hiding "Connect" on the network already connected is
+therefore a key net.cpp sets on the others, never a comparison in a UI.
 
 A **`candidates:`** clause turns a collection into scan-and-adopt: an ephemeral array the
 task publishes, rendered like list rows, where picking one opens the first add form
-prefilled (same-name fields map implicitly; `map:` is only for renames). Runtime contract:
-when the pane stops being visible the runtime **clears the `refresh` target key**, so no
-straddle carries a visibility timer for "stop scanning on leave".
+prefilled (same-name fields map implicitly; `map:` is only for renames). `refresh:` is
+required, because its button is how the list is reached: **both surfaces** open the results
+as a popup, headed by `found:` (defaulting to the refresh label) — titled for what is on
+screen rather than for the button that opened it, since by then the asking is done — and
+dismissed by a small Close in its top-right corner, because a card that is one long list has
+no room for a row of buttons under it. Opening the popup starts the scan and closing it
+stops the scan. What the device can *see* is a transient answer to a question
+just asked — it arrives over seconds, it changes, and it is gone once you stop asking — so
+it gets its own screen rather than pushing the configured list around underneath a button
+that may be well below the fold. Runtime contract: closing the popup, or leaving the pane,
+**clears the `refresh` target key**, so no straddle carries a visibility timer for "stop
+scanning on leave".
 
 A slider's `min`/`max`/`default` may also be `{ kconfig: CONFIG_NAME, default: N }`:
 resolved at lowering time from the staged set's collected `kconfig:` fragments

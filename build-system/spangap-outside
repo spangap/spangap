@@ -138,14 +138,16 @@ VENV_REQUIREMENTS="esptool==4.8.1 esp-idf-monitor==1.5.0"
 # and identical across hosts mounting the same workspace. Defined here (not in
 # the docker-management section below) because the monitor path — which exits
 # before that section — needs it to wire up the addr2line decode shim.
+# Superseded containers that still host live sessions keep running under this
+# name plus a -retired-<cid> suffix — see retire_container / reap_retired.
 ws_hash=$(printf '%s' "$workspace" | sha256sum | cut -c1-7)
 container="spangap-$ws_hash"
 
 # Per-workspace image tag. The build-env image carries no workspace-specific
 # state, so two workspaces off the same build-system/ produce byte-identical
 # images — but each workspace's container holds a reference to the image it was
-# created from. A shared tag therefore means a stale-hash rebuild here, or a
-# `reset-workspace`, can't `docker rmi` the tag while a *different* workspace's
+# created from. A shared tag therefore means a `reset-workspace` can't
+# `docker rmi` the tag while a *different* workspace's
 # container still references it ("conflict: ... container <id> is using its
 # referenced image"). Scoping the tag to $workspace via ws_hash gives every
 # workspace its own image to build, stamp, and remove independently.
@@ -1537,8 +1539,62 @@ dev_fixed_host_port() {
         "$container" 2>/dev/null
 }
 
+# True if the container has live exec sessions in it — an interactive
+# `spangap shell`, a dev server, an assistant working inside. The main process
+# is always `sleep infinity`, so execs are the only sign of life that matters.
+# ExecIDs renders as "[]" or "<no value>" (docker-version-dependent) when there
+# are none; dockerd prunes finished execs from the list.
+container_busy() {
+    local execs
+    execs=$(docker inspect -f '{{.ExecIDs}}' "$1" 2>/dev/null) || return 1
+    case $execs in ""|"[]"|"<no value>") return 1 ;; esac
+    return 0
+}
+
+# Get $container's name out of the way so a replacement can be created,
+# WITHOUT killing sessions running inside it. Idle (no live execs) → plain
+# rm -f. Busy → docker-rename it aside to $container-retired-<cid>; rename
+# disturbs neither the container nor its exec sessions, so a shell or dev
+# server inside keeps running against the old container while new spangap
+# invocations get a fresh one under the canonical name. Retired containers
+# are swept by reap_retired once their last session ends.
+retire_container() {
+    local cid
+    cid=$(docker inspect -f '{{.Id}}' "$container" 2>/dev/null) || return 0
+    if ! container_busy "$container"; then
+        docker rm -f "$container" >/dev/null
+        return 0
+    fi
+    local parked="$container-retired-${cid:0:12}"
+    docker rename "$container" "$parked" >/dev/null
+    [ -z "$SPANGAP_QUIET" ] \
+        && log "old container has live sessions — parked as $parked (removed automatically once they end)"
+    return 0
+}
+
+# Sweep this workspace's retired containers: any whose last session has ended
+# is removed, along with its image if the rebuild that retired it left that
+# image untagged (rmi by ID refuses a tagged image, which is exactly right —
+# a build-system hash flip-flop can re-tag the very image a retiree runs on).
+# `force` (reset-workspace) removes them sessions and all. Cheap in the steady
+# state: one docker ps.
+reap_retired() {
+    local force=${1:-} name img
+    docker ps -a --filter "label=spangap.workspace=$workspace" \
+            --format '{{.Names}}' 2>/dev/null \
+    | while read -r name; do
+        case $name in "$container"-retired-*) ;; *) continue ;; esac
+        [ -n "$force" ] || ! container_busy "$name" || continue
+        img=$(docker inspect -f '{{.Image}}' "$name" 2>/dev/null) || img=""
+        docker rm -f "$name" >/dev/null 2>&1 || continue
+        [ -z "$img" ] || docker rmi "$img" >/dev/null 2>&1 || true
+    done || true
+    return 0
+}
+
 ensure_container() {
     ensure_daemon
+    reap_retired
 
     # The spangap build-system straddle (Dockerfile + build-system/) is the
     # build context, git-cloned into $workspace/spangap.
@@ -1546,21 +1602,24 @@ ensure_container() {
     local local_hash=""
     [ -f "$ctx/build-system/Dockerfile" ] && local_hash=$(buildsys_hash "$ctx")
 
-    # Drop a stale image before anything else — if build-system/ has changed
-    # since the image was built, the container on top of it is stale too.
+    # Spot a stale image before anything else — if build-system/ has changed
+    # since the image was built, the container on top of it is stale too. The
+    # old image is NOT rmi'd here: the docker build below re-tags $IMAGE onto
+    # the new image, and the old one either goes dangling with nothing using
+    # it (removed alongside the retired container that references it, if any)
+    # or was never created twice.
+    local stale=""
     if [ -n "$local_hash" ] && docker image inspect "$IMAGE" >/dev/null 2>&1; then
         local stamp
         stamp=$(docker image inspect --format \
             '{{ index .Config.Labels "org.spangap.buildsys-hash" }}' \
             "$IMAGE" 2>/dev/null) || stamp=""
         if [ "$stamp" != "$local_hash" ]; then
+            stale=1
             announce_container_setup
             [ -z "$SPANGAP_QUIET" ] \
                 && log "$IMAGE is stale (build-system/ changed since image build) — rebuilding"
-            if docker inspect "$container" >/dev/null 2>&1; then
-                docker rm -f "$container" >/dev/null
-            fi
-            docker rmi "$IMAGE" >/dev/null
+            retire_container
         fi
     fi
 
@@ -1599,17 +1658,17 @@ ensure_container() {
                 announce_container_setup
                 [ -z "$SPANGAP_QUIET" ] \
                     && log "recreating container: $why"
-                docker rm -f "$container" >/dev/null
+                retire_container
             else
                 announce_container_setup
-                docker rm -f "$container" >/dev/null
+                retire_container
             fi
             ;;
         missing) ;;
-        *) announce_container_setup; docker rm -f "$container" >/dev/null ;;
+        *) announce_container_setup; retire_container ;;
     esac
 
-    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    if [ -n "$stale" ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
         [ -n "$local_hash" ] \
             || die "can't build $IMAGE: no Dockerfile at $ctx/build-system/Dockerfile"
         announce_container_setup
@@ -1923,6 +1982,9 @@ reset-workspace)
         log "removing container $container"
         docker rm -f "$container" >/dev/null
     fi
+    # Retired predecessors (see retire_container) still hold references to old
+    # images; reset means reset, so take them down sessions and all.
+    reap_retired force
     if docker image inspect "$IMAGE" >/dev/null 2>&1; then
         log "removing image $IMAGE"
         docker rmi "$IMAGE" >/dev/null

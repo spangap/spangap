@@ -1561,6 +1561,7 @@ def _web_collection(spec: dict, cfgvals: dict[str, str]) -> dict:
     if spec.get("actions"):
         out["actions"] = [{"label": a["label"],
                            **({"color": a["color"]} if a.get("color") else {}),
+                           **({"whenKey": a["when_key"]} if a.get("when_key") else {}),
                            "do": _web_action(a["do"], cfgvals)}
                           for a in spec["actions"]]
     if spec.get("edit"):
@@ -1570,6 +1571,8 @@ def _web_collection(spec: dict, cfgvals: dict[str, str]) -> dict:
         c: dict = {"k": cand["key"], "item": cand["item"]}
         if "subtitle" in cand:
             c["subtitle"] = cand["subtitle"]
+        if "found" in cand:
+            c["found"] = cand["found"]
         if "refresh" in cand:
             c["refresh"] = {"label": cand["refresh"]["label"],
                             "do": _web_action(cand["refresh"]["do"], cfgvals)}
@@ -1623,11 +1626,19 @@ def _web_row(row: dict, cfgvals: dict[str, str]) -> dict:
             out["secret"] = True
         if "placeholder" in spec:
             out["placeholder"] = spec["placeholder"]
+        if "placeholder_key" in spec:
+            out["placeholderKey"] = spec["placeholder_key"]
     elif kind == "dropdown":
         out = {"kind": "dropdown", "label": spec["label"],
                "options": [{"value": str(o["v"]), "label": o["l"]} for o in spec["options"]]}
         if spec.get("searchable"):
             out["searchable"] = True
+    elif kind == "timezone":
+        # Optionless by design: the browser builds its list from the client's
+        # own Intl database. The LCD half reads the on-device zone DB instead.
+        out = {"kind": "timezone", "label": spec["label"], "field": spec["field"]}
+        if "placeholder_key" in spec:
+            out["placeholderKey"] = spec["placeholder_key"]
     elif kind == "value":
         out = {"kind": "value", "label": spec["label"], "k": spec["key"]}
         if spec.get("copyable"):
@@ -1695,6 +1706,7 @@ _LCD_ROW_KIND = {
     "section": "LCD_ROW_SECTION", "caption": "LCD_ROW_CAPTION",
     "switch": "LCD_ROW_SWITCH", "slider": "LCD_ROW_SLIDER",
     "text": "LCD_ROW_TEXT", "dropdown": "LCD_ROW_DROPDOWN",
+    "timezone": "LCD_ROW_TIMEZONE",
     "value": "LCD_ROW_VALUE", "button": "LCD_ROW_BUTTON",
     "list": "LCD_ROW_LIST",
 }
@@ -1835,8 +1847,12 @@ class _LcdSettingsEmitter:
                 f["secret"] = "true"
             if "placeholder" in spec:
                 f["placeholder"] = _cstr(spec["placeholder"])
+            if "placeholder_key" in spec:
+                f["placeholder_key"] = _cstr(spec["placeholder_key"])
         if kind == "value" and spec.get("copyable"):
             f["copyable"] = "true"
+        if kind == "timezone" and "placeholder_key" in spec:
+            f["placeholder_key"] = _cstr(spec["placeholder_key"])
         if kind == "dropdown":
             f["options"] = _cstr("\n".join(str(o["v"]) for o in spec["options"]))
             f["opt_labels"] = _cstr("\n".join(str(o["l"]) for o in spec["options"]))
@@ -1881,8 +1897,10 @@ class _LcdSettingsEmitter:
             acts_sym = self._sym("ItemActs")
             lines = [f"static const lcd_item_action_t {acts_sym}[] = {{"]
             for a, asym in acts:
+                when = _cstr(a["when_key"]) if "when_key" in a else "nullptr"
                 lines.append(f"    {{ .label = {_cstr(a['label'])}, "
-                             f".color = {_ccolor(a)}, .act = {asym} }},")
+                             f".color = {_ccolor(a)}, .when_key = {when}, "
+                             f".act = {asym} }},")
             lines.append("};")
             self.defs.append("\n".join(lines))
 
@@ -1903,6 +1921,7 @@ class _LcdSettingsEmitter:
                 f".subtitle = {_cstr(cand.get('subtitle', ''))},\n"
                 f"    .refresh_label = "
                 f"{_cstr(cand['refresh']['label']) if 'refresh' in cand else 'nullptr'},\n"
+                f"    .found = {_cstr(cand.get('found', ''))},\n"
                 f"    .refresh = {refresh}, .map = {_cstr(mapping)} }};")
             cand_sym = f"&{cand_sym}"
 
@@ -1954,6 +1973,9 @@ class _LcdSettingsEmitter:
             csv = ",".join(str(o["v"]) for o in spec["options"])
             call = (f"lcdSettingDropdown(p, {_cstr(spec['label'])}, "
                     f"{_cstr(spec['key'])}, {_cstr(csv)})")
+        elif kind == "timezone":
+            die("settings: timezone: is a form field — the picked name must go "
+                "through a validating sentinel, so it cannot bind a pane row")
         elif kind == "value":
             call = f"lcdSettingValue(p, {_cstr(spec['label'])}, {_cstr(spec['key'])})"
         elif kind == "button":

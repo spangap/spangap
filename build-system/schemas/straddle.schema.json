@@ -46,6 +46,11 @@
       "description": "Compile-time DEFAULT for the MUTABLE s.net.hostname (e.g. 'reticulous'). Unlike stub/display_name/banner this seeds a user-settable value (what it's running ON), not immutable identity. Desugars to CONFIG_SPANGAP_FW_HOSTNAME, which seeds s.net.hostname on first boot. Dependency-order layered; the built straddle wins.",
       "type": "string"
     },
+    "bridge_ports": {
+      "description": "Extra device TCP ports the host-side container bridge forwards to the device, beyond the built-in ssh/http/https/TCP-CLI set — device services an in-container client must dial raw. Only read from the BUILT straddle's own straddle.yaml (dependencies cannot contribute), and only as a one-line flow list (`bridge_ports: [7633]`) — the host tooling reads it with a plain sed, so a block list is invisible to it.",
+      "type": "array",
+      "items": { "type": "integer", "minimum": 1, "maximum": 65535 }
+    },
     "firmware": {
       "description": "Firmware-half path relative to manifest dir. Omit for default 'idf'. Use '.' when the manifest dir IS the firmware project root (buildable straddles).",
       "type": "string",
@@ -582,9 +587,10 @@
         "when_kconfig": {
           "type": "string",
           "pattern": "^!?CONFIG_[A-Z0-9_]+$",
-          "description": "Emit this row only when a Kconfig symbol is set — `CONFIG_X`, or `!CONFIG_X` for only when it is NOT set. Gates all three lowered surfaces at once: the LCD row, the browser row, and the storageDefault() seeding — so a build that gates a feature out has no key for it in storage and no mention of it in either UI. Resolved at generation time against the staged set's `kconfig:` fragments, exactly like a settings scalar's `{ kconfig: … }` form, and with the same limit: a symbol nobody set in a straddle.yaml reads as unset here, even if the compiler sees it set from sdkconfig.defaults or `spangap menuconfig`. A feature meant to ship as a build variant therefore declares its symbol in a `kconfig:` block, which is the one place both halves of the build can see it.",
+          "description": "Emit this row only when a Kconfig symbol is set — `CONFIG_X`, or `!CONFIG_X` for only when it is NOT set. Gates all three lowered surfaces at once: the LCD row, the browser row, and the storageDefault() seeding — so a build that gates a feature out has no key for it in storage and no mention of it in either UI. Resolved at generation time, exactly like a settings scalar's `{ kconfig: … }` form, against two sources and only two: the staged set's presence symbols (`CONFIG_STRADDLE_<REPO>` and the `CONFIG_SPANGAP_<ALIAS>` short forms — this is how a row requires a sibling straddle, e.g. gps's motion assist requiring spangap/imu; the buildable itself has none), and symbols straddles set in their `kconfig:` blocks. Anything else reads as unset here, even if the compiler sees it set from sdkconfig.defaults or `spangap menuconfig` — so a feature meant to ship as a build variant declares its symbol in a `kconfig:` block, which is the one place both halves of the build can see it.",
           "examples": [
             "!CONFIG_LORA_NO_SUPE",
+            "CONFIG_STRADDLE_IMU",
             "CONFIG_SPANGAP_USB_CDC"
           ]
         },

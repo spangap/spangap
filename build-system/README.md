@@ -89,11 +89,17 @@ directly** — the
 container has no USB. `flash`/`reset` only signal a host monitor; `cli` reaches the device
 over the network. `spangap cli "<cmd>"` runs an **arbitrary** device CLI command and returns
 its output (`spangap cli gps`, `spangap cli "set s.gps.interval=5"`) — combine it with
-`spangap log` to verify firmware autonomously. Note that only the `spangap`-mediated verbs
-route to the device: the **raw socket level is not reachable from the container** — `nc` to
-the device's ssh (`:22`), web (`:80`/`:443`), or TCP CLI (`:2323`) is refused, because the
-host bridge terminates on the host's own loopback with no container route. Raw-socket work
-(the browser config-channel, an ssh `Ctrl-D`, physical checks) stays user-driven. The full
+`spangap log` to verify firmware autonomously. The container **cannot route to the
+device's LAN address itself** — raw sockets reach the device only through the host-side
+relays at `host.docker.internal:<port>`, which front the device's well-known ports (ssh
+`:22`, web `:80`/`:443`, TCP CLI `:2323`) plus any extra ports the project's straddle.yaml
+declares in `bridge_ports:` (a one-line flow list, e.g. `bridge_ports: [7633]` — the host
+reads it with a sed, so a block list is invisible). The relays belong to whichever of
+`spangap monitor` / `spangap dev` is running, so a `bridge_ports:` change takes effect on
+that verb's next start. One trap: the relay accepts a connection *before* dialing the
+device, so a successful connect proves only that the relay is up — a dead device port
+looks like an accept followed by silence, then a close. Physical checks and anything
+serial-interactive stay user-driven. The full
 device loop is its own section below
 ([Working with a real device](#working-with-a-real-device--the-you--user--board-loop)).
 
@@ -162,6 +168,12 @@ target), and leave it running:
 ```sh
 spangap monitor <port>      # <port> is sticky after the first time
 ```
+
+`spangap monitor <port> --aux <dev>` additionally fronts a **second** serial
+device on the bridge at `host.docker.internal:2325` (`$SPANGAP_AUX_PORT`) —
+bytes both ways, no line state — for an in-container client that needs a device
+serial port the monitor itself doesn't hold (e.g. the spare CDC port while the
+console is on `usb cdc`). Sticky like the port; `--aux -` clears it.
 
 It's a passive serial monitor (`--no-reset`, so it won't reboot the board while idle)
 that also **watches `.spangap-flashme`** at the workspace root. Your flash loop then is:
@@ -818,13 +830,22 @@ publishes and offers the bare radio's ceiling on a board whose front end is miss
 **all three surfaces at once**, so a build that gates a feature out has no row on the
 display, no row in the browser, and no `storageDefault()` for its key: the key is absent
 from storage rather than present and inert. It is resolved at generation time from the
-staged set's `kconfig:` fragments, the same source a settings scalar's `{ kconfig: … }`
-reads, and carries the same limit — a symbol nobody set in a straddle.yaml reads as unset
-here even when the compiler sees it set from a buildable's `sdkconfig.defaults` or from
-`spangap menuconfig`. So a feature meant to ship as a build variant declares its symbol in
-a `kconfig:` block, the one place both halves of the build can see it. iface-lora's
-`CONFIG_LORA_NO_SUPE` is the case in point: the same symbol gates the code with `#if` and
-these rows with `when_kconfig`.
+same place a settings scalar's `{ kconfig: … }` reads — two sources, and only two:
+
+- **the staged set's presence symbols**, `CONFIG_STRADDLE_<REPO>` and the
+  `CONFIG_SPANGAP_<ALIAS>` short forms, the same ones the build declares for the compiler.
+  This is how a row says it needs a *sibling straddle*: gps's motion-assist rows carry
+  `when_kconfig: "CONFIG_STRADDLE_IMU"`, so they exist exactly in the builds that stage
+  spangap/imu and nowhere else. The buildable itself has no presence symbol, in either
+  half.
+- **symbols straddles set in their `kconfig:` blocks**, which is where a build *variant*
+  declares itself. iface-lora's `CONFIG_LORA_NO_SUPE` is the case in point: the same symbol
+  gates the code with `#if` and these rows with `when_kconfig`.
+
+Anything else reads as unset here even when the compiler sees it set from a buildable's
+`sdkconfig.defaults` or from `spangap menuconfig` — so a feature meant to ship as a build
+variant declares its symbol in a `kconfig:` block, the one place both halves of the build
+can see it.
 
 A hand-written panel has no such gate — one browser bundle serves either firmware — which
 is one more reason a pane belongs in the yaml: `when_kconfig` is only available to a
@@ -944,8 +965,9 @@ image build, never to the currently-running container.
    vocabulary of spangap-core's `detect_probe.h`. spangap-core declares the symbol
    **weak** and calls it from `serviceRunStart()` — before the first `onStart()`,
    which is the last moment no bus is claimed — comparing the answer with the board baked into the image; a mismatch logs an
-   error and **halts the device awake** (the task blocks forever, so the console
-   stays up and the reason stays readable), because every pin map in that image
+   error and **halts the device awake** (the task parks on a slow loop with the
+   RTC watchdog disabled, so the console stays up and the reason is re-stated
+   rather than scrolling past), because every pin map in that image
    then belongs to someone else's board. Nothing else in the image references the
    function, so spangap-core keeps it on the link line with `-u detect_hw` — a
    weak undefined reference alone does not extract an archive member, and the

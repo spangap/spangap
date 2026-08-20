@@ -398,6 +398,11 @@ HOST_DEV_PORT=${SPANGAP_DEV_PORT:-9000}
 # .spangap-log inode at 0 bytes). Overridable to dodge a host port clash; the
 # in-container side reads the same SPANGAP_LOG_PORT (passed on every docker exec).
 LOG_PORT=${SPANGAP_LOG_PORT:-2324}
+# Host-side aux serial relay: fronts a second serial device (`spangap monitor
+# --aux <dev>`, sticky in $AUX_FILE) on the bridge so the container can reach a
+# device serial port that is not the console — bytes only, no line state.
+AUX_PORT=${SPANGAP_AUX_PORT:-2325}
+AUX_FILE="$workspace/.spangap-aux-$(uname -s)-$(uname -m)"
 
 # Host-side LAN bridge (see start_bridge). Script is workspace-wide (static
 # content); pid/log are per-host since the bridge is a host-local process — a
@@ -448,6 +453,20 @@ default_device_host() {
     fi
     [ -n "$hn" ] || hn=$(basename "${proj:-device}")
     printf '%s.local\n' "$hn"
+}
+
+# Extra device TCP ports the project asks the container bridge to front, from
+# the resolved straddle.yaml's `bridge_ports:` — a **one-line flow list**
+# (`bridge_ports: [7633]`), because this is read with the same single sed the
+# default hostname is; a block list is invisible here. Ports outside 1-65535
+# are dropped. Empty when nothing is declared or we're outside a straddle.
+project_bridge_ports() {
+    local proj line
+    proj=$(require_straddle cli 2>/dev/null) || return 0
+    line=$(sed -n 's/^[[:space:]]*bridge_ports:[[:space:]]*//p' \
+               "$proj/straddle.yaml" 2>/dev/null | head -1)
+    [ -n "$line" ] || return 0
+    printf '%s\n' "$line" | tr -c '0-9' '\n' | awk '/./ && $0+0>0 && $0+0<65536'
 }
 
 # The active device address: .spangap-tcp's bare host (a stray ":port" is
@@ -633,13 +652,79 @@ def serve_log(lport, path):
         threading.Thread(target=serve_log_client, args=(client, path),
                          daemon=True).start()
 
-# Each arg is "<dhost>:<port>" — listen on :port, splice to dhost:port.
+# Aux serial relay ("serial:<dev>:<lport>"): fronts a host serial device for
+# the container — bytes both ways, no line state. One TCP client at a time (a
+# serial device is exclusive); the device is opened per connection and closed
+# on disconnect, so its DTR follows the client's lifetime and firmware watching
+# line state sees the release.
+def serve_serial(lport, dev):
+    try:
+        import serial as pyserial
+    except ImportError:
+        print(f"spangap-forward: serial relay needs pyserial — :{lport} not started "
+              "(bridge not launched with the workspace venv python?)", flush=True)
+        return
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("0.0.0.0", lport))
+    except OSError as e:
+        print(f"spangap-forward: bind serial :{lport}: {e}", flush=True)
+        return
+    srv.listen(1)
+    while True:
+        try:
+            client, _ = srv.accept()
+        except OSError:
+            return
+        try:
+            sp = pyserial.Serial(dev, 115200, timeout=0.05)
+        except Exception as e:
+            print(f"spangap-forward: open {dev}: {e}", flush=True)
+            client.close()
+            continue
+        stop = threading.Event()
+        def s2c():
+            try:
+                while not stop.is_set():
+                    data = sp.read(4096)
+                    if data:
+                        client.sendall(data)
+            except Exception:
+                pass
+            finally:
+                stop.set()
+                try: client.shutdown(socket.SHUT_WR)
+                except OSError: pass
+        t = threading.Thread(target=s2c, daemon=True)
+        t.start()
+        try:
+            client.settimeout(None)
+            while True:
+                data = client.recv(65536)
+                if not data:
+                    break
+                sp.write(data)
+        except OSError:
+            pass
+        stop.set()
+        t.join(timeout=1)
+        try: sp.close()
+        except Exception: pass
+        client.close()
+
+# Each arg is "<dhost>:<port>" — listen on :port, splice to dhost:port — or
+# "serial:<dev>:<lport>" for the aux serial relay above.
 specs = []
 for a in sys.argv[1:]:
+    if a.startswith("serial:"):
+        dev, _, p = a[len("serial:"):].rpartition(":")
+        threading.Thread(target=serve_serial, args=(int(p), dev), daemon=True).start()
+        specs.append((a, int(p)))
+        continue
     dhost, _, p = a.rpartition(":")
     specs.append((dhost, int(p)))
-for dhost, p in specs:
-    threading.Thread(target=serve, args=(p, dhost, p), daemon=True).start()
+    threading.Thread(target=serve, args=(int(p), dhost, int(p)), daemon=True).start()
 log_port = int(os.environ.get("SPANGAP_LOG_PORT", "0"))
 log_file = os.environ.get("SPANGAP_LOG_FILE", "")
 if log_port and log_file:
@@ -660,17 +745,21 @@ PY
 # directly, so it's a no-op.
 
 # bridge_specs: emit a "<dhost>:<port>" line for each device port the container
-# needs to reach through the bridge — the two CLI ports (ssh, legacy TCP CLI) and
+# needs to reach through the bridge — the two CLI ports (ssh, legacy TCP CLI),
 # the two web ports (http, https/wss) that `spangap dev`'s in-container proxy
-# dials at host.docker.internal.
+# dials at host.docker.internal, and any extra `bridge_ports:` the project's
+# straddle.yaml declares (device services an in-container client dials raw).
 bridge_specs() {
-    local host
+    local host p
     host=$(device_host) || return 0
     [ -n "$host" ] || return 0
     printf '%s:%s\n' "$host" "$SSH_PORT"
     printf '%s:%s\n' "$host" "$TCP_CLI_PORT"
     printf '%s:%s\n' "$host" "$HTTP_PORT"
     printf '%s:%s\n' "$host" "$WSS_PORT"
+    for p in $(project_bridge_ports); do
+        printf '%s:%s\n' "$host" "$p"
+    done
 }
 
 # start_bridge: bring up (or refresh) the forwarder for the configured endpoints.
@@ -680,6 +769,15 @@ start_bridge() {
     [ "$(uname -s 2>/dev/null)" = Darwin ] || return 0
     local specs want
     specs=$(bridge_specs | tr '\n' ' '); specs=${specs% }
+    # The aux serial relay rides the same forwarder when a device is on file
+    # (`spangap monitor --aux <dev>`). It needs pyserial, which the workspace
+    # venv has (esptool depends on it) — so its presence also picks the python.
+    local aux="" py=python3
+    [ -s "$AUX_FILE" ] && aux=$(head -1 "$AUX_FILE" | tr -d ' \r')
+    if [ -n "$aux" ]; then
+        specs="$specs serial:$aux:$AUX_PORT"
+        [ -x "$VENV/bin/python" ] && py="$VENV/bin/python"
+    fi
     # Unlike the device forwards (which need a configured address), the
     # serial-log relay always runs — it's how the in-container `spangap log`
     # reads the log monitor is producing right now — so we launch even with an
@@ -703,7 +801,7 @@ start_bridge() {
     write_forward_script
     # shellcheck disable=SC2086
     SPANGAP_LOG_PORT="$LOG_PORT" SPANGAP_LOG_FILE="$workspace/.spangap-log" \
-        nohup python3 "$FORWARD_SCRIPT" $specs >"$FORWARD_LOG" 2>&1 &
+        nohup "$py" "$FORWARD_SCRIPT" $specs >"$FORWARD_LOG" 2>&1 &
     local pid=$!
     printf '%s\n%s\n' "$pid" "$want" > "$FORWARD_PID"
     if [ -n "$specs" ]; then
@@ -1291,6 +1389,28 @@ monitor)
     # build lands — no restart, and no premature "not in a straddle" warning.
     # Seed an initial value only to decide whether to probe for the toolchain.
     fw=$(monitor_fw)
+    # --aux <dev>: also front this second serial device on the bridge (TCP
+    # :$AUX_PORT, container-reachable) — the RNode endpoint's serial door on a
+    # `usb cdc` console presents as a second device node the monitor itself
+    # never touches. Sticky like the monitor port; `--aux -` clears it.
+    aux_rest=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --aux)
+                [ -n "${2:-}" ] || die "monitor: --aux needs a device path (or - to clear)"
+                if [ "$2" = "-" ]; then
+                    rm -f "$AUX_FILE"
+                else
+                    case $2 in
+                        *[!A-Za-z0-9._/-]*|"") die "monitor: invalid --aux device path '$2'" ;;
+                    esac
+                    printf '%s\n' "$2" > "$AUX_FILE"
+                fi
+                shift 2 ;;
+            *) aux_rest+=("$1"); shift ;;
+        esac
+    done
+    set -- ${aux_rest[@]+"${aux_rest[@]}"}
     if [ $# -gt 0 ]; then
         port=$1; shift
         sticky_set "$PORT_FILE" "$port"
@@ -2330,7 +2450,7 @@ except OSError:
     dev_specs=("127.0.0.1:${HOST_DEV_PORT}+:127.0.0.1:$dev_port")
     if [ -n "$dev_device" ]; then
         dev_specs+=("0.0.0.0:0:$dev_device:$WSS_PORT")
-        for p in "$WSS_PORT" "$HTTP_PORT" "$SSH_PORT" "$TCP_CLI_PORT"; do
+        for p in "$WSS_PORT" "$HTTP_PORT" "$SSH_PORT" "$TCP_CLI_PORT" $(project_bridge_ports); do
             dev_specs+=("0.0.0.0:$p?:$dev_device:$p")
         done
     fi

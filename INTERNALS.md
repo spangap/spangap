@@ -600,8 +600,19 @@ and contribute a builder with `lcdSettingsContribute` on the device.
 ### Add a cron entry from a module
 
 ```cpp
-cronDefault("*/15 *    *    *    *    N    mycmd sub", "mycmd sub");
-// Flags: - = always, A = awake only, N = STA upstream only.
+// Present exactly while the feature is enabled; storageDefault (not Set) so a
+// user's schedule tweak survives. React to the enable switch on the storage
+// task — a module without a long-lived task has nowhere else to host it.
+static void mymodApplyCron(const char*, const char*) {
+    if (storageGetInt("s.mymod.enable"))
+        storageDefault("s.cron.tab.mymod", "*/15 * * * * N mycmd sub");
+    else if (storageExists("s.cron.tab.mymod"))
+        storageUnset("s.cron.tab.mymod");
+}
+// in onInit():
+storageSubscribeChanges("s.mymod.enable", mymodApplyCron, /*onStorageTask=*/true);
+mymodApplyCron(nullptr, nullptr);
+// Flags column: - = always, A = awake only, N = STA upstream only.
 ```
 
 ### Add a net event callback
@@ -706,10 +717,10 @@ CFG / POLL remain edge-only.
 - `app0` (~6.25 MB @ 0x10000) — firmware.
 - `fixed` (~1.44 MB @ 0x670000, **read-only**) — LittleFS, flashed every
   build, mounted at `/fixed`. Contains `webroot/`, `factory_state/`
-  (boot, crontab, net_up, `storage/external/<prefix>.json` blobs), and
+  (boot, net_up, `storage/external/<prefix>.json` blobs), and
   `additional_state/` (first-boot overlay).
 - `state` (128 KB @ 0x7E0000) — LittleFS, read-write, mounted at
-  `/state` **always**. Contains `boot`, `net_up`, `crontab`, TLS certs,
+  `/state` **always**. Contains `boot`, `net_up`, TLS certs,
   ACME key, and `storage/`. Auto-formatted on first boot; `reset factory`
   / `format flash` formats it and copies from `/fixed/factory_state/`.
 

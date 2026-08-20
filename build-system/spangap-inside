@@ -938,7 +938,7 @@ _GEN_HEADER_KCONFIG = (
 
 
 def _name_to_kconfig(repo: str) -> str:
-    """spangap-lcd → SPANGAP_LCD, hw-lilygo-tdeck → HW_TDECK."""
+    """spangap-lcd → SPANGAP_LCD, hw-lilygo-tdeck → HW_LILYGO_TDECK."""
     return repo.upper().replace("-", "_").replace(".", "_")
 
 
@@ -1205,13 +1205,15 @@ def _row_enabled(row: dict, cfgvals: dict[str, str]) -> bool:
     """Whether a row survives its `when_kconfig:` gate — `CONFIG_X` to emit it
     only when that symbol is set, `!CONFIG_X` only when it isn't.
 
-    Resolved against the staged set's `kconfig:` fragments, exactly like a
-    settings scalar's `{ kconfig: … }` form, and with the same limit: a symbol
-    nobody set in a straddle.yaml is *absent*, which reads as unset. So a build
-    that turns a symbol on through `spangap menuconfig` or a buildable's
-    sdkconfig.defaults gates its CODE (the compiler sees the sdkconfig) without
-    gating these rows — a gated feature that must ship as a build variant
-    declares the symbol in a `kconfig:` block, where both halves can see it."""
+    Resolved against collect_kconfig_values, exactly like a settings scalar's
+    `{ kconfig: … }` form: the staged set's presence symbols
+    (`CONFIG_STRADDLE_<REPO>`, so a row can require a sibling straddle) and the
+    symbols straddles set in their `kconfig:` blocks. Anything else is *absent*,
+    which reads as unset — so a build that turns a symbol on through `spangap
+    menuconfig` or a buildable's sdkconfig.defaults gates its CODE (the compiler
+    sees the sdkconfig) without gating these rows. A gated feature that must
+    ship as a build variant therefore declares its symbol in a `kconfig:` block,
+    where both halves can see it."""
     gate = row.get(_SETTINGS_GATE_KEY)
     if gate is None:
         return True
@@ -1252,16 +1254,35 @@ def _surface_rows(rows: list[dict], surface: str) -> list[dict]:
 
 
 def collect_kconfig_values(proj: Manifest, deps: list[Manifest]) -> dict[str, str]:
-    """CONFIG_KEY → value string across every staged straddle's `kconfig:`
-    block (incl. desugared identity values), same precedence as
-    write_sdkconfig_fragments: init order, last wins, buildable last. This is
-    what lets a *settings scalar* reference a board-published Kconfig value
-    (see _settings_scalar) — e.g. a TX-power slider whose max is the board's
-    RF capability. Only fragment-set symbols appear; a symbol left at its
-    component-Kconfig default is absent (callers carry a fallback)."""
+    """CONFIG_KEY → value string as the generated surfaces see the build:
+
+      - the staged set's PRESENCE symbols (CONFIG_STRADDLE_<REPO>, plus the
+        CONFIG_SPANGAP_<ALIAS> short forms), exactly the set
+        write_presence_component declares for the compiler — so a row can be
+        gated on another straddle being staged (gps's motion assist needs imu),
+        which is a fact of the build rather than something a board should have
+        to restate;
+      - every staged straddle's `kconfig:` block (incl. desugared identity
+        values), same precedence as write_sdkconfig_fragments: init order, last
+        wins, buildable last. This is what lets a *settings scalar* reference a
+        board-published Kconfig value (see _settings_scalar) — e.g. a TX-power
+        slider whose max is the board's RF capability.
+
+    A fragment wins over a presence symbol of the same name (they are emitted
+    first), which matters to nobody today and keeps "what a straddle wrote"
+    authoritative. Beyond those two sources a symbol is absent: one left at its
+    component-Kconfig default, or set only from a buildable's sdkconfig.defaults
+    or `spangap menuconfig`, does not appear here (callers carry a fallback)."""
     sources = init_order(deps) + [proj]
     staged_names = {s.name for s in sources}
     out: dict[str, str] = {}
+    # Presence symbols for the staged deps — the buildable itself gets none,
+    # here or in write_presence_component, so both halves agree about it too.
+    for m in deps:
+        out[f"CONFIG_STRADDLE_{_name_to_kconfig(m.repo)}"] = "y"
+        alias = _SHORTCUT_ALIASES.get(m.repo)
+        if alias:
+            out[f"CONFIG_{alias}"] = "y"
     for m in sources:
         for raw in _flatten_kconfig(m.kconfig, staged_names) + m.identity_kconfig:
             line = raw.strip()
@@ -4263,12 +4284,24 @@ def _ssh_auth_ok(host: str) -> bool:
         return False
 
 
-def _tcp_open(host: str, port: int, timeout: float = 5.0) -> bool:
+def _port_answers(host: str, port: int, timeout: float = 5.0) -> bool:
+    """True only when <host>:<port> speaks — at least one byte arrives. A bare
+    connect proves nothing here: on Docker Desktop every probe lands on the
+    host-side bridge, which accepts unconditionally and only then dials the
+    device, so a dead device port still connects and then falls silent. Both
+    ports we probe talk first (sshd its version banner, the TCP CLI its
+    prompt), so silence means unreachable."""
     try:
-        socket.create_connection((_connect_host(host, port), port), timeout=timeout).close()
-        return True
+        s = socket.create_connection((_connect_host(host, port), port), timeout=timeout)
     except OSError:
         return False
+    try:
+        s.settimeout(timeout)
+        return bool(s.recv(1))
+    except OSError:
+        return False
+    finally:
+        s.close()
 
 
 def _print_authorize(host: str, key: Path) -> None:
@@ -4305,9 +4338,9 @@ def cmd_cli(argv: list[str]) -> int:
         if _ssh_auth_ok(host):                       # 2. ssh in
             argv2 = _ssh_argv(host, rest)
             os.execvp(argv2[0], argv2)               # replaces this process
-        if _tcp_open(host, TCP_CLI_PORT):            # 3. legacy TCP CLI
+        if _port_answers(host, TCP_CLI_PORT):        # 3. legacy TCP CLI
             return _tcp_cli_client(host, rest)
-        if _tcp_open(host, SSH_PORT):                # 4. sshd up, key not trusted
+        if _port_answers(host, SSH_PORT):            # 4. sshd up, key not trusted
             _print_authorize(host, key)
             return 1
         # 5. nothing answers — the device is unreachable from here.

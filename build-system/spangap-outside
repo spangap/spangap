@@ -1271,7 +1271,7 @@ push-all)
                 printf '%s\n' \
                     "usage: spangap push-all [--force] [DIR]" \
                     "  Push every git repo directly under DIR (default: the workspace root)," \
-                    "  creating its GitHub repo (private) first if it doesn't exist yet." \
+                    "  creating its GitHub repo first if it doesn't exist yet." \
                     "  --force rewrites the remote branch (needed after a history rewrite)." \
                     "  Requires an authenticated \`gh\`; new repos are created PUBLIC."
                 exit 0 ;;

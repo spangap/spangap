@@ -298,9 +298,12 @@ so extra trees can only be middleware.
 
 **Browser-side edits need no build.** The dev server runs Vite in the buildable's own
 `web-interface/`, and every straddle browser half is an npm-linked `file:` dep served as
-live source (`quasar.config.ts` keeps them out of dep pre-bundling for exactly that
-reason), so editing `web-interface/src/` or any `<straddle>/browser/src/` is picked up by
-HMR while `spangap dev` runs. Only the *generated* inputs — `src/boot/straddles.gen.ts`
+live source, so editing `web-interface/src/` or any `<straddle>/browser/src/` is picked up
+by HMR while `spangap dev` runs. That takes two plugins-worth of `quasar.config.ts`: the
+linked deps are kept out of dep pre-bundling (a stale optimized chunk would serve the code
+from before the edit), and `spangap-browser/vite/linked-deps-hmr` watches them where they
+really live — Vite's own watcher ignores everything under `node_modules`, which is where
+`preserveSymlinks` puts them. Only the *generated* inputs — `src/boot/straddles.gen.ts`
 (registration dispatcher + declarative settings panels), `src/app-icons/`, and the `file:`
 deps in `package.json` — come from a build, and **`spangap web`** rewrites just those with
 no compile: run it after changing a `browser_register:`/`settings:` block or the staged
@@ -529,16 +532,28 @@ on the screen: a straddle may name a top-level menu and give it an order while l
 empty, and the menu appears the moment something contributes to it. That is what lets the
 main menus be named in one place each (see below) instead of repeated by every contributor.
 
-**Sections merge.** Blocks concatenate, but their **sections** do not: a second straddle
-writing `section: "Status"` at a node that already has one does not get a second heading —
-its rows land at the end of the existing section's rows. Rows written before any section
-join the headerless run at the top of the node. Two straddles describing the same subject
+**Three heading levels.** `title:` names the PAGE — stated once, by the straddle the menu
+belongs to, and it starts no group, so it sits at the top and indents nothing. `heading:`
+is a group (level 2), the highest level a straddle that does not own the menu should
+state. `section:` is a sub-group inside one (level 3). The browser renders each at its own
+indent and indents what follows; the display gives each its own look — the page's name in
+white under a rule, the two group levels in the accent colour a size apart — but takes no
+indentation from any of them, having no width to spend on one. Headings are written in
+**sentence case** — a heading names a subject, it is not a title of a work.
+
+**Headings merge, and scope the merge.** Blocks concatenate, but their headings do not: a
+second straddle writing `heading: "LoRa"` at a node that already has one lands its rows
+inside the existing LoRa group rather than opening a second one, and within a group the
+same is true of `section:` runs. Only within that group — two straddles may both write
+`section: "Interface access code (IFAC)"` under different headings without their rows
+joining. Rows written before any heading — the pane's `title:` among them — form the
+headerless group at the top of the node. Two straddles describing the same subject
 therefore arrive under one heading instead of beside each other, which is what a node
 nobody owns is for. The match is exact (a case-only near-miss stays two headings, with a
 build warning), and it resolves here, at lowering time: each runtime receives a node's
 rows as one opaque builder, so the generator is the last place that still has the rows
 themselves. The consequence to know is that a straddle's rows can end up split across the
-pane — the section a row sits under is where it goes, not where it was written.
+pane — the heading a row sits under is where it goes, not where it was written.
 
 ```yaml
 settings:
@@ -608,8 +623,27 @@ them will need code:
    destroying it — so a sentinel updating `s.ntp.tz` is `ntp.tz.set`, not
    `s.ntp.tz.set`. A sentinel's `cmd:` is a fixed key, not a template.
 
-**Row kinds.** `section` / `caption` (text), `switch{label,key}`,
-`slider{label,key,min,max}`, `text{label,key,secret?,placeholder?,placeholder_key?}`,
+**Row kinds.** `title` / `heading` / `section` / `caption` (text),
+`advanced{label?,rows}` (a disclosure group), `switch{label,key}`,
+`slider{label,key,min,max}`,
+`integer{label,key,min?,max?,step?,buttons?}` — a number **typed in** rather
+than dragged to, which is what most quantities in this tree actually are: a
+timeout, a port, a count. The field takes digits only, and a value outside the
+stated bounds is refused on commit with a warning modal naming the range —
+refused rather than clamped, because clamping stores a number nobody typed and
+does it silently. A bound the row leaves out is a bound the quantity does not
+have. `buttons: true` adds a `-`/`+` pair, after the field and its unit, stepping by
+`step` (default 1). The step SNAPS to its own multiples rather than adding to
+what is there: at step 5, down from 23 is 20 and then 15, so a hand-typed number
+joins the grid on the first press. An integer field is a THIRD of a text
+field's width, since a number is a handful of characters. Keep `slider:` for a quantity that is genuinely felt rather than known —
+a brightness, a volume.
+`ipv4{label,key,placeholder?,placeholder_key?}` — a dotted quad, taking digits
+and dots only and refusing anything that is not four octets of 0-255, with the
+same warning modal. **Empty is always accepted** and means unset: that is how a
+fixed address is handed back to DHCP, and how a mask or gateway is left for the
+network to supply.
+`text{label,key,secret?,placeholder?,placeholder_key?}`,
 `dropdown{label,key,options:[{v,l}],searchable?}`,
 `timezone{label,field,placeholder_key?}` (an IANA zone picker, form fields only:
 optionless in the yaml, because each surface brings its own list — the browser
@@ -631,6 +665,42 @@ its kind — the same placement for all three gates:
 `when_key` is purely runtime: both surfaces subscribe, and the row exists while the key is
 truthy. Inside a form or an item editor the key may be a `{field}` template referencing a
 sibling field (`when_key: "{dhcp}"`), which is answered from the local buffer instead.
+
+**`unit:`** is a word printed after a field — a unit (`min`, `dBm`) or the fixed tail of
+what is being entered (`.duckdns.org`). It is never part of the value and never stored. A
+field carrying one RIGHT-ALIGNS its value, so the entry and the word it belongs to read as
+one quantity instead of drifting apart across the column. It does not change the field's
+width — a subdomain with `.duckdns.org` after it still needs room for a subdomain.
+Available on `text`, `integer` and `ipv4`.
+
+**`short: true`** on a text row gives it a third of a field's usual width, for an entry
+that is a handful of characters — a port, a sync word, a subdomain. A field the pane has to
+guess the length of is better guessed short: a wide box invites a long answer that will not
+fit anywhere else. Numbers are short already, and so is anything with a `unit:`.
+
+**A dropdown is sized to its options**, not stretched across the column — to the LONGEST of
+them, so it does not resize as you choose. One as wide as the pane reads as a text field,
+and a column of pickers of differing widths says at a glance which choices are small ones.
+
+**A caption's column depends on what it follows.** Directly under a heading it is about the
+GROUP, so it spans both columns at the heading's own indent. Under a field it is about that
+field, so it starts on the control column — set against the labels instead it reads as
+another label with no control beside it. Only the row order knows which, so the generator
+settles it for pane rows and each runtime's walk settles it inside a form.
+
+**`secret: true`** on a text row MASKS it and offers a reveal; it does not make
+it write-only. The value is loaded, shown when asked for, and edited in place
+like any other. There is no write-only field in this tree and no side store
+behind one: a passphrase an operator is expected to check against the other end
+of a link is not a credential to be posted into a void, and one they cannot read
+back is one they cannot debug. Masking is for the person standing behind them,
+and that is all it is for.
+
+**Links in a caption.** `[label](url)` is a link, written the one way everywhere.
+The browser makes it an anchor; the display keeps the label and drops the URL,
+having nowhere to send anybody. It is a link syntax and not a markdown parser —
+nothing else is interpreted, and anything that does not close both brackets is
+shown exactly as written.
 
 A text row's **`placeholder_key:`** names a key holding the placeholder text, for a hint
 only the device can supply — the MAC it would use if the field is left blank, the port it
@@ -689,6 +759,11 @@ lets several groups sit under one. A line may be `when_key`-gated, and the colum
 measured over every line including the hidden ones, so a line appearing never shifts it.
 A gate on the `info:` row itself hides the whole group.
 
+**Where a button sits.** A `button:` or a `buttons:` row starts on the CONTROL column,
+where every field on the pane starts, rather than at the pane's left edge — a button is a
+control, and one that begins a third of the way further left reads as belonging to none of
+the rows around it. `buttons:` then gathers its line at the `align:` edge OF THAT COLUMN.
+
 **Colour.** Anywhere a button is described — a `button:`, one of a `buttons:` row, a
 dialog button, a collection's per-item action — `color:` states its colour, from the one
 palette a status pill uses and through the same table on both surfaces: `red`, `green`,
@@ -729,13 +804,14 @@ device) is a `form` whose handler validates the submitted name, not a dropdown.
 ```yaml
       - list:
           label: "Peers"
+          caption: "Tried in this order."   # optional, under the heading
           key: s.rns_tcp.peers      # per-field objects; packed strings don't bind
           id: host                  # the field identifying an item
           item: "{name}"            # row title
           subtitle: "{host}:{port}" # optional second line
           status: "rns_tcp.peer.{id}"   # ephemeral key holding packed "text|color"
           empty: "No peers configured."
-          orderable: true
+          reorder: true
           cmd: rns_tcp.peer         # sentinel base
           add:  [ { label: "Add peer", form: { fields: [...] } } ]
           remove: { confirm: "Remove {name}?" }
@@ -758,34 +834,43 @@ identical payload be submitted twice — a cleared key can't dedup the next writ
 arrives as an empty string and erases what was stored — that is how a fixed IP is handed
 back to DHCP. A field the editor does not carry *at all* is not being edited, and the
 handler must fill it in from the item before validating or writing. That is what lets an
-`edit:` block leave a field out: spangap-net's detail page shows the SSID in its
-`section:` heading rather than as a row, and a handler that read absent as empty would
-erase the SSID on every Save and then reject the entry for having none.
+`edit:` block leave a field out: spangap-net's detail page is headed by the SSID and does
+not offer it as a row, and a handler that read absent as empty would erase the SSID on
+every Save and then reject the entry for having none.
 
-**Per-item secrets** stay out of the synced item object when they matter: the form carries
-an ordinary `field:` with `secret: true`, and the handler routes that field to an
-**id-keyed** side store (iface-tcp: `secrets.tcp.peer_ifac.<id>`) instead of writing it
-into the item. Id-keyed, never slot-keyed — slots shift on remove and permute on reorder.
-The field is write-only: the editor prefills nothing for it, and the handler treats an
-empty submit as *unchanged*, so saving an untouched form never erases a secret. (A secret
-the operator may freely read back — a WiFi password — can instead live in the item as a
-plain `secret: true` field.)
+**A per-item secret is an ordinary field of the item**, carrying `secret: true` so it is
+masked where it is shown. It prefills like every other field, and blanking it clears it —
+an editor that showed nothing and treated empty as "unchanged" could never be used to
+remove one. The `secrets.` namespace is for values the device generates and nobody types:
+a host key, a private key, an auth hash. A passphrase somebody was given for the other end
+of a link is not one of those.
 
-`orderable` writes the complete id order to `<cmd>.order` as a comma-joined list — the
-natural output of both a web drag-drop and an LCD up/down press. Firmware treats the payload
-as a **preference permutation**: reorder recognized ids into that relative order, ignore
-unknown ids, keep unmentioned ids in place. That makes it idempotent and benign under
-concurrent edits, which is what lets the web list hold an optimistic order until the
-re-published array lands.
+`reorder` makes the rows draggable, and writes the complete id order to `<cmd>.order` as a
+comma-joined list. In the browser the row itself is the handle; on the display the drag has
+to start on the grip at the row's right edge, because a vertical drag anywhere else on a
+list is the pane scrolling — which is what a finger on a long pane is nearly always doing.
+Firmware treats the payload as a **preference permutation**: reorder recognized ids into
+that relative order, ignore unknown ids, keep unmentioned ids in place. That makes it
+idempotent and benign under concurrent edits, which is what lets the web list hold an
+optimistic order until the re-published array lands.
+
+`caption:` is a line between the collection's heading and its rows — what the list is, and
+what its order means where the order is the operator's to set. The rows themselves are the
+device's own data and carry no room for prose.
 
 The **item editor** (`edit:`) is the same mechanism as a form: a pane over a key scope, a
 dialog on the web and a modal on the LCD, with every row feature available including
 `when_key` over sibling fields and `{field}` templating in a `section:` heading.
 
+**Both surfaces head it with the item's own title** — `item:` substituted over the item
+being edited, since the collection's name over an editor ("Known networks") says nothing
+about which one of them is open. So a collection names its detail page by having named its
+rows, and an `edit:` block states no heading of its own.
+
 On the **LCD it is the item's detail page**, and it is where everything that acts on one
 item lives: tapping anywhere on a list row opens it, and it carries the `actions:` buttons
 and Delete alongside Save and Cancel. A list row itself shows the item and nothing else —
-title, subtitle, status pill, and the reorder arrows when `orderable`, because those are
+title, subtitle, status pill, and the drag grip when `reorder`, because those are
 about the row's place rather than the item. Five buttons on a 320 px row is a row nobody
 can hit. The browser has the width for them and keeps them on the row.
 
@@ -810,13 +895,14 @@ that may be well below the fold. Runtime contract: closing the popup, or leaving
 **clears the `refresh` target key**, so no straddle carries a visibility timer for "stop
 scanning on leave".
 
-A slider's `min`/`max`/`default` may also be `{ kconfig: CONFIG_NAME, default: N }`:
+A numeric bound — a slider's or an integer's `min`/`max`, and a `default:` — may also be
+`{ kconfig: CONFIG_NAME, default: N }`:
 resolved at lowering time from the staged set's collected `kconfig:` fragments
 (`collect_kconfig_values`, same precedence as the fragment file), so a **board** can size
 a control to its hardware. The `default` applies when no staged straddle sets the symbol
 (component-Kconfig defaults are invisible to the generator).
 
-A slider's `min`/`max` — not its `default` — may instead be
+Those `min`/`max` — not a `default:` — may instead be
 `{ key: <storage key>, default: N }`: the bound is read from a value the **device**
 publishes, when the row is built on the LCD and reactively on the web. Reach for it when
 the real limit is something the firmware determines and the build cannot: a capability
@@ -864,7 +950,7 @@ The three generated surfaces:
   generated file small and puts the behaviour in one reviewable place. The body is emitted
   **only when `spangap-lcd` is staged** (gated globally, not per-contribution).
 - **Storage defaults** → `spangapSettingsGenDefaults()` (also in that gen file), one
-  `storageDefault()` per binding row (`switch`/`slider`/`text`/`dropdown`) that carries a
+  `storageDefault()` per binding row (`switch`/`slider`/`integer`/`text`/`dropdown`) that carries a
   `default:` **and** whose key is persisted config (`s.` prefix); the C literal type follows
   the YAML value's type. **Always emitted** (headless/web builds seed defaults too), and
   called after `spangapInit`, before the `serviceRunInit()` walk. Ephemeral keys, secrets

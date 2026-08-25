@@ -305,7 +305,7 @@
           }
         },
         "rows": {
-          "description": "The rows this contribution adds to the node, top to bottom. Each row is an object whose kind key (section/caption/switch/slider/text/dropdown/value/button/list) carries the spec, plus the optional `when_kconfig`/`when_key`/`when_surface`/`order` modifiers.",
+          "description": "The rows this contribution adds to the node, top to bottom. Each row is an object whose kind key (title/heading/section/caption/advanced/switch/slider/integer/ipv4/text/dropdown/timezone/value/button/buttons/info/list) carries the spec, plus the optional `when_kconfig`/`when_key`/`when_surface`/`order` modifiers.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/settingsRow"
@@ -344,7 +344,7 @@
       ]
     },
     "settingsBound": {
-      "description": "A slider bound: a settingsScalar, or { key: <storage key>, default: N } — read from a value the device publishes at run time rather than fixed at build time. Use it when the firmware knows the real limit and the build does not, e.g. a capability detected on the hardware itself. The default applies until the key exists.",
+      "description": "A numeric bound on a `slider:` or an `integer:`: a settingsScalar, or { key: <storage key>, default: N } — read from a value the device publishes at run time rather than fixed at build time. Use it when the firmware knows the real limit and the build does not, e.g. a capability detected on the hardware itself. The default applies until the key exists.",
       "oneOf": [
         {
           "$ref": "#/$defs/settingsScalar"
@@ -524,6 +524,16 @@
       "anyOf": [
         {
           "required": [
+            "title"
+          ]
+        },
+        {
+          "required": [
+            "heading"
+          ]
+        },
+        {
+          "required": [
             "section"
           ]
         },
@@ -534,12 +544,27 @@
         },
         {
           "required": [
+            "advanced"
+          ]
+        },
+        {
+          "required": [
             "switch"
           ]
         },
         {
           "required": [
             "slider"
+          ]
+        },
+        {
+          "required": [
+            "integer"
+          ]
+        },
+        {
+          "required": [
+            "ipv4"
           ]
         },
         {
@@ -608,11 +633,40 @@
           "description": "Orders this row among its siblings. Declaration order is the default and is usually what you want; where an order is stated it wins, per the global rule (ordered first ascending, unordered after in arrival order).",
           "type": "integer"
         },
+        "title": {
+          "type": "string",
+          "description": "The pane's heading (level 1): it names the page and is stated once, by the straddle the menu belongs to — e.g. \"Reticulum Interfaces\". Not a group: it starts no heading group, so it stays at the top of the pane and indents nothing."
+        },
+        "heading": {
+          "type": "string",
+          "description": "A group heading (level 2) — the highest level a straddle that does not own the menu should state, e.g. \"TCP Interface\". Everything under it is indented one step. Heading groups scope the merge: blocks contributed at one node join by heading title first, and section titles merge only within their heading group. On the LCD all three levels render as the one section style, with no indentation."
+        },
         "section": {
-          "type": "string"
+          "type": "string",
+          "description": "A sub-group heading (level 3) inside a `heading:` group, e.g. \"Outbound Peers\" under \"TCP Interface\". Rendered at the group's content indent, and everything under it indents one step further."
         },
         "caption": {
-          "type": "string"
+          "type": "string",
+          "description": "Descriptive text. Rendered one indent step deeper than the rows it sits among, so it reads as an aside about them rather than as one of them."
+        },
+        "advanced": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows"
+          ],
+          "description": "A disclosure group: the browser renders one button (default label \"Advanced Settings\") that expands the nested rows in place; the LCD renders the label as a section with the rows inline. Usable in a pane (rows bind storage keys) and in a collection's item editor (rows bind fields). Storage defaults inside it still seed.",
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/settingsRow"
+              }
+            }
+          }
         },
         "switch": {
           "type": "object",
@@ -668,6 +722,83 @@
             }
           }
         },
+        "integer": {
+          "description": "A number typed in, not dragged to. The field accepts digits only (and a leading minus where `min` allows one); a value outside `min`/`max` is refused on commit with a warning modal and the control goes back to what it held, so nothing out of range ever reaches storage. Prefer this to a `slider:` wherever the operator has an exact number in mind — a timeout, a port, a count — and keep the slider for a quantity that is genuinely felt rather than known (a brightness, a volume).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "label"
+          ],
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            },
+            "field": {
+              "type": "string",
+              "description": "Bind to a form/item-editor field of this name instead of a storage key."
+            },
+            "min": {
+              "description": "Lower bound. Omit where the quantity has none.",
+              "$ref": "#/$defs/settingsBound"
+            },
+            "max": {
+              "description": "Upper bound. Omit where the quantity has none.",
+              "$ref": "#/$defs/settingsBound"
+            },
+            "unit": {
+              "description": "A word printed after the field, in the field's own row: a unit (\"min\", \"dBm\", \"kHz\") or the fixed tail of what is being entered (\".duckdns.org\"). It is not part of the value and never stored. A field carrying one RIGHT-ALIGNS its value, so the number and the word it belongs to read as one quantity instead of drifting apart across the column.",
+              "type": "string"
+            },
+            "buttons": {
+              "description": "Put a - and a + beside the field, stepping by `step`. Omit on a number nobody nudges (a port), state it where the neighbouring values are the interesting ones (a timeout, a count).",
+              "type": "boolean"
+            },
+            "step": {
+              "description": "What the +/- buttons move by, default 1. A step SNAPS to its own multiples rather than adding to whatever is there: with `step: 5`, down from 23 is 20, then 15, and up from 23 is 25. So a hand-typed number joins the grid on the first press instead of carrying its offset forever.",
+              "$ref": "#/$defs/settingsScalar"
+            },
+            "default": {
+              "$ref": "#/$defs/settingsScalar"
+            }
+          }
+        },
+        "ipv4": {
+          "description": "A dotted-quad address or mask. The field takes digits and dots only, and a non-empty value that is not four octets of 0-255 is refused on commit with a warning modal, so a half-typed address never reaches storage. EMPTY IS ALWAYS ACCEPTED and means unset — that is how a fixed address is handed back to DHCP, and a mask or gateway left blank is left blank.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "label"
+          ],
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            },
+            "field": {
+              "type": "string",
+              "description": "Bind to a form/item-editor field of this name instead of a storage key."
+            },
+            "unit": {
+              "description": "A word printed after the field, in the field's own row: a unit (\"min\", \"dBm\", \"kHz\") or the fixed tail of what is being entered (\".duckdns.org\"). It is not part of the value and never stored. A field carrying one RIGHT-ALIGNS its value, so the number and the word it belongs to read as one quantity instead of drifting apart across the column.",
+              "type": "string"
+            },
+            "placeholder": {
+              "type": "string"
+            },
+            "placeholder_key": {
+              "description": "A key holding the placeholder text, for a hint only the device can supply. Wins over a literal `placeholder`.",
+              "type": "string"
+            },
+            "default": {
+              "type": "string"
+            }
+          }
+        },
         "text": {
           "type": "object",
           "additionalProperties": false,
@@ -691,6 +822,14 @@
               ]
             },
             "secret": {
+              "type": "boolean"
+            },
+            "unit": {
+              "description": "A word printed after the field, in the field's own row: a unit (\"min\", \"dBm\") or the fixed tail of what is being entered (\".duckdns.org\"). It is not part of the value and never stored. A field carrying one RIGHT-ALIGNS its value, so the entry and the word it belongs to read as one thing instead of drifting apart across the column.",
+              "type": "string"
+            },
+            "short": {
+              "description": "A third of a field's usual width — for an entry that is a handful of characters (a port, a sync word, a subdomain) rather than a sentence. A field the pane has to guess the length of is better guessed short: a wide box invites a long answer that will not fit anywhere else. Numbers are short already.",
               "type": "boolean"
             },
             "placeholder": {
@@ -893,6 +1032,10 @@
             "label": {
               "type": "string"
             },
+            "caption": {
+              "description": "Descriptive text between the collection's heading and its rows, for what the list IS and what its order means — the place to say it, since the rows themselves are the device's data and carry no room for prose.",
+              "type": "string"
+            },
             "key": {
               "description": "The array key. Items are per-field objects under it; a packed multi-field string does not bind, so an owner adopting this block migrates its storage shape.",
               "type": "string"
@@ -917,8 +1060,8 @@
               "description": "Caption shown when the array is empty.",
               "type": "string"
             },
-            "orderable": {
-              "description": "Enable reordering. The UI writes the complete id order to `<cmd>.order` as a comma-joined list; the firmware treats it as a PREFERENCE PERMUTATION — reorder recognized ids into that relative order, ignore unknown ids, leave unmentioned ids in place — which keeps it idempotent and benign under concurrent edits.",
+            "reorder": {
+              "description": "Let the operator drag the rows into the order they want. On the display the drag starts on a grip at the right of each row, so a vertical drag anywhere else still scrolls the pane; in the browser the row itself is the handle. The UI writes the complete id order to `<cmd>.order` as a comma-joined list; the firmware treats it as a PREFERENCE PERMUTATION — reorder recognized ids into that relative order, ignore unknown ids, leave unmentioned ids in place — which keeps it idempotent and benign under concurrent edits.",
               "type": "boolean"
             },
             "cmd": {

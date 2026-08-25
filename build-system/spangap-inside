@@ -1170,7 +1170,7 @@ def init_order(deps: list[Manifest]) -> list[Manifest]:
 # ---------------------------------------------------------------------------
 
 # Row kinds that bind a config key (carry a `default:` worth seeding).
-_SETTINGS_BINDING_KINDS = {"switch", "slider", "text", "dropdown"}
+_SETTINGS_BINDING_KINDS = {"switch", "slider", "integer", "ipv4", "text", "dropdown"}
 
 # Row-level modifiers: not part of a row's kind, so they are stripped before
 # the kind is read. `when_kconfig` and `when_surface` resolve at build time,
@@ -1300,8 +1300,8 @@ def _settings_scalar(spec_val, cfgvals: dict[str, str], where: str) -> int:
     hardware (the default covers builds where no board sets the symbol)."""
     if isinstance(spec_val, dict):
         if "key" in spec_val:
-            die(f"{where}: a storage-key bound is only valid on a slider's "
-                f"min/max, where the control can read it at run time")
+            die(f"{where}: a storage-key bound is only valid on a slider's or an "
+                f"integer's min/max, where the control can read it at run time")
         name = spec_val["kconfig"]
         raw = cfgvals.get(name)
         if raw is None:
@@ -1314,7 +1314,8 @@ def _settings_scalar(spec_val, cfgvals: dict[str, str], where: str) -> int:
 
 
 def _settings_bound(spec_val, cfgvals: dict[str, str], where: str) -> tuple[int, str | None]:
-    """A slider bound: a settings scalar (fixed at build time), or
+    """A numeric bound (a slider's or an integer's): a settings scalar (fixed at
+    build time), or
     `{ key: <storage key>, default: int }` — a value the device publishes and the
     control reads at run time. Returns (fallback, key or None).
 
@@ -1419,6 +1420,29 @@ def _sorted_rows(rows: list[dict], cfgvals: dict[str, str]) -> list[dict]:
         key=lambda pair: pair[0])]
 
 
+def _heading_runs(rows: list[dict]) -> list[tuple[str | None, dict | None, list[dict]]]:
+    """A row block split at its `heading:` rows (level 2 — the groups) into
+    (title, heading row, rows) groups. Rows before the first heading form the
+    group titled None. Groups are what scope section merging: two straddles may
+    both write `section: "Access code"` under different headings without their
+    rows joining."""
+    groups: list[tuple[str | None, dict | None, list[dict]]] = []
+    title: str | None = None
+    head: dict | None = None
+    cur: list[dict] = []
+    for r in rows:
+        kind, spec = _row_kind(r)
+        if kind == "heading":
+            if cur or title is not None:
+                groups.append((title, head, cur))
+            title, head, cur = str(spec), r, []
+        else:
+            cur.append(r)
+    if cur or title is not None:
+        groups.append((title, head, cur))
+    return groups
+
+
 def _section_runs(rows: list[dict]) -> list[tuple[str | None, dict | None, list[dict]]]:
     """A row block split at its `section:` rows into (title, heading row, rows)
     runs. The rows before the first section are the run titled None, whose
@@ -1442,18 +1466,44 @@ def _section_runs(rows: list[dict]) -> list[tuple[str | None, dict | None, list[
 
 
 def _merge_rows(blocks: list[list[dict]], path: str) -> list[dict]:
-    """Every row block at one node, as one list of rows.
+    """Every row block at one node, as one list of rows, merged at two levels.
 
-    Runs under the SAME SECTION TITLE join: a second straddle writing
-    `section: "Status"` does not get a second heading, its rows land at the end
-    of the existing one. Rows declared before any section join the headerless
-    run, which stays at the top of the node wherever it was written. That is
-    the whole point of a node nobody owns — two straddles describing the same
-    subject arrive under one heading instead of beside each other.
+    Level 2 (`heading:`) groups join on the SAME HEADING TITLE — a straddle
+    contributing under `heading: "LoRa"` lands its rows inside the existing
+    LoRa group. Rows before any heading — the pane's `title:` among them —
+    form the headerless group at the top.
+    Level 3: within one heading group, `section:` runs under the SAME SECTION
+    TITLE join exactly as before — and only within that group, so two
+    straddles may both write `section: "Access code"` under different
+    headings without their rows joining. That is the whole point of a node
+    nobody owns — two straddles describing the same subject arrive under one
+    heading instead of beside each other.
 
     Merging has to happen HERE. Each runtime receives a node's contributions as
     opaque per-node builders, so neither could interleave two of them; the
     generator is the last place that still has the rows themselves."""
+    gorder: list[str | None] = []
+    gblocks: dict[str | None, list[list[dict]]] = {}
+    gheads: dict[str | None, dict] = {}
+    for rows in blocks:
+        for gtitle, ghead, group_rows in _heading_runs(rows):
+            if gtitle is not None and gtitle not in gheads:
+                gheads[gtitle] = ghead
+            if gtitle not in gblocks:
+                gblocks[gtitle] = []
+                gorder.insert(0, None) if gtitle is None else gorder.append(gtitle)
+            gblocks[gtitle].append(group_rows)
+    out: list[dict] = []
+    for gtitle in gorder:
+        if gtitle is not None:
+            out.append(gheads[gtitle])
+        out.extend(_merge_section_rows(gblocks[gtitle], path))
+    return out
+
+
+def _merge_section_rows(blocks: list[list[dict]], path: str) -> list[dict]:
+    """Level-2 merge: every row block of ONE heading group, its section runs
+    joined by title."""
     order: list[str | None] = []
     runs: dict[str | None, list[dict]] = {}
     heads: dict[str | None, dict] = {}
@@ -1562,12 +1612,13 @@ def _web_form(form: dict, cfgvals: dict[str, str], cmd: str | None = None) -> di
 def _web_collection(spec: dict, cfgvals: dict[str, str]) -> dict:
     out: dict = {"kind": "list", "k": spec["key"], "id": spec["id"],
                  "item": spec["item"], "cmd": spec["cmd"]}
-    for src, dst in (("label", "label"), ("subtitle", "subtitle"),
+    for src, dst in (("label", "label"), ("caption", "caption"),
+                     ("subtitle", "subtitle"),
                      ("status", "status"), ("empty", "empty")):
         if src in spec:
             out[dst] = spec[src]
-    if spec.get("orderable"):
-        out["orderable"] = True
+    if spec.get("reorder"):
+        out["reorder"] = True
     adds = spec.get("add") or []
     ordered_adds = [a for _k, a in sorted(
         ((_order_key(a.get("order"), i), a) for i, a in enumerate(adds)),
@@ -1628,8 +1679,14 @@ def _web_button(btn: dict, cfgvals: dict[str, str]) -> dict:
 
 def _web_row(row: dict, cfgvals: dict[str, str]) -> dict:
     kind, spec = _row_kind(row)
-    if kind in ("section", "caption"):
+    if kind in ("title", "heading", "section", "caption"):
         out: dict = {"kind": kind, "text": spec}
+    elif kind == "advanced":
+        out = {"kind": "advanced",
+               "label": spec.get("label", "Advanced Settings") if isinstance(spec, dict)
+                        else "Advanced Settings",
+               "rows": [_web_row(r, cfgvals)
+                        for r in _sorted_rows(spec["rows"], cfgvals)]}
     elif kind == "switch":
         out = {"kind": "switch", "label": spec["label"]}
     elif kind == "slider":
@@ -1641,10 +1698,34 @@ def _web_row(row: dict, cfgvals: dict[str, str]) -> dict:
             out["minKey"] = lo_key
         if hi_key:
             out["maxKey"] = hi_key
-    elif kind == "text":
-        out = {"kind": "text", "label": spec["label"]}
+    elif kind == "integer":
+        # A bound the yaml leaves out is a bound the quantity does not have, so
+        # it is absent here rather than defaulted to a number the control would
+        # then enforce.
+        where = f"integer {spec.get('key') or spec.get('field')}"
+        out = {"kind": "integer", "label": spec["label"]}
+        for src, num, keyname in (("min", "min", "minKey"), ("max", "max", "maxKey")):
+            if src not in spec:
+                continue
+            val, val_key = _settings_bound(spec[src], cfgvals, where)
+            out[num] = val
+            if val_key:
+                out[keyname] = val_key
+        step = _settings_scalar(spec.get("step", 1), cfgvals, where)
+        if step != 1:
+            out["step"] = step
+        if spec.get("buttons"):
+            out["buttons"] = True
+        if "unit" in spec:
+            out["unit"] = spec["unit"]
+    elif kind in ("text", "ipv4"):
+        out = {"kind": kind, "label": spec["label"]}
         if spec.get("secret"):
             out["secret"] = True
+        if spec.get("short"):
+            out["short"] = True
+        if "unit" in spec:
+            out["unit"] = spec["unit"]
         if "placeholder" in spec:
             out["placeholder"] = spec["placeholder"]
         if "placeholder_key" in spec:
@@ -1724,8 +1805,13 @@ def _settings_web_nodes(contribs: list[SettingsContribution],
 # ---- LCD lowering -------------------------------------------------------
 
 _LCD_ROW_KIND = {
+    # Three heading levels, told apart on the display the way they are in the
+    # browser — by size, and by the page's own name not taking the accent that
+    # marks a divider within it.
+    "title": "LCD_ROW_TITLE", "heading": "LCD_ROW_HEADING",
     "section": "LCD_ROW_SECTION", "caption": "LCD_ROW_CAPTION",
     "switch": "LCD_ROW_SWITCH", "slider": "LCD_ROW_SLIDER",
+    "integer": "LCD_ROW_INTEGER", "ipv4": "LCD_ROW_IPV4",
     "text": "LCD_ROW_TEXT", "dropdown": "LCD_ROW_DROPDOWN",
     "timezone": "LCD_ROW_TIMEZONE",
     "value": "LCD_ROW_VALUE", "button": "LCD_ROW_BUTTON",
@@ -1764,6 +1850,9 @@ class _LcdSettingsEmitter:
         self.cfgvals = cfgvals
         self.defs: list[str] = []      # static descriptors, in dependency order
         self.n = 0                     # unique-symbol counter
+        # Whether the row just emitted was a heading — see the caption case in
+        # pane_call. Reset per node by node().
+        self.after_heading = False
 
     def _sym(self, stem: str) -> str:
         self.n += 1
@@ -1793,6 +1882,42 @@ class _LcdSettingsEmitter:
             f"    .dialog = {dialog}, .form = {form} }};")
         return f"&{sym}"
 
+    def num_spec(self, spec: dict) -> str:
+        """Emit an `integer:` row's lcd_num_t and return its address expression.
+
+        A bound the yaml leaves out stays absent (`has_min` / `has_max` false)
+        rather than becoming a number the control would enforce — an unbounded
+        quantity has no bound, which is not the same as one bounded at zero.
+        Field order here follows the struct's, so the designated initializers
+        stay legal C++."""
+        where = f"integer {spec.get('key') or spec.get('field')}"
+        lo, lo_key = _settings_bound(spec["min"], self.cfgvals, where) \
+            if "min" in spec else (0, None)
+        hi, hi_key = _settings_bound(spec["max"], self.cfgvals, where) \
+            if "max" in spec else (0, None)
+        f: dict[str, str] = {}
+        if "min" in spec:
+            f["min"] = str(lo)
+        if "max" in spec:
+            f["max"] = str(hi)
+        if "min" in spec:
+            f["has_min"] = "true"
+        if "max" in spec:
+            f["has_max"] = "true"
+        if lo_key:
+            f["min_key"] = _cstr(lo_key)
+        if hi_key:
+            f["max_key"] = _cstr(hi_key)
+        step = _settings_scalar(spec.get("step", 1), self.cfgvals, where)
+        if step != 1:
+            f["step"] = str(step)
+        if spec.get("buttons"):
+            f["buttons"] = "true"
+        sym = self._sym("Num")
+        body = ", ".join(f".{k} = {v}" for k, v in f.items())
+        self.defs.append(f"static const lcd_num_t {sym} = {{ {body} }};")
+        return f"&{sym}"
+
     def dialog(self, spec: dict) -> str:
         btns = [(b, self.action(b["do"]) if "do" in b else "nullptr") for b in spec["buttons"]]
         bsym = self._sym("DlgBtns")
@@ -1808,11 +1933,30 @@ class _LcdSettingsEmitter:
             f"    .buttons = {bsym}, .nbuttons = {len(btns)} }};")
         return f"&{sym}"
 
+    def _flatten_rows(self, rows: list[dict]) -> list[dict]:
+        """Form/item-editor rows with the LCD's degradations applied: a
+        `heading:` becomes a section, an `advanced:` group becomes its label as
+        a section followed by its rows inline — the display has no disclosure
+        control, and a longer scrolling pane beats an absent one."""
+        out: list[dict] = []
+        for r in _sorted_rows(rows, self.cfgvals):
+            kind, spec = _row_kind(r)
+            if kind in ("title", "heading"):
+                out.append({"section": spec})
+            elif kind == "advanced":
+                label = spec.get("label", "Advanced Settings") if isinstance(spec, dict) \
+                    else "Advanced Settings"
+                out.append({"section": label})
+                out.extend(self._flatten_rows(spec["rows"]))
+            else:
+                out.append(r)
+        return out
+
     def rows_array(self, rows: list[dict]) -> tuple[str, int]:
         """Emit an lcd_row_t[] (form fields / item-editor rows) and return
         (symbol, count). Unlike a pane's rows these are DATA — the runtime
         builds them against a local field buffer, not against storage."""
-        live = _sorted_rows(rows, self.cfgvals)
+        live = self._flatten_rows(rows)
         inner = [self.row_struct(r) for r in live]   # emit nested descriptors first
         sym = self._sym("Rows")
         lines = [f"static const lcd_row_t {sym}[] = {{"]
@@ -1863,7 +2007,7 @@ class _LcdSettingsEmitter:
                 f["min_key"] = _cstr(lo_key)
             if hi_key:
                 f["max_key"] = _cstr(hi_key)
-        if kind == "text":
+        if kind in ("text", "ipv4"):
             if spec.get("secret"):
                 f["secret"] = "true"
             if "placeholder" in spec:
@@ -1877,6 +2021,10 @@ class _LcdSettingsEmitter:
         if kind == "dropdown":
             f["options"] = _cstr("\n".join(str(o["v"]) for o in spec["options"]))
             f["opt_labels"] = _cstr("\n".join(str(o["l"]) for o in spec["options"]))
+        if isinstance(spec, dict) and "unit" in spec:
+            f["unit"] = _cstr(spec["unit"])
+        if isinstance(spec, dict) and spec.get("short"):
+            f["short_"] = "true"
         if isinstance(spec, dict) and "default" in spec and spec.get("field"):
             dv = spec["default"]
             f["dflt"] = _cstr("1" if dv is True else "0" if dv is False else str(dv))
@@ -1884,6 +2032,8 @@ class _LcdSettingsEmitter:
             f["act"] = self.action(spec["do"])
         if kind == "list":
             f["coll"] = self.collection(spec)
+        if kind == "integer":
+            f["num"] = self.num_spec(spec)
         body = ", ".join(f".{k} = {v}" for k, v in f.items())
         return f"    {{ {body} }},"
 
@@ -1950,12 +2100,14 @@ class _LcdSettingsEmitter:
         sym = self._sym("Coll")
         self.defs.append(
             f"static const lcd_collection_t {sym} = {{\n"
-            f"    .label = {_cstr(spec.get('label', ''))}, .key = {_cstr(spec['key'])},\n"
+            f"    .label = {_cstr(spec.get('label', ''))}, "
+            f".caption = {_cstr(spec.get('caption', ''))},\n"
+            f"    .key = {_cstr(spec['key'])},\n"
             f"    .id = {_cstr(spec['id'])}, .item = {_cstr(spec['item'])},\n"
             f"    .subtitle = {_cstr(spec.get('subtitle', ''))}, "
             f".status = {_cstr(spec.get('status', ''))},\n"
             f"    .empty = {_cstr(spec.get('empty', ''))}, "
-            f".orderable = {'true' if spec.get('orderable') else 'false'},\n"
+            f".reorder = {'true' if spec.get('reorder') else 'false'},\n"
             f"    .cmd = {_cstr(spec['cmd'])},\n"
             f"    .adds = {adds_sym}, .nadds = {len(ordered_adds)},\n"
             f"    .has_remove = {'true' if rm is not None else 'false'},\n"
@@ -1972,10 +2124,28 @@ class _LcdSettingsEmitter:
         visibility helper when the row carries one (every helper returns its
         row object, so the wrap composes)."""
         kind, spec = _row_kind(row)
-        if kind == "section":
-            call = f"lcdSettingSection(p, {_cstr(spec)})"
+        if kind in ("title", "heading", "section"):
+            # Each level has its own look; the display takes no indentation
+            # from any of them, since it has no width to spend on one.
+            fn = {"title": "lcdSettingTitle", "heading": "lcdSettingHeading",
+                  "section": "lcdSettingSection"}[kind]
+            call = f"{fn}(p, {_cstr(spec)})"
+        elif kind == "advanced":
+            # No disclosure control on the display: the group is its label as a
+            # section, rows inline. Any `when_key` on the group is not carried.
+            label = spec.get("label", "Advanced Settings") if isinstance(spec, dict) \
+                else "Advanced Settings"
+            lines = [f"    lcdSettingSection(p, {_cstr(label)});"]
+            for r in _sorted_rows(spec["rows"], self.cfgvals):
+                lines.append(self.pane_call(r))
+            return "\n".join(lines)
         elif kind == "caption":
-            call = f"lcdSettingCaption(p, {_cstr(spec)})"
+            # A caption directly under a heading is about the GROUP and spans
+            # both columns; one under a field is about that field and starts on
+            # the control column. Only the row order knows which, and this is
+            # the last place that has it.
+            wide = "true" if self.after_heading else "false"
+            call = f"lcdSettingCaption(p, {_cstr(spec)}, {wide})"
         elif kind == "switch":
             call = f"lcdSettingSwitch(p, {_cstr(spec['label'])}, {_cstr(spec['key'])})"
         elif kind == "slider":
@@ -1987,9 +2157,19 @@ class _LcdSettingsEmitter:
                 args += f", {_cstr(lo_key) if lo_key else 'nullptr'}"
                 args += f", {_cstr(hi_key) if hi_key else 'nullptr'}"
             call = f"lcdSettingSlider(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}, {args})"
+        elif kind == "integer":
+            call = (f"lcdSettingInteger(p, {_cstr(spec['label'])}, "
+                    f"{_cstr(spec['key'])}, {self.num_spec(spec)}, "
+                    f"{_cstr(spec['unit']) if 'unit' in spec else 'nullptr'})")
+        elif kind == "ipv4":
+            call = (f"lcdSettingIpv4(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}, "
+                    f"{_cstr(spec['unit']) if 'unit' in spec else 'nullptr'})")
         elif kind == "text":
-            secret = ", true" if spec.get("secret") else ""
-            call = f"lcdSettingText(p, {_cstr(spec['label'])}, {_cstr(spec['key'])}{secret})"
+            args = "true" if spec.get("secret") else "false"
+            args += f", {_cstr(spec['unit']) if 'unit' in spec else 'nullptr'}"
+            args += ", true" if spec.get("short") else ", false"
+            call = (f"lcdSettingText(p, {_cstr(spec['label'])}, "
+                    f"{_cstr(spec['key'])}, {args})")
         elif kind == "dropdown":
             csv = ",".join(str(o["v"]) for o in spec["options"])
             call = (f"lcdSettingDropdown(p, {_cstr(spec['label'])}, "
@@ -2012,6 +2192,10 @@ class _LcdSettingsEmitter:
             call = f"lcdSettingCollection(p, {self.collection(spec)})"
         else:
             die(f"settings: unknown row kind {kind!r}")
+        if kind in ("title", "heading", "section"):
+            self.after_heading = True
+        elif kind != "caption":
+            self.after_heading = False
         if "when_key" in row:
             call = f"lcdSettingWhenKey({call}, {_cstr(row['when_key'])})"
         return f"    {call};"
@@ -2055,6 +2239,7 @@ class _LcdSettingsEmitter:
 
         if not rows:
             return seg_sym, "nullptr"
+        self.after_heading = False
         calls = [self.pane_call(r) for r in rows]   # emits nested descriptors first
         fn = f"spangapGenSetPane_{idx}"
         self.defs.append(
@@ -2097,6 +2282,9 @@ def _settings_defaults_cpp(contribs: list[SettingsContribution],
             if not _row_enabled(row, cfgvals):
                 continue
             kind, spec = _row_kind(row)
+            if kind == "advanced":
+                walk(spec["rows"])   # pane rows behind the disclosure still bind keys
+                continue
             if kind not in _SETTINGS_BINDING_KINDS or not isinstance(spec, dict):
                 continue          # a list's own rows are all `field:` rows
             if "default" not in spec:

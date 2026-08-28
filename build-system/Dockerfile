@@ -81,12 +81,16 @@ RUN { \
 #   - System python3 (/usr/bin/python3): runs the in-container CLI; needs pyyaml+jsonschema.
 #   - IDF Python venv (/opt/esp/python_env/idf5.5_py3.12_env): what `python3` resolves to
 #     once `. $IDF_PATH/export.sh` activates the env. ESP-IDF CMake helpers call
-#     `python3 lcd-icons.py` — that lands in the IDF venv, so Pillow/cairosvg/pypng/lz4
-#     must be there for icon rasterization.
+#     `python3 lcd-icons.py` / `python3 lcd-fonts.py` — those land in the IDF venv, so
+#     Pillow/cairosvg/pypng/lz4 must be there for icon rasterization and fonttools for
+#     font subsetting. fonttools is load-bearing for size, not just quality: without it
+#     lcd-fonts.py copies the source faces through verbatim (~1.6 MB) and /fixed overflows
+#     its partition.
 RUN pip3 install --no-cache-dir --break-system-packages pyyaml jsonschema
 RUN /opt/esp/python_env/idf5.5_py3.12_env/bin/pip install --no-cache-dir \
         Pillow \
         cairosvg \
+        fonttools \
         pypng \
         lz4
 

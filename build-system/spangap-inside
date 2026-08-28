@@ -2132,11 +2132,28 @@ class _LcdSettingsEmitter:
             call = f"{fn}(p, {_cstr(spec)})"
         elif kind == "advanced":
             # No disclosure control on the display: the group is its label as a
-            # section, rows inline. Any `when_key` on the group is not carried.
+            # section, rows inline. A `when_key` on the group therefore has no
+            # single object to ride, so it is pushed down onto the section and
+            # onto every row inlined from it — the display then hides exactly
+            # what the browser's disclosure hides.
             label = spec.get("label", "Advanced Settings") if isinstance(spec, dict) \
                 else "Advanced Settings"
-            lines = [f"    lcdSettingSection(p, {_cstr(label)});"]
+            gate = row.get("when_key")
+            sec = f"lcdSettingSection(p, {_cstr(label)})"
+            if gate:
+                sec = f"lcdSettingWhenKey({sec}, {_cstr(gate)})"
+            lines = [f"    {sec};"]
             for r in _sorted_rows(spec["rows"], self.cfgvals):
+                if gate:
+                    if "when_key" in r:
+                        # One row, one gate: the display's whenKey binding sets
+                        # or clears the hidden flag on its own, so two of them
+                        # on one row race rather than AND. Say so here instead
+                        # of shipping a row that shows when it should not.
+                        die(f"settings: row inside a gated `advanced` group carries "
+                            f"its own when_key ({r['when_key']!r}) — publish one key "
+                            f"that folds both facts and use that")
+                    r = {**r, "when_key": gate}
                 lines.append(self.pane_call(r))
             return "\n".join(lines)
         elif kind == "caption":

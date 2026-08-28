@@ -666,6 +666,17 @@ its kind — the same placement for all three gates:
 truthy. Inside a form or an item editor the key may be a `{field}` template referencing a
 sibling field (`when_key: "{dhcp}"`), which is answered from the local buffer instead.
 
+**One row, one `when_key`.** The gate is a truthiness test on a single key, never a
+conjunction: the display's binding sets or clears the row's hidden flag on its own, so two
+gates on one row would race rather than AND. Where a row's visibility genuinely depends on
+two facts, the FIRMWARE folds them into one published key and the row gates on that — the
+same rule that has the firmware publish finished strings. iface-lora's `lora.0.row_rx_boost`
+is the pattern: the slot's chip answers to the control **and** the radio is switched on.
+On an `advanced:` group the gate covers the group, rows and all. The browser hides the
+disclosure; the display, which inlines the group as a section, pushes the gate down onto
+that section and onto every row it inlines — so a row inside a gated group may not carry a
+gate of its own (the generator says so rather than silently dropping one).
+
 **`unit:`** is a word printed after a field — a unit (`min`, `dBm`) or the fixed tail of
 what is being entered (`.duckdns.org`). It is never part of the value and never stored. A
 field carrying one RIGHT-ALIGNS its value, so the entry and the word it belongs to read as

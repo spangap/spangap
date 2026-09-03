@@ -119,7 +119,7 @@ container lifecycle. There is **no `docker` and no `esptool.py`** in here by des
   does this for you; a raw shell you open does not). Prefer `spangap build` /
   `spangap build <idf args>` over calling `idf.py` yourself so staging + the
   `${SPANGAP_REQUIRES}` wiring actually happen first.
-- `node` / `npm` are on PATH (Node 20). The browser build runs in-container during the
+- `node` / `npm` are on PATH (Node 22). The browser build runs in-container during the
   firmware build (`npm install` only if `node_modules` is missing, then `npx quasar build`).
 - `python3` (system) has `pyyaml` + `jsonschema`; the IDF venv has Pillow/cairosvg/pypng/lz4
   for the LCD icon rasterizer. `git` is present.
@@ -1212,7 +1212,7 @@ superseded per-straddle `CLAUDE.md` files. Four concrete traps when reading them
   "Boot registration" above).
 
 Platform realities not stated elsewhere in this file, but assumed everywhere: target is
-**ESP32-S3 with octal PSRAM (mandatory)**, toolchain is **ESP-IDF 5.5.4** + Node 20.
+**ESP32-S3 with octal PSRAM (mandatory)**, toolchain is **ESP-IDF 5.5.4** + Node 22.
 The PSRAM/DRAM split is a live firmware hazard — a flash op disables the PSRAM cache, so
 a task on a PSRAM stack that touches LittleFS **crashes**; route all I/O through the
 `fs_*` API (the reason `fs.cpp`'s DRAM worker tasks exist). DMA/WiFi/lwIP need internal

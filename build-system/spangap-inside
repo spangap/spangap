@@ -6,6 +6,7 @@ Runs inside the build-env container. spangap-outside docker-exec's to this.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import mmap
 import os
@@ -4367,16 +4368,90 @@ def cmd_claude(claude_args: list[str]) -> int:
     """First-run setup (permissions default + workspace docs), install, exec."""
     _offer_bypass_permissions()
     _ensure_workspace_docs()
+    just_installed = False
     if not shutil.which("claude"):
         print("spangap: claude not installed in container — running `npm install -g @anthropic-ai/claude-code`...", file=sys.stderr)
         r = subprocess.run(["npm", "install", "-g", "@anthropic-ai/claude-code"], check=False)
         if r.returncode != 0:
             die("npm install -g @anthropic-ai/claude-code failed; see output above")
+        just_installed = True
     claude_path = shutil.which("claude")
     if not claude_path:
         die(f"claude still not on PATH after npm install — check {Path.home() / '.npm-global' / 'bin'}")
-    os.execvp(claude_path, [claude_path, *claude_args])
+    if just_installed:
+        _verify_fresh_install(claude_path)
+    _exec_claude(claude_path, claude_args)
     return 1
+
+
+def _verify_fresh_install(claude_path: str) -> None:
+    """Smoke-test an install we just performed. Only ever runs on the install
+    path, so the steady-state `spangap claude` pays nothing for it.
+
+    Worth the one extra exec because npm's success here means very little. The
+    native binary arrives as an *optional* dependency, so a tarball that extracts
+    only partway — the failure mode of ~200MB unpacked onto a slow bind mount,
+    and $HOME is one (see spangap-outside's mounts) — leaves npm reporting
+    "added 2 packages" over a truncated binary and a missing package.json. The
+    postinstall then can't resolve the package and leaves its placeholder behind.
+    Neither step complains. `--version` is the cheapest thing that does."""
+    r = subprocess.run([claude_path, "--version"], capture_output=True, timeout=120)
+    if r.returncode == 0:
+        return
+    # First line carrying a letter or digit: a crashing native binary tends to open
+    # with a rule of "=" or a blank, and quoting that back says nothing.
+    detail = next(
+        (ln.strip() for ln in (r.stderr or r.stdout or b"").decode("utf-8", "replace").splitlines()
+         if any(c.isalnum() for c in ln)),
+        "",
+    )
+    die("claude installed but won't run — the npm install is incomplete "
+        "(commonly a native binary truncated mid-extraction; npm doesn't report "
+        "this because it's an optional dependency).\n"
+        + (f"  {detail}\n" if detail else "")
+        + "  Reinstall:\n"
+        f"    rm -rf {Path.home() / '.npm-global' / 'lib' / 'node_modules' / '@anthropic-ai'} "
+        f"{Path.home() / '.npm-global' / 'bin' / 'claude'}\n"
+        "    npm install -g @anthropic-ai/claude-code")
+
+
+def _exec_claude(claude_path: str, claude_args: list[str]) -> None:
+    """execvp `claude`, but don't let a shebang-less file surface as Errno 8.
+
+    npm ships bin/claude.exe as a *placeholder shell script with no shebang* and
+    the postinstall overwrites it with the native binary. When the platform-native
+    optional dependency is missing or half-extracted — which is exactly what a
+    truncated tarball on a slow bind mount produces, and npm reports success
+    anyway because the dep is optional — the placeholder survives. It is written
+    to be run *through a shell*, so a direct execvp() answers ENOEXEC and the user
+    gets `OSError: [Errno 8] Exec format error` from inside os._execvpe instead of
+    the several lines of repair instructions the placeholder was written to print.
+
+    So: on ENOEXEC, hand the file to /bin/sh, which is the interpreter a
+    shebang-less script implies. That surfaces the placeholder's own message
+    (and, for a genuinely corrupt binary, a clear one of ours) rather than a
+    traceback. Every other exec error keeps propagating untouched."""
+    try:
+        os.execvp(claude_path, [claude_path, *claude_args])
+    except OSError as e:
+        if e.errno != errno.ENOEXEC:
+            raise
+    # execvp only returns here on ENOEXEC, which covers two very different files:
+    # the text placeholder we want to run, and a binary the kernel refused outright
+    # (wrong machine type, or truncated inside its ELF header — truncated *after*
+    # the header execs fine and faults later, which is what _verify_fresh_install
+    # is for). Handing the second kind to /bin/sh just sprays it at the terminal,
+    # so sniff first: a NUL in the head means binary, and nothing else does as
+    # cheaply across the encodings a shell script may legitimately use.
+    with open(claude_path, "rb") as fh:
+        head = fh.read(4096)
+    if b"\x00" in head:
+        die(f"{claude_path} is not a runnable binary (built for another "
+            f"architecture, or truncated). Reinstall it:\n"
+            f"  rm -rf {Path.home() / '.npm-global' / 'lib' / 'node_modules' / '@anthropic-ai'} "
+            f"{Path.home() / '.npm-global' / 'bin' / 'claude'}\n"
+            f"  npm install -g @anthropic-ai/claude-code")
+    os.execv("/bin/sh", ["/bin/sh", claude_path, *claude_args])
 
 
 # ---------------------------------------------------------------------------

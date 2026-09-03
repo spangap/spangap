@@ -2,7 +2,7 @@
 #
 # Holds:
 #   - ESP-IDF v5.5.4 (from espressif/idf:v5.5.4, multi-arch incl. arm64)
-#   - Node 20 + npm (Quasar/Vite browser build)
+#   - Node 22 + npm (Quasar/Vite browser build; Claude Code needs >=22)
 #   - cairo + Pillow + cairosvg + pypng + lz4 (LCD launcher-icon rasterizer)
 #   - the in-container `spangap` CLI (Python)
 #
@@ -14,15 +14,20 @@
 # platform-straddle version.
 FROM espressif/idf:v5.5.4
 
-# Node 20 via NodeSource (Ubuntu 22.04 ships Node 12, too old for Quasar/Vite).
-# NodeSource publishes arm64 binaries.
+# Node 22 via NodeSource (Ubuntu 22.04 ships Node 12, too old for Quasar/Vite).
+# NodeSource publishes arm64 binaries. 22 and not 20 because `spangap claude`
+# lazy-installs @anthropic-ai/claude-code, whose recent releases declare
+# `engines.node >= 22`: on Node 20 npm silently resolves `latest` backwards to
+# the newest release still allowing Node 18, while Claude Code's own auto-updater
+# pins the real latest and installs it with an EBADENGINE warning. Both leave the
+# container on a version nobody chose.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
     mkdir -p /etc/apt/keyrings; \
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg; \
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
         > /etc/apt/sources.list.d/nodesource.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends nodejs; \

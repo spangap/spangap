@@ -28,7 +28,7 @@ None. This repo contains no third-party source code.
 
 The Docker build-env image (see `Dockerfile`) layers third-party software on
 top of `espressif/idf:v5.5.4`. That base image and the packages installed into
-it (Node 20, Python, Cairo, Pillow, Alpine/Debian system packages) retain
+it (Node 22, Python, Cairo, Pillow, Alpine/Debian system packages) retain
 their own licenses; see the upstream image and package manifests for details.
 None of that software is redistributed *from* this repository — the image is
 built from source at install time.

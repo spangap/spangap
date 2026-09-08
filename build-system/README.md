@@ -433,6 +433,7 @@ gate, which keys off the **repo name**, not the prefix):
 | `acme` `duckdns` `upnp` `wg` `ota` | (= repo) | `iface-lora` | `rns_lora` |
 | `sshd` | `sshd` | `lxmf` | `lxmf` |
 | `maps` | `maps` | `nomad` | `nomad` |
+| | | `lxmproxy` | `lxmproxy` |
 | | | `hw-lilygo-tdeck` | `tdeck` |
 
 This table can go stale — `spangap-inside` reads the real values; `ls <workspace>` +

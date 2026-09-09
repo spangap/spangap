@@ -698,9 +698,9 @@ them will need code:
    published to an ephemeral key as the exact text to show. No UI computes, compares or
    concatenates. Gate keys are published truthy/empty, and `when_key` tests truthiness
    only, never equality.
-2. **Firmware validates in sentinel handlers, and answers on two keys.** A mutation
-   arrives on a command-sentinel key; the owning task validates it and answers on the
-   sentinel family's shared **error** and **ack** keys — for a collection that is
+2. **Firmware validates in command key handlers, and answers on two keys.** A mutation
+   arrives on a command key; the owning task validates it and answers on the
+   command key family's shared **error** and **ack** keys — for a collection that is
    `<cmd>.error` / `<cmd>.done` (one pair for `.add`/`.set`/`.remove`/`.order`), for a
    bare form `<form-cmd>.error` / `<form-cmd>.done`. A rejection is a human-readable
    sentence on the error key (the form shows it and stays open); an **accepted** mutation
@@ -715,8 +715,8 @@ them will need code:
 
    **Sentinel keys are ephemeral and live beside the values they manage, never beneath
    one.** A dot-path write under a scalar key replaces the scalar with an object,
-   destroying it — so a sentinel updating `s.ntp.tz` is `ntp.tz.set`, not
-   `s.ntp.tz.set`. A sentinel's `cmd:` is a fixed key, not a template.
+   destroying it — so a command key updating `s.ntp.tz` is `ntp.tz.set`, not
+   `s.ntp.tz.set`. A command key's `cmd:` is a fixed key, not a template.
 
 **Row kinds.** `title` / `heading` / `section` / `caption` (text),
 `advanced{label?,rows}` (a disclosure group), `switch{label,key}`,
@@ -744,7 +744,7 @@ network to supply.
 optionless in the yaml, because each surface brings its own list — the browser
 its Intl database as a type-to-filter select, the LCD region+zone dropdowns from
 the firmware's built-in zone table; `placeholder_key` names the key whose value
-seeds the initial selection, and the submitted name must go through a sentinel
+seeds the initial selection, and the submitted name must go through a command key
 that resolves it against that table before storing),
 `value{label,key,copyable?}`
 (read-only live text), `button{label,do,color?}`, `buttons{align?,items:[…]}`,
@@ -889,7 +889,7 @@ a collection's per-item buttons):
   input fields, ever.** Every button closes the dialog; a bare label is a cancel. Buttons
   nest actions, so a choice tree is dialogs of buttons of `set`s.
 - **`form: {fields, cmd, submit?, title?}`** — the one dialog with inputs, because it fronts
-  a sentinel. `fields` are ordinary binding rows carrying `field:` instead of `key:`; values
+  a command key. `fields` are ordinary binding rows carrying `field:` instead of `key:`; values
   are collected locally and serialized as one JSON object to `cmd` on submit. The handler's
   answer keys (convention 2 above) drive it: the error key showing a reason keeps it open,
   the ack key moving closes it — an edit that changes nothing still acks. A string
@@ -918,7 +918,7 @@ device) is a `form` whose handler validates the submitted name, not a dropdown.
           status: "rns_tcp.peer.{id}"   # ephemeral key holding packed "text|color"
           empty: "No peers configured."
           reorder: true
-          cmd: rns_tcp.peer         # sentinel base
+          cmd: rns_tcp.peer         # command key base
           add:  [ { label: "Add peer", form: { fields: [...] } } ]
           remove: { confirm: "Remove {name}?" }
           actions:                  # each may carry when_key, templated over the item
@@ -932,7 +932,7 @@ item id), `<cmd>.set` (the JSON item, plus `_id` naming the item it is committin
 so editing the id field itself is an ordinary edit) and `<cmd>.order`; the owning task is
 the array's only writer, answering every one of them on the shared `<cmd>.error` /
 `<cmd>.done` pair (convention 2 above). An add form's `cmd:` defaults to `<cmd>.add`, so
-the whole sentinel family stays derived from the one name. A handler consumes its sentinel
+the whole command key family stays derived from the one name. A handler consumes its command key
 by deleting it (`storageUnset` / `storageDeleteTree`) after reading, which is what lets an
 identical payload be submitted twice — a cleared key can't dedup the next write.
 
@@ -1221,7 +1221,7 @@ summary above, then one-paragraph what-it-is; brief origins (wraps/forks/ports w
 what it does and how it interacts with the other straddles, with one minimal
 real usage example; the public surface (ports/API/opcodes, pointer to the header
 for exact layouts); the **full storage-variable list** (settings with defaults,
-runtime/telemetry, command sentinels, secrets — exhaustive, verified against
+runtime/telemetry, command keys, secrets — exhaustive, verified against
 code); CLI / user manual. Never tell users to call an `xInit()` the generated
 init already calls — state that it starts automatically when the straddle is in
 the build.

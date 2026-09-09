@@ -587,7 +587,7 @@ Two conventions come with it, and a pane that fights them will need code:
   counter, a formatted percentage — goes to an ephemeral key as the exact text
   to show. Gate keys are truthy or empty, because `when_key` tests truthiness
   and never equality.
-- **Validate in the sentinel handler.** A collection's mutations and a form's
+- **Validate in the command key handler.** A collection's mutations and a form's
   submissions arrive on command keys; the owning task checks them and writes the
   reason for a rejection to `<cmd>.error`. Neither UI validates, which is what
   keeps one rule from being written twice.

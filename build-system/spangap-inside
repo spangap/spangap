@@ -6,18 +6,30 @@ Runs inside the build-env container. spangap-outside docker-exec's to this.
 from __future__ import annotations
 
 import argparse
+import base64
+import collections
 import errno
+import hashlib
+import http.server
+import itertools
 import json
+import mimetypes
 import mmap
 import os
+import queue
 import re
+import secrets
 import selectors
 import shlex
 import shutil
+import signal
 import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,6 +86,17 @@ SSH_PORT = 22         # device sshd (the spangap/sshd straddle)
 TCP_CLI_PORT = 2323   # legacy TCP CLI socket (builds without sshd)
 WSS_PORT = 443        # device TLS — what the browser SPA dials (?port= default)
 DEV_PORT = 9000       # `spangap dev` quasar dev server (published by the container)
+# What `spangap flashmon` binds (see its section). Fixed rather than allocated
+# out of the dev range: the browser has to reach it at a URL nobody looked up,
+# and the boards it holds are granted to that origin, so the address has to
+# outlive a container. Published by the container alongside the
+# dev range; the host `spangap flashmon` prints the port Docker mapped it to.
+FLASHMON_PORT = int(os.environ.get("SPANGAP_FLASHMON_PORT", "9010"))
+# Written by a running server, read by the verbs that talk to it: the port it
+# bound and the token the browser must present. A hint and not an authority —
+# the workspace is shared by every container of it, so the last server to start
+# owns this file wherever it is running. What actually answers is the port.
+FLASHMON_FILE = WORKSPACE / ".spangap-flashmon"
 # Host-side serial-log relay served by the monitor's bridge (see cmd_log). Not
 # a device port; reached at host.docker.internal:LOG_PORT. Must match the host
 # LOG_PORT — spangap-outside passes it through on every docker exec.
@@ -4012,7 +4035,16 @@ def _log_from_relay(follow: bool) -> bool:
 
 
 def cmd_log(args: argparse.Namespace) -> int:
-    """Print the device serial log captured by the host `spangap monitor`.
+    """Print the device serial log, from whichever side is holding the port.
+
+    Two sources, tried in order, because either one may be the console:
+
+    1. `spangap flashmon` in this container, fed by the flashmon browser tabs. It
+       holds a ring per node, so this is also the only source that can show
+       several devices at once (no -n interleaves them, one line at a time,
+       each tagged with its node's name).
+    2. the host `spangap monitor`, which holds the USB port itself and serves
+       its log over the relay described below.
 
     The monitor appends the live log to $workspace/.spangap-log on the host. On
     Docker Desktop that file is UNREADABLE from inside the container: the bind
@@ -4028,6 +4060,12 @@ def cmd_log(args: argparse.Namespace) -> int:
     host (coherent bind mount), and on Docker Desktop a clear signal that the
     monitor isn't running.
     """
+    hub_status = _hub_stream_log(getattr(args, "node", None), args.follow)
+    if hub_status:
+        return 0 if hub_status == 200 else 1
+    if getattr(args, "node", None):
+        die(f"log: -n {args.node} names a hub node, but no `spangap flashmon` is "
+            "running in this container")
     if _log_from_relay(args.follow):
         return 0
 
@@ -4063,6 +4101,775 @@ def cmd_log(args: argparse.Namespace) -> int:
             time.sleep(0.5)
     except KeyboardInterrupt:
         return 0
+
+
+# ---------------------------------------------------------------------------
+# `spangap flashmon` — serve the flasher, and take its tabs' consoles.
+#
+# The server is called the hub throughout this section: the tabs attach to it and
+# it routes between them and the verbs. The verb is named for what the user is
+# actually starting, which is flashmon in a browser.
+#
+#   tab -> hub   {"t":"hello","node":"f9fb74","host":"tbeam","fw":"…","hw":"…"}
+#   tab -> hub   {"t":"log","b":"<base64 of the raw serial bytes>"}   (continuous)
+#   hub -> tab   {"t":"cmd","id":41,"cmd":"gps"}
+#   tab -> hub   {"t":"reply","id":41,"ok":true,"out":"…"}
+#   tab -> hub   {"t":"bye"}
+#
+# The problem it solves: the console lives in a browser tab (flashmon holds the
+# USB port over Web Serial), so nothing in this container can see what a device
+# is saying or ask it anything. The host-side `spangap monitor` is the other
+# answer to that, and it wants the same port — only one of the two can hold a
+# board.
+#
+# So the hub turns the tabs into the console. It serves flashmon itself over
+# http://localhost, which is what makes the tabs willing to talk back: a page
+# only reaches a local WebSocket from a page that is itself local (an https
+# deployment reaching ws://localhost is mixed content, and blocked). Every tab
+# that connects registers the node it is holding and streams that node's serial
+# bytes up; the hub keeps a ring per node and hands commands back down.
+#
+# Both halves of this are already the tab's to give: flashmon reads the device's
+# identity off its greeting, and it already runs commands over a framed
+# side-channel that the terminal never sees. The hub only routes.
+#
+# Unlike the monitor's serial-log relay, there is no host round trip and no bind
+# mount in the path — the hub is a process in this container, so the verbs reach
+# it on 127.0.0.1 and read its memory, not a file whose size the mount lies
+# about.
+#
+# What it deliberately does NOT do is flash: flashmon polls the catalogue's
+# `timestamp` and auto-flashes a newer image on its own, so a `spangap
+# make-builds` run is already the whole trigger.
+# ---------------------------------------------------------------------------
+
+# Across every node, in arrival order — one ring, each chunk tagged with the node
+# that said it, which is what lets a reader interleave them all or filter to one.
+# Enough to answer "what has it been saying" for a good while at console rates
+# without growing without bound; a follower gets the ring on attach and appended
+# bytes from then on. The cap is the whole ring, so a chatty board crowds out a
+# quiet one's history.
+HUB_RING = 512 * 1024
+# WebSocket opcodes (RFC 6455). Text is all we send; the rest are handled so a
+# browser's own housekeeping doesn't look like a protocol error.
+WS_CONT, WS_TEXT, WS_BIN, WS_CLOSE, WS_PING, WS_PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xa
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# Terminal decoration the tab's xterm renders and a piped log has no use for.
+# The log the host monitor writes is stripped the same way, so `spangap log`
+# reads alike whichever side captured it.
+_ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[=>]|\r")
+# An escape sequence that runs off the end of a chunk. The device's colour codes
+# sit at the head of a log line, and a read that splits one leaves half a
+# sequence at each side — neither half matching above, so both would be printed.
+# Held back until the rest of it arrives.
+_PARTIAL_ESC_RE = re.compile(rb"\x1b(?:\[[0-9;?]*|\][^\x07]*)?$")
+# Beyond this a "sequence" is text that merely started with an escape byte, and
+# holding more of it back would be losing output rather than cleaning it.
+PARTIAL_ESC_MAX = 64
+
+
+class _Tab:
+    """One connected browser tab, and the node it says it is holding."""
+
+    def __init__(self, wfile):
+        self.wfile = wfile
+        self.send_lock = threading.Lock()   # frames must not interleave
+        self.node = None                    # device id (the `dev` field), e.g. f9fb74
+        self.host = None                    # the device's hostname, when it has one
+        self.fw = None
+        self.hw = None
+        self.pending: dict[int, list] = {}  # command id -> [Event, reply-or-None]
+        self.ids = itertools.count(1)
+        self.closed = False
+
+    @property
+    def label(self) -> str:
+        return self.host or self.node or "?"
+
+    def send(self, obj: dict) -> bool:
+        try:
+            _ws_send(self.wfile, self.send_lock, json.dumps(obj).encode())
+            return True
+        except OSError:
+            self.closed = True
+            return False
+
+
+class _Hub:
+    """The registry: which tab holds which node, and what each node has said."""
+
+    def __init__(self, token: str):
+        self.token = token
+        self.lock = threading.Lock()
+        self.tabs: dict[str, _Tab] = {}          # node id -> tab
+        self.labels: dict[str, str] = {}         # node id -> display label
+        # One ring for every node rather than one per node, so what it replays
+        # is what actually happened: with several nodes attached, the order the
+        # lines arrived in across them is the thing being watched, and per-node
+        # rings can only be replayed one node after another.
+        self.ring: collections.deque[tuple[str, bytes]] = collections.deque()
+        self.ring_bytes = 0
+        self.watchers: list[tuple[str | None, queue.Queue]] = []
+
+    # -- nodes ------------------------------------------------------------
+    def attach(self, tab: _Tab) -> None:
+        with self.lock:
+            prior = self.tabs.get(tab.node)
+            if prior is not None and prior is not tab:
+                prior.closed = True
+            fresh = prior is not tab
+            self.tabs[tab.node] = tab
+            self.labels[tab.node] = tab.label
+        # A tab re-announces itself whenever it learns more about the node it is
+        # holding — the hostname and the running build land after the device id
+        # — so only a tab that was not already on this node is an arrival.
+        if fresh:
+            self.publish(tab.node, f"--- {tab.label} attached ---\n".encode())
+
+    def detach(self, tab: _Tab) -> None:
+        if not tab.node:
+            return
+        with self.lock:
+            if self.tabs.get(tab.node) is tab:
+                del self.tabs[tab.node]
+        self.publish(tab.node, f"--- {tab.label} detached ---\n".encode())
+
+    def nodes(self) -> list[dict]:
+        with self.lock:
+            return [{"node": n, "host": t.host, "fw": t.fw, "hw": t.hw}
+                    for n, t in sorted(self.tabs.items(), key=lambda kv: kv[1].label)]
+
+    def resolve(self, sel: str | None) -> list[str]:
+        """Node ids a `-n` selector names: its id or its hostname, exact before
+        prefix. No selector means every node the hub knows of, attached or not —
+        a node whose tab has gone still has a ring worth reading."""
+        with self.lock:
+            known = dict(self.labels)
+        if not sel:
+            return list(known)
+        s = sel.lower()
+        exact = [n for n, lab in known.items() if s in (n.lower(), lab.lower())]
+        if exact:
+            return exact
+        return [n for n, lab in known.items()
+                if n.lower().startswith(s) or lab.lower().startswith(s)]
+
+    def tab_for(self, sel: str | None) -> tuple[_Tab | None, int, str]:
+        """The one live tab a selector names, or (None, status, why-not).
+
+        The two ways to fail are kept apart because callers treat them
+        differently: 409 says the hub has nothing for this (so `spangap cli`
+        goes on to try the network), while 300 says the answer was ambiguous
+        and only the caller can settle it."""
+        with self.lock:
+            live = dict(self.tabs)
+        if not live:
+            return None, 409, ("no browser tab is attached to the hub — open the "
+                               "hub URL in a browser and connect a device")
+        hits = [n for n in self.resolve(sel) if n in live]
+        if not hits:
+            return None, 409, (f"no attached node matches '{sel}' — attached: "
+                               + ", ".join(sorted(t.label for t in live.values()))
+                               if sel else "no attached node")
+        if len(hits) > 1:
+            return None, 300, ("several nodes attached (" +
+                               ", ".join(sorted(live[n].label for n in hits)) +
+                               ") — name one with -n")
+        return live[hits[0]], 200, ""
+
+    # -- log --------------------------------------------------------------
+    def publish(self, node: str, data: bytes) -> None:
+        if not data:
+            return
+        with self.lock:
+            self.ring.append((node, data))
+            self.ring_bytes += len(data)
+            while self.ring_bytes > HUB_RING and len(self.ring) > 1:
+                self.ring_bytes -= len(self.ring.popleft()[1])
+            label = self.labels.get(node, node)
+            watchers = list(self.watchers)
+        for want, q in watchers:
+            if want is None or want == node:
+                try:
+                    q.put_nowait((label, data))
+                except queue.Full:
+                    pass            # a follower that can't keep up loses bytes
+
+    def backlog(self, nodes: list[str]) -> list[tuple[str, bytes]]:
+        want = set(nodes)
+        with self.lock:
+            return [(self.labels.get(n, n), data)
+                    for n, data in self.ring if n in want]
+
+    def watch(self, node: str | None) -> queue.Queue:
+        q: queue.Queue = queue.Queue(maxsize=4096)
+        with self.lock:
+            self.watchers.append((node, q))
+        return q
+
+    def unwatch(self, q: queue.Queue) -> None:
+        with self.lock:
+            self.watchers = [w for w in self.watchers if w[1] is not q]
+
+    # -- commands ---------------------------------------------------------
+    def run(self, sel: str | None, cmd: str, timeout: float) -> tuple[int, str]:
+        tab, status, why = self.tab_for(sel)
+        if tab is None:
+            return status, why
+        cid = next(tab.ids)
+        slot = [threading.Event(), None]
+        tab.pending[cid] = slot
+        try:
+            if not tab.send({"t": "cmd", "id": cid, "cmd": cmd}):
+                return 409, f"the tab holding {tab.label} went away"
+            if not slot[0].wait(timeout):
+                return 504, (f"{tab.label} did not answer within {timeout:g}s "
+                             f"(is the device still there?)")
+            reply = slot[1] or {}
+            if not reply.get("ok"):
+                if reply.get("why") == "unframed":
+                    return 501, (f"{tab.label} runs firmware without the framed "
+                                 "console channel — nothing to run commands over")
+                return 502, str(reply.get("why") or "the command failed")
+            return 200, str(reply.get("out") or "")
+        finally:
+            tab.pending.pop(cid, None)
+
+
+# -- WebSocket framing ------------------------------------------------------
+# Only what a browser actually sends: one connection, text frames, the control
+# frames it sends on its own. Written out rather than pulled in because the
+# container carries no third-party Python beyond what a build needs.
+
+def _ws_send(wfile, lock: threading.Lock, payload: bytes, op: int = WS_TEXT) -> None:
+    n = len(payload)
+    if n < 126:
+        head = bytes((0x80 | op, n))
+    elif n < 65536:
+        head = bytes((0x80 | op, 126)) + struct.pack("!H", n)
+    else:
+        head = bytes((0x80 | op, 127)) + struct.pack("!Q", n)
+    with lock:
+        wfile.write(head + payload)
+        wfile.flush()
+
+
+def _ws_read_exact(rfile, n: int) -> bytes | None:
+    buf = rfile.read(n)
+    return buf if buf is not None and len(buf) == n else None
+
+
+def _ws_recv(rfile) -> tuple[int, bytes] | None:
+    """One whole message, reassembling continuation frames. None on close."""
+    op_msg = None
+    body = bytearray()
+    while True:
+        head = _ws_read_exact(rfile, 2)
+        if head is None:
+            return None
+        fin, op = head[0] & 0x80, head[0] & 0x0f
+        masked, n = head[1] & 0x80, head[1] & 0x7f
+        if n == 126:
+            ext = _ws_read_exact(rfile, 2)
+            if ext is None:
+                return None
+            n = struct.unpack("!H", ext)[0]
+        elif n == 127:
+            ext = _ws_read_exact(rfile, 8)
+            if ext is None:
+                return None
+            n = struct.unpack("!Q", ext)[0]
+        mask = _ws_read_exact(rfile, 4) if masked else b""
+        if masked and mask is None:
+            return None
+        data = _ws_read_exact(rfile, n) if n else b""
+        if data is None:
+            return None
+        if masked:
+            data = bytes(b ^ mask[i & 3] for i, b in enumerate(data))
+        # Control frames are never fragmented and may arrive between the
+        # fragments of a message, so they are answered without disturbing it.
+        if op in (WS_CLOSE, WS_PING, WS_PONG):
+            return op, data
+        if op_msg is None:
+            op_msg = op
+        body += data
+        if fin:
+            return op_msg, bytes(body)
+
+
+# -- the server -------------------------------------------------------------
+
+class _HubServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    hub: _Hub
+
+
+class _HubHandler(http.server.BaseHTTPRequestHandler):
+    # HTTP/1.0: a follow stream ends when the connection does, which needs no
+    # chunked framing on either side and is what the CLI reader expects.
+    protocol_version = "HTTP/1.0"
+    server_version = "spangap-hub"
+
+    def log_message(self, fmt, *a):     # one line per poll otherwise
+        pass
+
+    # A page is only trusted to reach the hub if it is itself local. The port
+    # can't be checked — the browser sees the port Docker published, not the one
+    # bound in here — so the host is the whole test, which is exactly the
+    # boundary the token then sits behind.
+    def _origin_ok(self) -> bool:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True                  # not a browser: the in-container verbs
+        try:
+            host = urllib.parse.urlsplit(origin).hostname or ""
+        except ValueError:
+            return False
+        return host in ("localhost", "127.0.0.1", "::1")
+
+    def _text(self, status: int, body: str, ctype: str = "text/plain; charset=utf-8") -> None:
+        raw = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        try:
+            self.wfile.write(raw)
+        except OSError:
+            pass
+
+    def do_POST(self) -> None:
+        url = urllib.parse.urlsplit(self.path)
+        q = urllib.parse.parse_qs(url.query)
+        if url.path != "/cmd":
+            return self._text(404, "not found\n")
+        if not self._origin_ok():
+            return self._text(403, "forbidden\n")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        cmd = (self.rfile.read(n) if n else b"").decode("utf-8", "replace").strip()
+        if not cmd:
+            return self._text(400, "no command in the request body\n")
+        # Long enough to outlast the tab's own retry of an unanswered frame
+        # (two tries, 8s each), so a timeout here means the device is silent
+        # rather than that we gave up before it did.
+        try:
+            timeout = float((q.get("timeout") or ["20"])[0])
+        except ValueError:
+            timeout = 20.0
+        status, out = self.server.hub.run((q.get("node") or [None])[0], cmd, timeout)
+        if status == 200 and out and not out.endswith("\n"):
+            out += "\n"
+        self._text(status, out)
+
+    def do_GET(self) -> None:
+        url = urllib.parse.urlsplit(self.path)
+        path, q = url.path, urllib.parse.parse_qs(url.query)
+        if path == "/":
+            self.send_response(302)
+            self.send_header("Location", "/flashmon/")
+            self.end_headers()
+            return
+        if not self._origin_ok():
+            return self._text(403, "forbidden\n")
+        if path == "/hub/token":
+            # Same-origin only in practice: no CORS headers go out, so a page
+            # from anywhere else can issue this request but cannot read it.
+            return self._text(200, self.server.hub.token + "\n")
+        if path == "/hub/nodes":
+            return self._text(200, json.dumps(self.server.hub.nodes(), indent=1) + "\n",
+                              "application/json; charset=utf-8")
+        if path == "/hub":
+            return self._websocket(q)
+        if path == "/log":
+            return self._log(q)
+        for prefix, root in (("/flashmon", WORKSPACE / "flashmon" / "flashmon"),
+                             ("/builds", WORKSPACE / "builds")):
+            if path == prefix or path.startswith(prefix + "/"):
+                return self._static(root, prefix, path)
+        self._text(404, "not found\n")
+
+    # -- static ------------------------------------------------------------
+    # flashmon and the catalogues, at the two paths a deployment serves them at:
+    # the page reaches its images at the relative ../builds/, so these two have
+    # to be siblings here as they are there.
+    def _static(self, root: Path, prefix: str, path: str) -> None:
+        try:
+            rel = urllib.parse.unquote(path[len(prefix):]).lstrip("/")
+        except ValueError:
+            return self._text(400, "bad request\n")
+        target = (root / rel).resolve()
+        if target != root.resolve() and root.resolve() not in target.parents:
+            return self._text(403, "forbidden\n")
+        if target.is_dir():
+            # Without the trailing slash the page's base URL is the parent, and
+            # every relative asset in it resolves one directory too high.
+            if not path.endswith("/"):
+                self.send_response(301)
+                self.send_header("Location", path + "/")
+                self.end_headers()
+                return
+            target = target / "index.html"
+        if not target.is_file():
+            return self._text(404, f"not found: {path}\n")
+        ctype = mimetypes.guess_type(target.name)[0]
+        if target.suffix == "":
+            ctype = "text/plain; charset=utf-8"     # the catalogue's `timestamp`
+        try:
+            data = target.read_bytes()
+        except OSError as e:
+            return self._text(500, f"{path}: {e}\n")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype or "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        # These trees change under a running hub — a rebuilt catalogue is the
+        # point — so nothing here may be held.
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except OSError:
+            pass
+
+    # -- log ---------------------------------------------------------------
+    def _log(self, q: dict) -> None:
+        hub = self.server.hub
+        sel = (q.get("node") or [None])[0]
+        follow = (q.get("follow") or ["0"])[0] not in ("0", "", "false")
+        nodes = hub.resolve(sel)
+        if sel and not nodes:
+            return self._text(404, f"no node matches '{sel}'\n")
+        # A named node streams verbatim; the whole hub is prefixed per line,
+        # which is the point of watching several at once.
+        prefixed = sel is None
+        if sel and len(nodes) > 1:
+            return self._text(409, "'" + sel + "' matches " +
+                              ", ".join(sorted(hub.labels.get(n, n) for n in nodes)) + "\n")
+        watch = hub.watch(nodes[0] if (nodes and not prefixed) else None) if follow else None
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        partial: dict[str, bytes] = {}
+        carry: dict[str, bytes] = {}
+        try:
+            for label, data in hub.backlog(nodes):
+                self._emit(label, data, prefixed, partial, carry)
+            if not follow:
+                return
+            while True:
+                try:
+                    label, data = watch.get(timeout=1.0)
+                except queue.Empty:
+                    # A follower that hung up while its node happened to be
+                    # quiet would otherwise hold this thread until the device
+                    # spoke again. The socket is write-only from here, so
+                    # anything readable on it is the peer's EOF.
+                    try:
+                        if self.connection.recv(
+                                1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b"":
+                            break
+                    except BlockingIOError:
+                        pass                 # nothing pending: still connected
+                    continue
+                self._emit(label, data, prefixed, partial, carry)
+        except OSError:
+            pass                             # the reader hung up
+        finally:
+            if watch is not None:
+                hub.unwatch(watch)
+
+    def _emit(self, label: str, data: bytes, prefixed: bool, partial: dict,
+              carry: dict) -> None:
+        data = carry.pop(label, b"") + data
+        cut = _PARTIAL_ESC_RE.search(data)
+        if cut and len(data) - cut.start() <= PARTIAL_ESC_MAX:
+            carry[label] = data[cut.start():]
+            data = data[:cut.start()]
+        data = _ANSI_RE.sub(b"", data)
+        if not data:
+            return
+        if not prefixed:
+            self.wfile.write(data)
+            self.wfile.flush()
+            return
+        # Prefixing is per line, so a chunk that stops mid-line waits for the
+        # rest of it rather than planting a prefix inside the line.
+        buf = partial.get(label, b"") + data
+        lines = buf.split(b"\n")
+        partial[label] = lines.pop()
+        if lines:
+            tag = f"[{label}] ".encode()
+            self.wfile.write(b"".join(tag + ln + b"\n" for ln in lines))
+            self.wfile.flush()
+
+    # -- websocket ---------------------------------------------------------
+    def _websocket(self, q: dict) -> None:
+        hub = self.server.hub
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key or (self.headers.get("Upgrade") or "").lower() != "websocket":
+            return self._text(400, "not a websocket handshake\n")
+        if (q.get("token") or [""])[0] != hub.token:
+            # Any page on this machine can reach the port; only one served by
+            # the hub can read the token that gets past this.
+            return self._text(403, "bad or missing hub token\n")
+        accept = base64.b64encode(
+            hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        # Written out rather than sent through send_response, which would stamp
+        # it with this handler's HTTP/1.0: a 101 is only a websocket handshake
+        # on HTTP/1.1, and a browser rejects the upgrade over anything older.
+        self.wfile.write(b"HTTP/1.1 101 Switching Protocols\r\n"
+                         b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                         b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n\r\n")
+        self.wfile.flush()
+        self.close_connection = True         # this socket is ours now
+        tab = _Tab(self.wfile)
+        try:
+            while not tab.closed:
+                got = _ws_recv(self.rfile)
+                if got is None:
+                    break
+                op, payload = got
+                if op == WS_CLOSE:
+                    break
+                if op == WS_PING:
+                    _ws_send(tab.wfile, tab.send_lock, payload, WS_PONG)
+                    continue
+                if op != WS_TEXT:
+                    continue
+                try:
+                    msg = json.loads(payload.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                self._on_message(hub, tab, msg)
+        except (OSError, struct.error):
+            pass
+        finally:
+            hub.detach(tab)
+
+    def _on_message(self, hub: _Hub, tab: _Tab, msg: dict) -> None:
+        t = msg.get("t")
+        if t == "hello":
+            node = str(msg.get("node") or "").strip()
+            if not node:
+                return
+            if tab.node and tab.node != node:
+                hub.detach(tab)              # the tab moved to another board
+            tab.node = node
+            tab.host = (msg.get("host") or None)
+            tab.fw = (msg.get("fw") or None)
+            tab.hw = (msg.get("hw") or None)
+            hub.attach(tab)
+        elif t == "bye":
+            hub.detach(tab)
+            tab.node = None
+        elif t == "log":
+            if not tab.node:
+                return
+            try:
+                hub.publish(tab.node, base64.b64decode(msg.get("b") or ""))
+            except (ValueError, TypeError):
+                pass
+        elif t == "reply":
+            slot = tab.pending.get(msg.get("id"))
+            if slot:
+                slot[1] = msg
+                slot[0].set()
+
+
+def cmd_flashmon(args: argparse.Namespace) -> int:
+    if args.nodes:
+        status, body = _hub_get("/hub/nodes")
+        if status != 200:
+            die(body.strip()
+                or "no flashmon server is running in this container "
+                   "(start one with `spangap flashmon` on the host)")
+        sys.stdout.write(body)
+        return 0
+
+    if args.stop:
+        # Found in /proc rather than read out of FLASHMON_FILE. That file lives
+        # in the workspace, which every container of this workspace shares, so
+        # the last server to start owns it whichever container it is in — and
+        # stopping the wrong one, or refusing to stop a running one because the
+        # record has been overwritten, are both worse than a scan. /proc is the
+        # one thing here that is per-container by construction.
+        stopped = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            try:
+                argv = entry.joinpath("cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue            # gone between the listing and the read
+            if not any(a.endswith((b"cli.py", b"spangap-inside")) for a in argv):
+                continue
+            if b"flashmon" not in argv:
+                continue
+            if b"--stop" in argv or b"--nodes" in argv:
+                continue            # another client of the server, not the server
+            try:
+                os.kill(int(entry.name), signal.SIGTERM)
+                stopped.append(entry.name)
+            except OSError:
+                pass
+        if not stopped:
+            print("spangap flashmon: nothing is running in this container",
+                  file=sys.stderr)
+            return 1                # so a caller can tell "stopped" from "none"
+        print(f"spangap flashmon: stopped (pid {', '.join(stopped)})",
+              file=sys.stderr)
+        return 0
+
+    token = secrets.token_urlsafe(18)
+    hub = _Hub(token)
+    try:
+        srv = _HubServer(("0.0.0.0", args.port), _HubHandler)
+    except OSError as e:
+        die(f"flashmon: bind :{args.port}: {e} (one already running?)")
+    srv.hub = hub
+    # SIGTERM is how `spangap flashmon --stop` and the container's own shutdown ask
+    # it to go, and both want the listener closed and the record removed.
+    def _terminate(_signum, _frame):
+        raise KeyboardInterrupt          # unwinds serve_forever into the cleanup
+
+    signal.signal(signal.SIGTERM, _terminate)
+    FLASHMON_FILE.write_text(json.dumps(
+        {"port": args.port, "token": token, "pid": os.getpid()}) + "\n")
+    print(f"spangap flashmon: serving the flasher + the catalogues on :{args.port} "
+          f"(the host `spangap flashmon` prints the URL to browse to).\n"
+          f"                  `spangap log -f` / `spangap cli` reach every node "
+          f"a tab attaches.", file=sys.stderr)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.shutdown()
+        FLASHMON_FILE.unlink(missing_ok=True)
+    return 0
+
+
+# -- talking to a running hub from the other verbs ---------------------------
+# The hub is a process in this same container, so this is a loopback connection
+# and nothing more: no host round trip, no bind mount, no relay.
+
+def _hub_token() -> str:
+    try:
+        return json.loads(FLASHMON_FILE.read_text()).get("token", "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _hub_connect(timeout: float = 2.0) -> socket.socket | None:
+    """A socket to the local hub, or None if no hub is listening."""
+    port = FLASHMON_PORT
+    try:
+        port = int(json.loads(FLASHMON_FILE.read_text()).get("port", FLASHMON_PORT))
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        return socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    except OSError:
+        return None
+
+
+def _hub_head(s: socket.socket) -> tuple[int, bytes]:
+    """Read the status line and headers; return the status and any body bytes
+    that arrived with them."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = s.recv(4096)
+        if not chunk:
+            return 0, b""
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    try:
+        status = int(head.split(b" ", 2)[1])
+    except (IndexError, ValueError):
+        status = 0
+    return status, rest
+
+
+def _hub_get(path: str) -> tuple[int, str]:
+    """One-shot GET. (0, "") when no hub is up."""
+    s = _hub_connect()
+    if s is None:
+        return 0, ""
+    try:
+        s.sendall(f"GET {path} HTTP/1.0\r\nHost: hub\r\n\r\n".encode())
+        status, body = _hub_head(s)
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+        return status, body.decode("utf-8", "replace")
+    except OSError:
+        return 0, ""
+    finally:
+        s.close()
+
+
+def _hub_stream_log(node: str | None, follow: bool) -> int:
+    """Stream the hub's serial log to stdout. 0 (having printed nothing) if no
+    hub is up, so the caller can fall through to the host monitor's relay;
+    otherwise the hub's own status for what was asked."""
+    s = _hub_connect()
+    if s is None:
+        return 0
+    query = f"follow={int(follow)}" + (f"&node={urllib.parse.quote(node)}" if node else "")
+    try:
+        s.sendall(f"GET /log?{query} HTTP/1.0\r\nHost: hub\r\n\r\n".encode())
+        s.settimeout(None)
+        status, body = _hub_head(s)
+        if status != 200:
+            print(f"spangap: flashmon: {body.decode('utf-8', 'replace').strip()}",
+                  file=sys.stderr)
+            return status        # it answered: falling through to the host is wrong
+        out = sys.stdout.buffer
+        out.write(body)
+        out.flush()
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            out.write(chunk)
+            out.flush()
+    except KeyboardInterrupt:
+        pass
+    except OSError:
+        pass
+    finally:
+        s.close()
+    return 200
+
+
+def _hub_run(node: str | None, cmd: str, timeout: float = 20.0) -> tuple[int, str]:
+    """Run one command on a node through its browser tab. (0, "") if no hub."""
+    s = _hub_connect()
+    if s is None:
+        return 0, ""
+    body = cmd.encode()
+    query = f"timeout={timeout:g}" + (f"&node={urllib.parse.quote(node)}" if node else "")
+    try:
+        s.sendall(f"POST /cmd?{query} HTTP/1.0\r\nHost: hub\r\n"
+                  f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        s.settimeout(timeout + 5)
+        status, out = _hub_head(s)
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            out += chunk
+        return status, out.decode("utf-8", "replace")
+    except OSError as e:
+        return 0, f"flashmon: {e}"
+    finally:
+        s.close()
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
@@ -4214,10 +5021,37 @@ def cmd_show(args: argparse.Namespace) -> int:
     print()
 
     print("Tooling:")
+    # Which side is holding the boards. The hub is asked rather than inferred
+    # from its record file, so a stale record can't claim nodes that are gone.
+    status, body = _hub_get("/hub/nodes")
+    attached: list = []
+    if status == 200:
+        try:
+            attached = json.loads(body)
+        except ValueError:
+            attached = []
+        if attached:
+            print("  spangap flashmon: attached nodes — "
+                  + ", ".join((n.get("host") or n.get("node") or "?")
+                              + (f" ({n['hw']})" if n.get("hw") else "")
+                              for n in attached))
+            print("                    `spangap log -f` reads them; "
+                  "`spangap cli -n <node> <cmd>` runs commands on one")
+        else:
+            print("  spangap flashmon: running, but no browser tab is attached "
+                  "yet — open the URL the host `spangap flashmon` printed")
     if _monitor_ready():
         print(
             "  spangap flash: spangap monitor outside the container is ready "
             "and waiting to do the actual flashing"
+        )
+    elif attached:
+        # Boards on the hub are flashed by the tabs holding them, which watch
+        # the catalogue and take a newer image on their own. Nothing to signal.
+        print(
+            "  spangap flash: nothing to signal — the browser tabs holding "
+            "these boards flash them from the catalogue, so `spangap "
+            "make-builds` in builds/<catalogue> is the whole of it"
         )
     else:
         print(
@@ -4596,6 +5430,7 @@ def _print_authorize(host: str, key: Path) -> None:
 
 def cmd_cli(argv: list[str]) -> int:
     override: str | None = None
+    node: str | None = None
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -4604,12 +5439,39 @@ def cmd_cli(argv: list[str]) -> int:
                 die("spangap cli: -h needs a hostname")
             override = argv[i + 1]
             i += 2
+        elif a in ("-n", "--node"):
+            if i + 1 >= len(argv):
+                die("spangap cli: -n needs a node (a hostname or a device id)")
+            node = argv[i + 1]
+            i += 2
         elif a == "--":
             i += 1
             break
         else:
             break
     rest = argv[i:]
+
+    # Route 1: through the hub, i.e. over USB via the browser tab holding this
+    # node. It is tried first because it is the only route that needs nothing of
+    # the device but a console: a node that has not onboarded, one whose network
+    # is down, and one that has never been given our key are all reachable here
+    # and by nothing below. One command at a time — an interactive session stays
+    # ssh's job — and a hub with no tab on the node falls through, so a plain
+    # `spangap cli` behaves exactly as it always did when no browser is involved.
+    if rest:
+        status, out = _hub_run(node, " ".join(rest))
+        if status == 200:
+            sys.stdout.write(out)
+            return 0
+        if status and not (status == 409 and node is None):
+            print(f"spangap cli: {out.strip()}", file=sys.stderr)
+            return 1
+        if node:
+            die(f"cli: -n {node} names a hub node, but no `spangap flashmon` is "
+                "running in this container")
+    elif node:
+        die("cli: -n reaches a node through the hub, which runs one command at "
+            "a time — name the command too (`spangap cli -n tbeam status`)")
 
     host = device_host(set_to=override)
     key = _ensure_ssh_key()
@@ -5309,13 +6171,38 @@ def main(argv: list[str] | None = None) -> int:
 
     p_log = sub.add_parser(
         "log",
-        help="print the device serial log captured by `spangap monitor` (streamed from the host relay; -f to follow)",
+        help="print the device serial log — from `spangap flashmon` (the browser tabs) if one is running, else from the host `spangap monitor`; -f to follow",
     )
     p_log.add_argument(
         "-f", "--follow", action="store_true",
         help="follow the log like tail -f, surviving flash/reset truncations (Ctrl-C to stop)",
     )
+    p_log.add_argument(
+        "-n", "--node", metavar="NODE",
+        help="show only this hub node (its hostname or its device id). Without "
+             "it every attached node is shown, each line tagged with the node "
+             "it came from — which is how a message is followed across a mesh.",
+    )
     p_log.set_defaults(func=cmd_log)
+
+    p_fm = sub.add_parser(
+        "flashmon",
+        help="serve the flasher + the image catalogues on http://localhost and take the browser tabs' consoles as this container's own (see `spangap log`, `spangap cli`)",
+    )
+    p_fm.add_argument(
+        "--port", type=int, default=FLASHMON_PORT,
+        help=f"port to bind in the container (default {FLASHMON_PORT}, which is the "
+             "one the container publishes to the host)",
+    )
+    p_fm.add_argument(
+        "--nodes", action="store_true",
+        help="print the nodes whose tabs are attached, and exit",
+    )
+    p_fm.add_argument(
+        "--stop", action="store_true",
+        help="stop the server running in this container",
+    )
+    p_fm.set_defaults(func=cmd_flashmon)
 
     sub.add_parser(
         "show",

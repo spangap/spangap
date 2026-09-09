@@ -51,6 +51,10 @@
       "type": "array",
       "items": { "type": "integer", "minimum": 1, "maximum": 65535 }
     },
+    "catalogue_seed": {
+      "description": "Where `spangap flashmon` fetches the starting content of this workspace's `builds/local/builds.yaml` from, on the first run that finds none: a URL (or a workspace-relative path) to a published builds.yaml, normally this project's own deployed catalogue. It is a starting point and nothing more — the file is copied once and is the user's from then on, never re-fetched or reconciled. Only read from the BUILT straddle's own straddle.yaml, and only as a one-line scalar, since the host tooling reads it with a plain sed.",
+      "type": "string"
+    },
     "firmware": {
       "description": "Firmware-half path relative to manifest dir. Omit for default 'idf'. Use '.' when the manifest dir IS the firmware project root (buildable straddles).",
       "type": "string",

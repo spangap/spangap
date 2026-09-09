@@ -28,6 +28,19 @@
 #                    at once). The run owns every relay it needs — the dev server's
 #                    own, and this device's ports — so nothing else has to be
 #                    running for the page to reach the device. Streams until quit.
+#   flashmon [--stop|--nodes]
+#                    serve the browser flasher out of the container and open it:
+#                    it serves flashmon and the image catalogues over
+#                    http://localhost, and every tab that connects lends the
+#                    container the console of the node it is holding, so
+#                    in-container `spangap log` / `spangap cli` reach devices
+#                    nothing on the host is holding. Clones the flashmon repo and
+#                    seeds a `builds/local` catalogue on first run. Idempotent:
+#                    one already serving the port is opened rather than replaced,
+#                    since its origin is where the browser's board grants live.
+#                    --stop stops it in every container of this workspace. The
+#                    alternative to `monitor`, not a companion to it — one of the
+#                    two owns a given board's port.
 #   get-deps         git-clone any missing transitive `requires:` siblings
 #                    (uses host github creds; container has none). Also runs
 #                    automatically as part of `build`.
@@ -384,6 +397,12 @@ DEV_PORT=9000       # `spangap dev` quasar dev server bind port inside the conta
 # concurrent `spangap dev` in this workspace, so a second run can serve a second
 # device instead of colliding with the first.
 DEV_PORT_LAST=9009
+# `spangap flashmon` binds this in the container, and the container publishes it
+# to the host (see ensure_container). Fixed rather than allocated out of the dev
+# range because there is one flasher per workspace serving every board, where a
+# dev server is one per device — and because the browser has to be sent to it at
+# an address that outlives a container.
+FLASHMON_PORT=${SPANGAP_FLASHMON_PORT:-9010}
 # The flasher's own repo (see ensure_flashmon): the platform's, like the
 # build-env itself, and cloned beside the project it flashes.
 FLASHMON_REPO=spangap/flashmon
@@ -1630,15 +1649,15 @@ ensure_daemon() {
     esac
 }
 
-# True if the container publishes the `spangap dev` port to the host. The mapping
-# is fixed at `docker run` time, so a container created before it existed must be
-# recreated — cheap and lossless, since all state lives in bind mounts.
-# True if the container publishes the whole `spangap dev` port range. The top of
-# the range is checked as well as the bottom, because a container from before the
-# range publishes only the first port and could serve just one dev run.
+# True if the container publishes the browser-facing ports to the host: the
+# whole `spangap dev` range, and the flasher's. The mapping is fixed at `docker
+# run` time, so a container created before one of them existed must be recreated
+# — cheap and lossless, since all state lives in bind mounts. Every port is
+# checked, not just the first: a container that publishes only the bottom of the
+# range could serve one dev run and no flasher.
 container_publishes_dev_port() {
     local p b
-    for p in "$DEV_PORT" "$DEV_PORT_LAST"; do
+    for p in "$DEV_PORT" "$DEV_PORT_LAST" "$FLASHMON_PORT"; do
         b=$(docker inspect --format \
             '{{ index .HostConfig.PortBindings "'"$p"'/tcp" }}' \
             "$container" 2>/dev/null) || b=""
@@ -1647,16 +1666,51 @@ container_publishes_dev_port() {
     return 0
 }
 
-# The fixed host port a legacy container baked into its dev-port mapping, or ""
-# for the current ephemeral form (which records an empty HostPort in
-# HostConfig — Docker fills the real port in at start time, in NetworkSettings,
-# not here). Used to spot — and recreate — containers created by an older
-# spangap that pinned the host side to $DEV_PORT and so blocks every sibling
-# workspace. Ephemeral containers return "" and are left alone.
-dev_fixed_host_port() {
+# The fixed host port a container baked into its mapping for $2, or "" for the
+# ephemeral form (which records an empty HostPort in HostConfig — Docker fills
+# the real port in at start time, in NetworkSettings, not here).
+container_host_port() {
     docker inspect --format \
-        '{{ with (index .HostConfig.PortBindings "'"$DEV_PORT"'/tcp") }}{{ (index . 0).HostPort }}{{ end }}' \
-        "$container" 2>/dev/null
+        '{{ with (index .HostConfig.PortBindings "'"$2"'/tcp") }}{{ (index . 0).HostPort }}{{ end }}' \
+        "$1" 2>/dev/null
+}
+
+# True if this machine's loopback has $1 free to bind. Asked of the kernel
+# rather than of Docker: whatever holds it — a sibling workspace's container, a
+# retired one of ours, an unrelated process — the answer that matters is the
+# same, and only a bind attempt gives it.
+host_port_free() {
+    python3 -c "
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(('127.0.0.1', $1))
+except OSError:
+    sys.exit(1)
+" >/dev/null 2>&1
+}
+
+# The flasher's port is FIXED, and this is what keeps it that way. A browser's
+# serial-port grants and the flasher's node roster are both keyed to the page's
+# origin, so a page that moved ports would make every board a stranger again and
+# ask for each one out of the chooser by hand. Landing on some other port is
+# therefore not a graceful degradation, it is the failure — so a container of
+# THIS workspace that is squatting on $FLASHMON_PORT is removed to get it back,
+# live sessions and all. (Only ours. Another workspace's container is somebody
+# else's and is reported, not removed.)
+free_flashmon_port() {
+    local name
+    host_port_free "$FLASHMON_PORT" && return 0
+    docker ps -a --filter "label=spangap.workspace=$workspace" \
+            --format '{{.Names}}' 2>/dev/null \
+    | while read -r name; do
+        [ "$(container_host_port "$name" "$FLASHMON_PORT")" = "$FLASHMON_PORT" ] || continue
+        docker exec "$name" spangap flashmon --stop >/dev/null 2>&1 || true
+        [ -z "$SPANGAP_QUIET" ] \
+            && log "removing $name — it is holding the flasher's port $FLASHMON_PORT"
+        docker rm -f "$name" >/dev/null 2>&1 || true
+    done || true
+    host_port_free "$FLASHMON_PORT"
 }
 
 # True if the container has live exec sessions in it — an interactive
@@ -1681,6 +1735,14 @@ container_busy() {
 retire_container() {
     local cid
     cid=$(docker inspect -f '{{.Id}}' "$container" 2>/dev/null) || return 0
+    # A flashmon server in the outgoing container is spangap's own doing rather
+    # than a user session, and leaving it up would keep the container "busy" —
+    # parked instead of removed, still holding the fixed host port its
+    # replacement wants, so the new one would land on a different port and every
+    # board in the browser would need granting again. Stopping it first is what
+    # lets the container go, and with it the port. (Silent on an older image
+    # whose in-container CLI has no flashmon verb.)
+    docker exec "$container" spangap flashmon --stop >/dev/null 2>&1 || true
     if ! container_busy "$container"; then
         docker rm -f "$container" >/dev/null
         return 0
@@ -1763,14 +1825,23 @@ ensure_container() {
                     test -f "$container_ws/spangap.workspace.yaml" >/dev/null 2>&1; then
                 local why=""
                 if ! container_publishes_dev_port; then
-                    [ -n "$why" ] && why="$why; the dev port range is unpublished" \
-                                  || why="the dev port range ($DEV_PORT-$DEV_PORT_LAST) is unpublished"
-                elif [ "$(dev_fixed_host_port)" = "$DEV_PORT" ]; then
+                    [ -n "$why" ] && why="$why; the browser-facing ports are unpublished" \
+                                  || why="the browser-facing ports ($DEV_PORT-$DEV_PORT_LAST, $FLASHMON_PORT) are unpublished"
+                elif [ "$(container_host_port "$container" "$DEV_PORT")" = "$DEV_PORT" ]; then
                     # Legacy container pinned the host side to $DEV_PORT, which
                     # blocks every other workspace. Recreate it onto an ephemeral
                     # host port to release the fixed one.
                     [ -n "$why" ] && why="$why; the dev port uses a fixed host mapping" \
                                   || why="the dev port uses a fixed host mapping ($DEV_PORT)"
+                elif [ "$(container_host_port "$container" "$FLASHMON_PORT")" != "$FLASHMON_PORT" ]; then
+                    # The flasher is on some other host port, so the browser is
+                    # being asked for board grants this machine has already given
+                    # once. Nothing moves a mapping but a new container, and the
+                    # check has to name the port rather than merely see one: an
+                    # ephemeral binding is a binding, so a container that landed
+                    # off $FLASHMON_PORT would otherwise read as correct forever.
+                    [ -n "$why" ] && why="$why; the flasher is not on $FLASHMON_PORT" \
+                                  || why="the flasher is on a host port other than $FLASHMON_PORT"
                 fi
                 if [ -z "$why" ]; then
                     return 0
@@ -1832,13 +1903,15 @@ ensure_container() {
     # The workspace mounts UNDER the persistent home (/home/spangap) at its
     # basename; Docker orders nested bind mounts by depth, so /home/spangap
     # lands first and $container_ws on top of it regardless of -v order.
-    # Publish the `spangap dev` port RANGE to the host loopback so the Quasar dev
-    # servers (each bound 0.0.0.0:<port in range> inside) are reachable from this
-    # machine's browser — the one host→container path Docker Desktop gives us
-    # without host networking. A range rather than one port because a run serves
-    # one device: two devices at once means two dev servers in this container,
-    # each needing its own way out. Loopback-only: the dev SPA is for this
-    # machine's browser, and it reaches the device through this run's own relay.
+    # Publish the browser-facing ports to the host loopback — the `spangap dev`
+    # RANGE and the flasher's single port — so the servers bound inside (each on
+    # 0.0.0.0) are reachable from this machine's browser, which is the one
+    # host→container path Docker Desktop gives us without host networking. A
+    # range for dev because a run serves one device: two devices at once means
+    # two dev servers in this container, each needing its own way out. One port
+    # for the flasher because there is one per workspace and it serves every
+    # board. Loopback-only: both are for this machine's browser, and they reach
+    # the device through their own relays (dev) or through the browser itself.
     #
     # Empty host port (the `127.0.0.1::$RANGE` form, note the double colon) —
     # Docker assigns a free ephemeral host port per published port. The mapping
@@ -1864,9 +1937,24 @@ ensure_container() {
         run_user_args=(--user "$remap_uid:$remap_gid")
     fi
 
+    # The flasher is published on $FLASHMON_PORT and on nothing else, unlike the
+    # dev range: a browser's serial-port grants and the flasher's node roster are
+    # both keyed to the page's origin, so a page on another port makes every
+    # board a stranger again and asks for each one out of the chooser by hand.
+    # A working page at the wrong address is not a lesser success, it is the
+    # thing being avoided — so if one of this workspace's own containers is
+    # squatting on the port, it goes; and if something else is, that is said
+    # here rather than papered over with a port the browser has never met.
+    if ! free_flashmon_port; then
+        die "host port $FLASHMON_PORT is taken by something that is not this workspace's" \
+            "(the browser's board grants live on it, so nothing else will do)." \
+            "Find it with: lsof -nP -iTCP:$FLASHMON_PORT -sTCP:LISTEN"
+    fi
+
     docker run -d --name "$container" \
         ${run_user_args[@]+"${run_user_args[@]}"} \
         -p "127.0.0.1::$DEV_PORT-$DEV_PORT_LAST" \
+        -p "127.0.0.1:$FLASHMON_PORT:$FLASHMON_PORT" \
         -v "$spangap_home:/home/spangap" \
         -v "$workspace:$container_ws" \
         --workdir "$container_ws" \
@@ -1936,17 +2024,72 @@ pull_dep() {
     return 0
 }
 
-# The flasher comes down with the project, not by hand: `spangap dev` serves it
-# beside the app and `spangap make-builds` fills the catalogue it reads, so a
-# workspace that can build a project can also flash one. Not a straddle and never
-# staged into a build — a plain checkout beside the others. Non-fatal: a
-# workspace that can't reach github still builds what's on disk.
+# The flasher comes down with the project, not by hand: `spangap flashmon` serves
+# it and `spangap make-builds` fills the catalogue it reads, so a workspace that
+# can build a project can also flash one. Not a straddle and never staged into a
+# build — a plain checkout beside the others. Non-fatal: a workspace that can't
+# reach github still builds what's on disk.
 ensure_flashmon() {
     [ -e "$workspace/flashmon" ] && return 0
     command -v git >/dev/null 2>&1 || return 0
     log "cloning $FLASHMON_REPO -> $workspace/flashmon"
     git clone --quiet "https://github.com/${FLASHMON_REPO}.git" "$workspace/flashmon" \
         || log "warning: could not clone $FLASHMON_REPO — the flasher won't be there to serve"
+    return 0
+}
+
+# `builds/local` — the catalogue this workspace builds for itself, and the one a
+# locally served flasher offers. Seeded once, so a fresh checkout has somewhere
+# to point `spangap make-builds` at instead of a blank page and an empty
+# directory; after that the file is the user's and is never touched again.
+#
+# The starting content is whatever the project's `catalogue_seed:` names —
+# normally its own published catalogue, so the entries are the boards it really
+# builds for. A project that names none, or a fetch that fails, falls back to the
+# flasher's shipped template, which builds nothing until it is edited but is
+# still a valid catalogue. Non-fatal either way: this is a convenience, and a
+# workspace with no network still serves whatever catalogues it already has.
+# True if a flashmon server — ours, not something else that happens to hold the
+# port — is answering on this host port. Asked of the server rather than of the
+# port, so an unrelated listener is not mistaken for one of ours.
+flashmon_serving() {
+    local port=$1
+    command -v curl >/dev/null 2>&1 || return 1
+    curl -fsS --max-time 2 "http://127.0.0.1:$port/hub/nodes" >/dev/null 2>&1
+}
+
+ensure_local_catalogue() {
+    local dir="$workspace/builds/local"
+    [ -f "$dir/builds.yaml" ] && return 0
+    local seed proj
+    proj=$(require_straddle cli 2>/dev/null) || proj=""
+    [ -n "$proj" ] && seed=$(sed -n 's/^[[:space:]]*catalogue_seed:[[:space:]]*//p' \
+                                 "$proj/straddle.yaml" 2>/dev/null | head -1)
+    mkdir -p "$dir" || return 0
+    case $seed in
+    http://*|https://*)
+        if command -v curl >/dev/null 2>&1 \
+           && curl -fsSL --max-time 20 "$seed" -o "$dir/builds.yaml.part" 2>/dev/null \
+           && [ -s "$dir/builds.yaml.part" ]; then
+            mv "$dir/builds.yaml.part" "$dir/builds.yaml"
+            log "seeded builds/local/builds.yaml from $seed"
+            return 0
+        fi
+        rm -f "$dir/builds.yaml.part"
+        log "warning: could not fetch $seed — seeding builds/local from the flasher's template"
+        ;;
+    ?*)
+        if [ -f "$workspace/$seed" ]; then
+            cp "$workspace/$seed" "$dir/builds.yaml"
+            log "seeded builds/local/builds.yaml from $seed"
+            return 0
+        fi
+        ;;
+    esac
+    if [ -f "$workspace/flashmon/builds.yaml.example" ]; then
+        cp "$workspace/flashmon/builds.yaml.example" "$dir/builds.yaml"
+        log "seeded builds/local/builds.yaml from the flasher's template — edit it, then \`spangap make-builds\` in that directory"
+    fi
     return 0
 }
 
@@ -2386,6 +2529,106 @@ EOF
     rc=$?
     set -e
     exit "$rc"
+    ;;
+flashmon)
+    # The browser flasher, served out of the container — and the consoles of the
+    # tabs that connect to it, lent back to the container.
+    #
+    # Nothing has to run on the host for it. Docker publishes the server's port
+    # to a host loopback port that lives as long as the container does, so this
+    # verb starts it, reads that mapping back, and gets out of the way — there is
+    # no relay to keep alive and nothing to leave running in a terminal.
+    #
+    # It is also the whole of getting started: the flasher is cloned if it isn't
+    # there and a `builds/local` catalogue is seeded if there is none, so this
+    # one command takes a bare workspace to a page that can flash a board.
+    shift
+    ensure_daemon
+    # --stop and --nodes are questions about what is already running, so they are
+    # answered before any of the setting-up below. Neither wants a container
+    # built for it, a flasher cloned, or a catalogue seeded, and --stop least of
+    # all: the run that is being asked to tear things down is the last one that
+    # should be standing them up.
+    case "${1:-}" in
+    --stop)
+        # Every container of this workspace, not just the current one: a server
+        # left running in a replaced container is exactly the one worth being
+        # able to stop, since it is what holds the canonical host port and, being
+        # a live session in that container, what stops it being removed. Stopping
+        # it lets the next run reclaim both.
+        #
+        # Run the workspace's own copy of the in-container CLI rather than the
+        # one baked into each container's image: a replaced container is on an
+        # older image, whose CLI need not have this verb at all, and the
+        # workspace is bind-mounted into every one of them.
+        docker ps --filter "label=spangap.workspace=$workspace" \
+                --format '{{.Names}}' 2>/dev/null \
+        | while read -r c; do
+            docker exec -e SPANGAP_WORKSPACE="$container_ws" "$c" \
+                /usr/bin/python3 "$container_ws/spangap/build-system/spangap-inside" \
+                flashmon --stop >/dev/null 2>&1 \
+                && log "stopped the flasher in $c"
+        done || true
+        reap_retired
+        exit 0
+        ;;
+    --nodes)
+        # shellcheck disable=SC2086
+        exec docker exec $exec_flags -e SPANGAP_WORKSPACE="$container_ws" \
+            --workdir "$container_ws" "$container" spangap flashmon --nodes
+        ;;
+    esac
+    # A flasher already answering on the canonical port is left exactly as it is,
+    # whichever container is running it. It is usually one this workspace started
+    # in a container that has since been replaced but not yet removed — the
+    # replacement could only serve a different port, and a different port is a
+    # different origin, which would cost every board in that browser its grant.
+    # So: hand the browser to the one that is up, and say what that means.
+    if flashmon_serving "$FLASHMON_PORT"; then
+        url="http://localhost:$FLASHMON_PORT/"
+        log "flashmon already serving $url"
+        if ! docker exec "$container" spangap flashmon --nodes >/dev/null 2>&1; then
+            log "note: it is not this workspace's current container, so \`spangap log\` / \`spangap cli\` there cannot reach its tabs."
+            log "      to move it over: \`spangap flashmon --stop\` (stops it wherever it is), then run this again."
+        fi
+        open_url "$url"
+        exit 0
+    fi
+    # ensure_container is what guarantees the flasher's port: a container that is
+    # not publishing $FLASHMON_PORT is recreated here rather than tolerated, so
+    # by the time the server starts below there is exactly one address it can be
+    # reached at.
+    ensure_container
+    ensure_flashmon             # the page this serves
+    ensure_local_catalogue      # and something for it to offer
+    # Already up? Asked of the server itself rather than of the .spangap-flashmon
+    # file it writes, so a record left behind by one that was killed outright is
+    # replaced instead of being believed.
+    if ! docker exec "$container" spangap flashmon --nodes >/dev/null 2>&1; then
+        rm -f "$workspace/.spangap-flashmon"
+        docker exec -d -e SPANGAP_WORKSPACE="$container_ws" \
+            --workdir "$container_ws" "$container" spangap flashmon
+        # The wrapper sources the IDF environment before it reaches the server,
+        # so the record takes a second or two to appear.
+        for _ in $(seq 1 30); do
+            [ -s "$workspace/.spangap-flashmon" ] && break
+            sleep 0.3
+        done
+        [ -s "$workspace/.spangap-flashmon" ] \
+            || die "it didn't come up — try \`spangap docker spangap flashmon\` to see why"
+    fi
+    # Read back rather than assumed: ensure_container guarantees the mapping, and
+    # this is where that guarantee is checked against the daemon before a URL is
+    # handed to a browser that will remember it.
+    flashmon_port=$(docker port "$container" "$FLASHMON_PORT/tcp" 2>/dev/null \
+                      | awk -F: 'NR==1 {print $NF; exit}')
+    [ "$flashmon_port" = "$FLASHMON_PORT" ] \
+        || die "the container publishes the flasher on ${flashmon_port:-nothing}, not $FLASHMON_PORT"
+    url="http://localhost:$FLASHMON_PORT/"
+    log "flashmon serving $url"
+    log "in the container: \`spangap log -f\` follows every attached node, \`spangap cli -n <node> <cmd>\` runs a command on one"
+    open_url "$url"
+    exit 0
     ;;
 dev)
     # Run the project's Quasar dev server inside the container and open it in the

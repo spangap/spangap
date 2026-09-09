@@ -78,11 +78,12 @@ container these verbs work directly, with the IDF env already set up:
 | `spangap list-requires` / `list-deps` | full transitive set / missing siblings (read-only diagnostics) |
 | `spangap clean` / `reallyclean` | `idf.py fullclean` / strip **every** straddle in the active root back to source (gitignored artifacts only) |
 | `spangap show` | project straddle + deps in init order, the env report (python, IDF_PATH, node/npm/idf.py versions), and whether a host `spangap monitor` is ready to flash (bare `spangap` with no subcommand does the same; `show` stays as an explicit alias) |
-| `spangap cli [-h host] [<cmd>]` | talk to a running device over the network (ssh, else TCP CLI) |
+| `spangap cli [-n node] [-h host] [<cmd>]` | run a command on a device: through a `spangap flashmon` browser tab holding it (`-n`, over USB — needs no network on the device at all), else over the network (ssh, else TCP CLI) |
+| `spangap flashmon [--nodes] [--stop]` | serve flashmon + the image catalogues on the container's published port, and take the console of every browser tab that connects (see below). Runs in the foreground; the host `spangap flashmon` starts it and prints the URL |
 | `spangap flash` | **signal only** — touches `.spangap-flashme` (workspace root) and waits ≤5s for a host monitor to consume it (see below) |
 | `spangap reset` | **signal only** — touches `.spangap-resetme` (workspace root) and waits ≤5s for a host monitor to consume it; the monitor restarts with a device reset (clean reboot + boot-log capture), no reflash |
 | `spangap make-builds [entry…]` | build the image catalogue described by the `builds.yaml` in the cwd (or every catalogue below it), stamp every image of the run with one datetime, rewrite `index.html` + `timestamp`. Every straddle it compiles must already be in the workspace — cloning is the host's (see below) |
-| `spangap log [-f]` | print the device serial log (`.spangap-log`); streamed from the host monitor's relay (`host.docker.internal:2324`) because the bind mount is stale inside the container (a plain `cat`/`tail` — and even `O_DIRECT` — freeze; see below); `-f` follows like `tail -f` and survives flash/reset truncations |
+| `spangap log [-f] [-n node]` | print the device serial log. From a running `spangap flashmon` when there is one (every attached node at once, each line tagged, or one with `-n`), else from the host monitor's relay (`host.docker.internal:2324`) — never by reading `.spangap-log`, which is stale inside the container (a plain `cat`/`tail` — and even `O_DIRECT` — freeze; see below); `-f` follows like `tail -f` and survives flash/reset truncations |
 
 **`spangap flash` / `spangap reset` / `spangap cli` from in here don't touch hardware
 directly** — the
@@ -157,9 +158,18 @@ Two things the script handles that are easy to trip over:
 ## Working with a real device — the you ↔ user ↔ board loop
 
 **This container has no serial ports and no `esptool`** — it cannot talk to hardware
-directly. Everything device-side flows through a **`spangap monitor` the user runs on
-the host**, plus the device's network CLI. Set this up once and you can iterate tightly
-without the user touching anything per cycle.
+directly. Something on the host has to be holding the board's USB port, and there are
+two things that can be, each owning the port exclusively:
+
+- **`spangap flashmon`** — flashmon in a browser tab holds the port, and lends the console
+  to this container. Several boards at once, one tab each. It flashes on its own from
+  the catalogue, so there is no flash signal in this mode.
+- **`spangap monitor`** — a host-side serial monitor holds the port and this container
+  signals it to flash. One board.
+
+The hub is described in its own section below; the monitor loop is the rest of this
+one. Either way, set it up once and you can iterate without the user touching anything
+per cycle.
 
 **1. Let you flash.** Ask the user to run, **on the host, from the project directory**
 (or the workspace root, once something has been built — `.spangap-build` then names the
@@ -262,15 +272,101 @@ spangap cli -h 192.168.1.50               # point at a specific device, then con
 (opens the device's TCP CLI; `s.` persists it to flash). When ssh isn't available, `spangap
 cli` automatically uses that socket on the same `.spangap-tcp` address.
 
+### `spangap flashmon` — the browser tabs as this container's console
+
+```
+tab -> hub   {"t":"hello","node":"f9fb74","host":"tbeam","fw":…,"hw":…}
+tab -> hub   {"t":"log","b":"<base64 of the raw serial bytes>"}     (continuous)
+hub -> tab   {"t":"cmd","id":41,"cmd":"gps"}
+tab -> hub   {"t":"reply","id":41,"ok":true,"out":"…"}
+tab -> hub   {"t":"bye"}
+```
+
+The user runs **`spangap flashmon`** on the host once; it starts the server in this
+container and opens the URL Docker published it on — `http://localhost:9010/`, the
+same address every time, because the browser keys both its serial-port grants and
+flashmon's node roster to the page's origin: a page that moved ports would turn every
+board back into a stranger the user has to pick out of the chooser by hand. There is
+no fallback port, because a working page at an address the browser has never met is
+the very thing being avoided: a container not publishing 9010 is recreated rather than
+tolerated, a container of this workspace squatting on 9010 is removed to get it back
+(sessions in it and all), and anything else holding it is a hard error naming the
+`lsof` that finds it. Running it again when something
+is already serving that port opens it rather than starting a second one, for the same
+reason — including when the server is in a container this workspace has replaced but
+not yet removed, which is the usual way that happens. That case costs something: the
+current container's `spangap log` / `spangap cli` cannot reach tabs attached to a
+server in another container, so `spangap flashmon --stop` — which stops it in every
+container of this workspace — then a re-run moves it across.
+
+That URL serves **flashmon** and
+the **image catalogues** — the same two trees a deployment serves, at the same two
+paths — and every flashmon tab loaded from it connects back over a WebSocket and
+registers the node it is holding. From then on this container can read that node's
+console and run commands on it, with no host-side monitor and no serial port of its
+own.
+
+It is also the whole of getting started, which is why it does two things beyond
+serving: it **clones the flasher** if the workspace hasn't got it, and it **seeds
+`builds/local/builds.yaml`** if there is no such catalogue — from the URL the project
+straddle's `catalogue_seed:` names (its own published catalogue, so the entries are
+the boards it really builds for), falling back to the flasher's shipped template.
+Seeded once and never reconciled: from then on the file is the user's.
+
+`local` is what a locally served page offers, and it **stays** on it — a board flashed
+from some other catalogue does not move a local page, because that catalogue is the
+one being built a few metres away. A tab opened there also starts with **auto-flash
+on**. So the loop is one command: `spangap make-builds` in `builds/local`, and every
+attached board takes the new image by itself. (Both are defaults of the page, not of
+the server: `?build=<catalogue>` and the settings panel still win, and unticking
+auto-flash is remembered.)
+
+```sh
+spangap flashmon --nodes        # who is attached
+spangap log -f                  # every attached node, each line tagged [<host>]
+spangap log -f -n tbeam         # just that one, verbatim
+spangap cli -n tbeam gps        # run a command on it and print the output
+spangap flashmon --stop
+```
+
+Three things make this worth reaching for over the monitor:
+
+- **Several boards at once.** One tab per board, one hub, and `spangap log -f` with no
+  `-n` interleaves them in arrival order with each line tagged by its node — which is
+  how a message is followed across a mesh.
+- **`spangap cli` with no network.** The command goes over the device's USB console
+  (through the tab, over the same framed channel flashmon's own probes use), so it
+  reaches a node that has not onboarded, whose wifi is down, or that has never been
+  given our ssh key — none of which ssh or the TCP CLI can do.
+- **The user keeps the browser.** flashmon stays the console they are looking at.
+
+And two things it does not do:
+
+- **It does not flash.** flashmon polls the catalogue's `timestamp` and, with
+  auto-flash ticked (which a locally served tab starts with), flashes a newer image
+  itself — so `spangap make-builds` is the whole trigger, and `spangap flash` has
+  nothing to signal. Auto-flash is per board, not per node: every attached tab
+  holding that board type takes the new image, so what goes into the catalogue goes
+  onto every board of that type on the desk.
+- **It does not relay the device's network ports.** Those belong to `spangap monitor`
+  and `spangap dev`, so `spangap cli` *over the network*, the device's web UI and ssh
+  still need one of those running.
+
+The page is trusted because it is local, and the browser enforces that for us: a page
+served over https cannot open a `ws://` to localhost at all. Behind that, the hub mints
+a token per run, hands it out only over its own origin (no CORS headers, so no other
+page can read it), and requires it on the WebSocket — so another page on the same
+machine cannot drive the boards.
+
 **`spangap dev [<addr>]`** runs the project's Quasar web SPA (`web-interface/`) hot from
 Vite, reachable from outside the container at **`http://localhost:9000/`**, which it opens
 in the OS browser. The address argument (bare, or `-h <addr>`) sets the device this run
 drives, and persists it like `spangap cli`. It streams the dev console until you quit it.
 
 **The run owns every relay it needs, so nothing else has to be running.** That matters
-because the alternative — the `spangap monitor` bridge — holds the serial port, and the
-browser flasher this same dev server serves at `/flashmon` wants that port itself. On
-startup it brings up one `dev-forward` process holding:
+because the alternative — the `spangap monitor` bridge — holds the serial port, which the
+browser flasher wants for itself. On startup it brings up one `dev-forward` process
+holding:
 
 - the **dev server's own** relay: the container publishes its dev port to an ephemeral host
   port (a fixed publish would hold that port for the container's whole life and wedge every
@@ -290,11 +386,9 @@ container from before the range is recreated to get it.
 On a native-Linux host the container reaches the LAN directly, so the proxy dials the device
 address itself and the relays are just unused.
 
-It also mounts two workspace directories beside the app, at the paths a deployment serves
-them at: **`/flashmon`** (`flashmon/flashmon/`, the browser flasher) and **`/builds`** (the
-image catalogues). Each `web-interface`'s `quasar.config.ts` asks for them by adding
-`spangap-browser/vite/workspace-mounts` to `build.vitePlugins`; Vite has one static root,
-so extra trees can only be middleware.
+It serves the app and nothing else. **flashmon and the image catalogues come from
+`spangap flashmon`** (above) — one address for the flasher, so the serial-port grants and the
+node roster the browser keys to that origin stay put.
 
 **Browser-side edits need no build.** The dev server runs Vite in the buildable's own
 `web-interface/`, and every straddle browser half is an npm-linked `file:` dep served as

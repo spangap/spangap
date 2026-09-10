@@ -57,7 +57,7 @@ tree (see ["What `spangap build` does"](#what-spangap-build-does-under-the-hood)
   dirs, where they stay pinned. **Look here.**
 
 The workspace is a **host bind mount**, so anything you write under a straddle's `build/`
-is read directly by the host flasher, and the container path (`<workspace>/<repo>`) is
+is read directly by the host's flashing path, and the container path (`<workspace>/<repo>`) is
 what gets baked into `build/CMakeCache.txt`'s `CMAKE_HOME_DIRECTORY` — stable and
 host-independent. **Never bake a host-absolute path into the build.**
 
@@ -307,10 +307,10 @@ console and run commands on it, with no host-side monitor and no serial port of 
 own.
 
 It is also the whole of getting started, which is why it does two things beyond
-serving: it **clones the flasher** if the workspace hasn't got it, and it **seeds
+serving: it **clones flashmon** if the workspace hasn't got it, and it **seeds
 `builds/local/builds.yaml`** if there is no such catalogue — from the URL the project
 straddle's `catalogue_seed:` names (its own published catalogue, so the entries are
-the boards it really builds for), falling back to the flasher's shipped template.
+the boards it really builds for), falling back to flashmon's shipped template.
 Seeded once and never reconciled: from then on the file is the user's.
 
 `local` is what a locally served page offers, and it **stays** on it — a board flashed
@@ -365,7 +365,7 @@ drives, and persists it like `spangap cli`. It streams the dev console until you
 
 **The run owns every relay it needs, so nothing else has to be running.** That matters
 because the alternative — the `spangap monitor` bridge — holds the serial port, which the
-browser flasher wants for itself. On startup it brings up one `dev-forward` process
+flashmon wants for itself. On startup it brings up one `dev-forward` process
 holding:
 
 - the **dev server's own** relay: the container publishes its dev port to an ephemeral host
@@ -387,7 +387,7 @@ On a native-Linux host the container reaches the LAN directly, so the proxy dial
 address itself and the relays are just unused.
 
 It serves the app and nothing else. **flashmon and the image catalogues come from
-`spangap flashmon`** (above) — one address for the flasher, so the serial-port grants and the
+`spangap flashmon`** (above) — one address for flashmon, so the serial-port grants and the
 node roster the browser keys to that origin stay put.
 
 **Browser-side edits need no build.** The dev server runs Vite in the buildable's own
@@ -407,7 +407,7 @@ needed only when the firmware half has to change too.
 **`spangap make-builds`** builds an image catalogue: run it in a `builds/<catalogue>/`
 directory holding a `builds.yaml` (or in the tree above them, for all of them). Every image
 of one run shares one datetime stamp, and it rewrites the `index.html` + `timestamp` that
-the flasher reads. Each image is a `spangap build`, run from in here like any other. Each is
+flashmon reads. Each image is a `spangap build`, run from in here like any other. Each is
 built with `SPANGAP_BUILD_DATETIME` (that stamp), `SPANGAP_BUILD_DIST` (the entry's `name:`) and
 `SPANGAP_BUILD_CATALOGUE` (the directory's own name) in its environment, so the running
 firmware reports back which catalogue published it and when — `sys.build.catalogue` /
@@ -443,14 +443,14 @@ publishes that board and disturbs nothing else. (Naming entries only works insid
 catalogue; a run over the tree above them refuses it.)
 
 A built entry's **older images are deleted** once the new one is in — same entry, same
-catalogue, earlier stamp. One entry in one catalogue means one image: the flasher only ever
+catalogue, earlier stamp. One entry in one catalogue means one image: flashmon only ever
 offers the newest per name, so the rest are download weight in the deployment and noise in
 the listing. Only entries a run actually built are pruned, and only strictly older stamps,
 so a subset run still leaves every other board alone. A build that fails prunes nothing —
 the image that is still the current one stays where it is.
 
 A catalogue directory holding a **`.unlisted`** file still builds and is still reachable by
-naming it on the flasher page (`?build=<name>`, or the settings panel's Build selector) — it
+naming it on the flashmon page (`?build=<name>`, or the settings panel's Build selector) — it
 is simply left out of the parent `index.html`.
 Catalogues differing only in flavour say so with `--kconfig` in their entries, so they build
 from the same tree with no straddle per combination.
@@ -552,7 +552,7 @@ enumerate the workspace.
 6. on a successful plain build, write **`build/flasher.zip`** — `<project>.esptool` (an
    esptool argfile: the write_flash flags, then `<offset> <image>` per line) plus every
    image it names (bootloader, partition table, app, data). A self-contained,
-   host-independent bundle any flasher consumes: the web flasher (`flashmon`), or
+   host-independent bundle any flashing tool consumes: `flashmon`, esptool by hand, or
    `spangap make-builds` collecting it into a catalogue. The argfile is generated from
    `flasher_args.json` rather than copied from IDF's own `flash_project_args`, because the
    in-place finalize patches the `fixed` offset into the former only.

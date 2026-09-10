@@ -3624,7 +3624,7 @@ def write_flasher_zip(build_dir: Path) -> None:
     flags, as an esptool argfile) and every image it names, each stored at its
     build-relative path (e.g. bootloader/bootloader.bin,
     partition_table/partition-table.bin, the app .bin, ota_data_initial.bin).
-    Any flasher — host esptool or the web flasher — has all it needs from
+    Any flashing tool — flashmon, `spangap flash`, or esptool by hand — has all it needs from
     these: read the argfile for the layout, flash the bins at their offsets.
     Best-effort: a build with no flashable images (flash_files empty) writes no
     zip.
@@ -3646,7 +3646,7 @@ def write_flasher_zip(build_dir: Path) -> None:
         else:
             missing.append(fname)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        # Only the images that made it into the zip go in the argfile: a flasher
+        # Only the images that made it into the zip go in the argfile: anything
         # working from it must never be sent looking for a file that isn't there.
         z.writestr(f"{project_name(build_dir, d)}.esptool",
                    esptool_argfile(d.get("write_flash_args") or [], present))
@@ -3874,7 +3874,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         "SPANGAP_BUILD_DIST": os.environ.get("SPANGAP_BUILD_DIST", ""),
         # Which catalogue published it (`stable`, `dev`, …) — the channel, one
         # level above the entry. Stamps from two catalogues are unrelated series,
-        # so a flasher has to know this before comparing them at all.
+        # so flashmon has to know this before comparing them at all.
         "SPANGAP_BUILD_CATALOGUE": os.environ.get("SPANGAP_BUILD_CATALOGUE", ""),
     }
     # Provenance manifest → device webroot as /BUILD.md. Written before the IDF
@@ -4104,7 +4104,7 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# `spangap flashmon` — serve the flasher, and take its tabs' consoles.
+# `spangap flashmon` — serve flashmon, and take its tabs' consoles.
 #
 # The server is called the hub throughout this section: the tabs attach to it and
 # it routes between them and the verbs. The verb is named for what the user is
@@ -4739,7 +4739,7 @@ def cmd_flashmon(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, _terminate)
     FLASHMON_FILE.write_text(json.dumps(
         {"port": args.port, "token": token, "pid": os.getpid()}) + "\n")
-    print(f"spangap flashmon: serving the flasher + the catalogues on :{args.port} "
+    print(f"spangap flashmon: serving flashmon + the catalogues on :{args.port} "
           f"(the host `spangap flashmon` prints the URL to browse to).\n"
           f"                  `spangap log -f` / `spangap cli` reach every node "
           f"a tab attaches.", file=sys.stderr)
@@ -5620,7 +5620,7 @@ def cmd_web(args: argparse.Namespace) -> int:
 # flasher.zip that build leaves behind is copied in beside the config as
 # <slug>_<name>_<datetime>.zip, and every image built in one run shares that one
 # datetime. That entry's earlier images in that catalogue are then deleted: one
-# entry in one catalogue means one image, and the flasher only ever offers the
+# entry in one catalogue means one image, and flashmon only ever offers the
 # newest per name, so the older ones are download weight in the deployment and
 # noise in the listing. Only the entries a run actually built are pruned, and
 # only strictly older stamps, so a subset run disturbs nothing else. Alongside
@@ -5661,9 +5661,9 @@ def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str,
     are ignored rather than rejected.
 
     `onboarding:` is the one optional per-entry key that ends up in the listing:
-    `device` says this image sets a fresh node up from its own screen, so a
-    flasher has nothing to ask and should get out of the way once the image is
-    written. Anything else (and the absence of the key) means the flasher asks —
+    `device` says this image sets a fresh node up from its own screen, so
+    flashmon has nothing to ask and should get out of the way once the image is
+    written. Anything else (and the absence of the key) means flashmon asks —
     which is the only safe default, since a build that cannot ask for itself and
     is never asked is a node nobody ever set up.
     """
@@ -5715,7 +5715,7 @@ def _split_image_name(name: str) -> tuple[str, str] | None:
 def _prune_older_images(d: Path, entry: str, keep_stamp: str) -> None:
     """Delete this entry's earlier images from this catalogue, now that a newer
     one is in. One entry in one catalogue means one image: the older ones are the
-    same distribution at a stamp nothing will ever ask for again — the flasher
+    same distribution at a stamp nothing will ever ask for again — flashmon
     offers the newest per name, so they are download weight in the deployment and
     noise in the listing.
 
@@ -5747,10 +5747,10 @@ def _fmt_bytes(n: int) -> str:
 
 def _listing_page(title: str, rows: list[tuple[str, str, str, str]]) -> str:
     """A listing page. Deliberately plain: it is read by a browser and parsed by
-    the flasher, and all a parser wants is the hrefs.
+    flashmon, and all a parser wants is the hrefs.
 
     A row may carry attributes on its anchor (`attrs`) — facts about that image
-    the flasher needs BEFORE it fetches it. They go on the anchor rather than
+    flashmon needs BEFORE it fetches it. They go on the anchor rather than
     into an HTML comment because a comment is only ever near the row it is about,
     while an attribute is part of it: one parser pass reads the href and the
     facts together, and no amount of reordering or reformatting can separate
@@ -5820,7 +5820,7 @@ def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
         # The build bakes it in; the device reports it back as sys.build.dist.
         #
         # The catalogue's own directory name (`stable`, `dev`, …) goes in beside
-        # it: it is the channel the image was published on, which a flasher needs
+        # it: it is the channel the image was published on, which flashmon needs
         # to know before any stamp comparison means anything — the newest image
         # in `stable` is not newer than a `dev` image that happens to sort below
         # it. The device reports it back as sys.build.catalogue.
@@ -6187,7 +6187,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_fm = sub.add_parser(
         "flashmon",
-        help="serve the flasher + the image catalogues on http://localhost and take the browser tabs' consoles as this container's own (see `spangap log`, `spangap cli`)",
+        help="serve flashmon + the image catalogues on http://localhost and take the browser tabs' consoles as this container's own (see `spangap log`, `spangap cli`)",
     )
     p_fm.add_argument(
         "--port", type=int, default=FLASHMON_PORT,

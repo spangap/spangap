@@ -29,7 +29,7 @@
 #                    own, and this device's ports — so nothing else has to be
 #                    running for the page to reach the device. Streams until quit.
 #   flashmon [--stop|--nodes]
-#                    serve the browser flasher out of the container and open it:
+#                    serve flashmon out of the container and open it:
 #                    it serves flashmon and the image catalogues over
 #                    http://localhost, and every tab that connects lends the
 #                    container the console of the node it is holding, so
@@ -399,11 +399,11 @@ DEV_PORT=9000       # `spangap dev` quasar dev server bind port inside the conta
 DEV_PORT_LAST=9009
 # `spangap flashmon` binds this in the container, and the container publishes it
 # to the host (see ensure_container). Fixed rather than allocated out of the dev
-# range because there is one flasher per workspace serving every board, where a
+# range because there is one flashmon per workspace serving every board, where a
 # dev server is one per device — and because the browser has to be sent to it at
 # an address that outlives a container.
 FLASHMON_PORT=${SPANGAP_FLASHMON_PORT:-9010}
-# The flasher's own repo (see ensure_flashmon): the platform's, like the
+# flashmon's own repo (see ensure_flashmon): the platform's, like the
 # build-env itself, and cloned beside the project it flashes.
 FLASHMON_REPO=spangap/flashmon
 # Host-facing dev port: where the browser is sent, fronted onto the container's
@@ -863,7 +863,7 @@ port_busy() {
 }
 
 # ---------------------------------------------------------------------------
-# Flash + monitor inner loop. Absorbs scripts/flasher's daemon mode.
+# Flash + monitor inner loop.
 # ---------------------------------------------------------------------------
 
 kill_monitor() {
@@ -1158,15 +1158,15 @@ monitor_loop() {
             # `spangap flash` polls .spangap-flashack to learn its signal was
             # picked up. It must NOT wait on flashme removal instead: that's
             # deferred by the 3s grace below (so other hosts can latch the same
-            # signal), which races and false-times-out the 5s flasher wait even
+            # signal), which races and false-times-out the 5s flash wait even
             # though the flash is already underway. (Skip on the pending=1
-            # initial-flash path — no flasher is waiting there.)
+            # initial-flash path — nothing is waiting there.)
             [ -f "$flashme" ] && touch "$flashack"
             local rm_pid=""
             if [ -f "$flashme" ]; then
                 # Hand the 3s grace + removal to a detached shell so the flash
                 # starts now instead of waiting it out; the window only lets
-                # other hosts' flashers latch the same signal before it goes.
+                # other hosts latch the same signal before it goes.
                 ( sleep 3; rm -f "$flashme" ) &
                 rm_pid=$!
             fi
@@ -1436,7 +1436,7 @@ monitor)
     else
         port=$(sticky_get "$PORT_FILE" SPANGAP_PORT monitor "serial port")
     fi
-    port_busy "$port" && die "$port is busy — another monitor/flasher owns it"
+    port_busy "$port" && die "$port is busy — another monitor or flash run owns it"
     ensure_venv
     # Wire up panic-backtrace decode: a host `xtensa-esp32-elf-addr2line` shim
     # that forwards to the build-env toolchain. The shim is straddle-agnostic (it
@@ -1467,7 +1467,7 @@ probe)
     else
         port=$(sticky_get "$PORT_FILE" SPANGAP_PORT probe "serial port")
     fi
-    port_busy "$port" && die "$port is busy — another monitor/flasher owns it"
+    port_busy "$port" && die "$port is busy — another monitor or flash run owns it"
     ensure_venv
     if ! out=$("$VENV/bin/esptool.py" -p "$port" flash_id 2>&1); then
         printf '%s\n' "$out" >&2
@@ -1650,11 +1650,11 @@ ensure_daemon() {
 }
 
 # True if the container publishes the browser-facing ports to the host: the
-# whole `spangap dev` range, and the flasher's. The mapping is fixed at `docker
+# whole `spangap dev` range, and flashmon's. The mapping is fixed at `docker
 # run` time, so a container created before one of them existed must be recreated
 # — cheap and lossless, since all state lives in bind mounts. Every port is
 # checked, not just the first: a container that publishes only the bottom of the
-# range could serve one dev run and no flasher.
+# range could serve one dev run and no flashmon.
 container_publishes_dev_port() {
     local p b
     for p in "$DEV_PORT" "$DEV_PORT_LAST" "$FLASHMON_PORT"; do
@@ -1690,8 +1690,8 @@ except OSError:
 " >/dev/null 2>&1
 }
 
-# The flasher's port is FIXED, and this is what keeps it that way. A browser's
-# serial-port grants and the flasher's node roster are both keyed to the page's
+# flashmon's port is FIXED, and this is what keeps it that way. A browser's
+# serial-port grants and flashmon's node roster are both keyed to the page's
 # origin, so a page that moved ports would make every board a stranger again and
 # ask for each one out of the chooser by hand. Landing on some other port is
 # therefore not a graceful degradation, it is the failure — so a container of
@@ -1707,7 +1707,7 @@ free_flashmon_port() {
         [ "$(container_host_port "$name" "$FLASHMON_PORT")" = "$FLASHMON_PORT" ] || continue
         docker exec "$name" spangap flashmon --stop >/dev/null 2>&1 || true
         [ -z "$SPANGAP_QUIET" ] \
-            && log "removing $name — it is holding the flasher's port $FLASHMON_PORT"
+            && log "removing $name — it is holding flashmon's port $FLASHMON_PORT"
         docker rm -f "$name" >/dev/null 2>&1 || true
     done || true
     host_port_free "$FLASHMON_PORT"
@@ -1834,14 +1834,14 @@ ensure_container() {
                     [ -n "$why" ] && why="$why; the dev port uses a fixed host mapping" \
                                   || why="the dev port uses a fixed host mapping ($DEV_PORT)"
                 elif [ "$(container_host_port "$container" "$FLASHMON_PORT")" != "$FLASHMON_PORT" ]; then
-                    # The flasher is on some other host port, so the browser is
+                    # flashmon is on some other host port, so the browser is
                     # being asked for board grants this machine has already given
                     # once. Nothing moves a mapping but a new container, and the
                     # check has to name the port rather than merely see one: an
                     # ephemeral binding is a binding, so a container that landed
                     # off $FLASHMON_PORT would otherwise read as correct forever.
-                    [ -n "$why" ] && why="$why; the flasher is not on $FLASHMON_PORT" \
-                                  || why="the flasher is on a host port other than $FLASHMON_PORT"
+                    [ -n "$why" ] && why="$why; flashmon is not on $FLASHMON_PORT" \
+                                  || why="flashmon is on a host port other than $FLASHMON_PORT"
                 fi
                 if [ -z "$why" ]; then
                     return 0
@@ -1904,12 +1904,12 @@ ensure_container() {
     # basename; Docker orders nested bind mounts by depth, so /home/spangap
     # lands first and $container_ws on top of it regardless of -v order.
     # Publish the browser-facing ports to the host loopback — the `spangap dev`
-    # RANGE and the flasher's single port — so the servers bound inside (each on
+    # RANGE and flashmon's single port — so the servers bound inside (each on
     # 0.0.0.0) are reachable from this machine's browser, which is the one
     # host→container path Docker Desktop gives us without host networking. A
     # range for dev because a run serves one device: two devices at once means
     # two dev servers in this container, each needing its own way out. One port
-    # for the flasher because there is one per workspace and it serves every
+    # for flashmon because there is one per workspace and it serves every
     # board. Loopback-only: both are for this machine's browser, and they reach
     # the device through their own relays (dev) or through the browser itself.
     #
@@ -1937,8 +1937,8 @@ ensure_container() {
         run_user_args=(--user "$remap_uid:$remap_gid")
     fi
 
-    # The flasher is published on $FLASHMON_PORT and on nothing else, unlike the
-    # dev range: a browser's serial-port grants and the flasher's node roster are
+    # flashmon is published on $FLASHMON_PORT and on nothing else, unlike the
+    # dev range: a browser's serial-port grants and flashmon's node roster are
     # both keyed to the page's origin, so a page on another port makes every
     # board a stranger again and asks for each one out of the chooser by hand.
     # A working page at the wrong address is not a lesser success, it is the
@@ -2024,7 +2024,7 @@ pull_dep() {
     return 0
 }
 
-# The flasher comes down with the project, not by hand: `spangap flashmon` serves
+# flashmon comes down with the project, not by hand: `spangap flashmon` serves
 # it and `spangap make-builds` fills the catalogue it reads, so a workspace that
 # can build a project can also flash one. Not a straddle and never staged into a
 # build — a plain checkout beside the others. Non-fatal: a workspace that can't
@@ -2034,19 +2034,19 @@ ensure_flashmon() {
     command -v git >/dev/null 2>&1 || return 0
     log "cloning $FLASHMON_REPO -> $workspace/flashmon"
     git clone --quiet "https://github.com/${FLASHMON_REPO}.git" "$workspace/flashmon" \
-        || log "warning: could not clone $FLASHMON_REPO — the flasher won't be there to serve"
+        || log "warning: could not clone $FLASHMON_REPO — flashmon won't be there to serve"
     return 0
 }
 
 # `builds/local` — the catalogue this workspace builds for itself, and the one a
-# locally served flasher offers. Seeded once, so a fresh checkout has somewhere
+# locally served flashmon offers. Seeded once, so a fresh checkout has somewhere
 # to point `spangap make-builds` at instead of a blank page and an empty
 # directory; after that the file is the user's and is never touched again.
 #
 # The starting content is whatever the project's `catalogue_seed:` names —
 # normally its own published catalogue, so the entries are the boards it really
 # builds for. A project that names none, or a fetch that fails, falls back to the
-# flasher's shipped template, which builds nothing until it is edited but is
+# flashmon's shipped template, which builds nothing until it is edited but is
 # still a valid catalogue. Non-fatal either way: this is a convenience, and a
 # workspace with no network still serves whatever catalogues it already has.
 # True if a flashmon server — ours, not something else that happens to hold the
@@ -2076,7 +2076,7 @@ ensure_local_catalogue() {
             return 0
         fi
         rm -f "$dir/builds.yaml.part"
-        log "warning: could not fetch $seed — seeding builds/local from the flasher's template"
+        log "warning: could not fetch $seed — seeding builds/local from flashmon's template"
         ;;
     ?*)
         if [ -f "$workspace/$seed" ]; then
@@ -2088,7 +2088,7 @@ ensure_local_catalogue() {
     esac
     if [ -f "$workspace/flashmon/builds.yaml.example" ]; then
         cp "$workspace/flashmon/builds.yaml.example" "$dir/builds.yaml"
-        log "seeded builds/local/builds.yaml from the flasher's template — edit it, then \`spangap make-builds\` in that directory"
+        log "seeded builds/local/builds.yaml from flashmon's template — edit it, then \`spangap make-builds\` in that directory"
     fi
     return 0
 }
@@ -2531,7 +2531,7 @@ EOF
     exit "$rc"
     ;;
 flashmon)
-    # The browser flasher, served out of the container — and the consoles of the
+    # flashmon, served out of the container — and the consoles of the
     # tabs that connect to it, lent back to the container.
     #
     # Nothing has to run on the host for it. Docker publishes the server's port
@@ -2539,14 +2539,14 @@ flashmon)
     # verb starts it, reads that mapping back, and gets out of the way — there is
     # no relay to keep alive and nothing to leave running in a terminal.
     #
-    # It is also the whole of getting started: the flasher is cloned if it isn't
+    # It is also the whole of getting started: flashmon is cloned if it isn't
     # there and a `builds/local` catalogue is seeded if there is none, so this
     # one command takes a bare workspace to a page that can flash a board.
     shift
     ensure_daemon
     # --stop and --nodes are questions about what is already running, so they are
     # answered before any of the setting-up below. Neither wants a container
-    # built for it, a flasher cloned, or a catalogue seeded, and --stop least of
+    # built for it, flashmon cloned, or a catalogue seeded, and --stop least of
     # all: the run that is being asked to tear things down is the last one that
     # should be standing them up.
     case "${1:-}" in
@@ -2567,7 +2567,7 @@ flashmon)
             docker exec -e SPANGAP_WORKSPACE="$container_ws" "$c" \
                 /usr/bin/python3 "$container_ws/spangap/build-system/spangap-inside" \
                 flashmon --stop >/dev/null 2>&1 \
-                && log "stopped the flasher in $c"
+                && log "stopped flashmon in $c"
         done || true
         reap_retired
         exit 0
@@ -2578,7 +2578,7 @@ flashmon)
             --workdir "$container_ws" "$container" spangap flashmon --nodes
         ;;
     esac
-    # A flasher already answering on the canonical port is left exactly as it is,
+    # A flashmon already answering on the canonical port is left exactly as it is,
     # whichever container is running it. It is usually one this workspace started
     # in a container that has since been replaced but not yet removed — the
     # replacement could only serve a different port, and a different port is a
@@ -2594,7 +2594,7 @@ flashmon)
         open_url "$url"
         exit 0
     fi
-    # ensure_container is what guarantees the flasher's port: a container that is
+    # ensure_container is what guarantees flashmon's port: a container that is
     # not publishing $FLASHMON_PORT is recreated here rather than tolerated, so
     # by the time the server starts below there is exactly one address it can be
     # reached at.
@@ -2623,7 +2623,7 @@ flashmon)
     flashmon_port=$(docker port "$container" "$FLASHMON_PORT/tcp" 2>/dev/null \
                       | awk -F: 'NR==1 {print $NF; exit}')
     [ "$flashmon_port" = "$FLASHMON_PORT" ] \
-        || die "the container publishes the flasher on ${flashmon_port:-nothing}, not $FLASHMON_PORT"
+        || die "the container publishes flashmon on ${flashmon_port:-nothing}, not $FLASHMON_PORT"
     url="http://localhost:$FLASHMON_PORT/"
     log "flashmon serving $url"
     log "in the container: \`spangap log -f\` follows every attached node, \`spangap cli -n <node> <cmd>\` runs a command on one"
@@ -2638,7 +2638,7 @@ dev)
     # This run owns every relay it needs, so nothing else has to be running: the
     # device's ports are fronted on the host by our own dev-forward, where the
     # container's proxy reaches them. That matters because the alternative — the
-    # `spangap monitor` bridge — holds the serial port, and the browser flasher
+    # `spangap monitor` bridge — holds the serial port, and flashmon
     # served at /flashmon wants that port itself.
     shift
     # The device address, as `-h <addr>` or as a bare first argument. Both persist

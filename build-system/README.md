@@ -607,6 +607,29 @@ A straddle contributes boot code two ways:
 (This supersedes the long manual `app_main()` init sequences still shown in some sibling
 READMEs — see the stale-doc caveats below.)
 
+### The app order (the `app_order:` block)
+
+One list, both surfaces: `app_order: [LXMF, Nomad, Maps]` in the **buildable's**
+straddle.yaml is the order the device offers its apps in, on the panel's launcher grid
+*and* in the browser's dock. `spangap-inside` lowers it twice — to
+`CONFIG_LCD_LAUNCHER_ORDER` in the sdkconfig fragments (only when `spangap-lcd` is
+staged; the symbol is its) and to a `registerAppOrder()` call in the generated
+`straddles.gen.ts` — so neither surface carries an order of its own to drift.
+
+It layers by dependency order like `kconfig:`, but **whole**: the highest straddle that
+states one wins its entire list, because half an order is not an order. Which apps ship
+together, and which of them the operator reaches for first, is a property of the image,
+so this is the buildable's to say and no app declares a position for itself.
+
+An entry names an app by any name that surface knows it by, matched case-insensitively:
+on the panel its `LcdApp::Config` name or icon basename, in the browser its `registerApp`
+`id`, `label` or `icon`. That looseness is what lets ONE list span both surfaces — an
+entry naming an app this surface hasn't got is ignored, so the panel-only and
+browser-only apps sit in the same list — and what lets one entry reach an app the two
+surfaces label differently (the icon name is what they share). Anything unnamed falls in
+after the named ones, in each surface's own default order; on the panel the operator's
+own drag-to-reorder (`s.lcd.launcher_order`) still outranks the lot.
+
 ### Declarative settings (the `settings:` block)
 
 The `settings:` blocks across a build describe **one tree**, and `spangap-inside` lowers

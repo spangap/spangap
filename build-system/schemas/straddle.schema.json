@@ -51,6 +51,11 @@
       "type": "array",
       "items": { "type": "integer", "minimum": 1, "maximum": 65535 }
     },
+    "app_order": {
+      "description": "The order the device's apps are offered in, as one list of app names — the panel's launcher grid and the browser's Dock read the same list, so an image presents its apps in one order on both surfaces. Written by the straddle being BUILT: which apps ship together, and which of them the operator reaches for first, is a property of the image rather than of any one app. Layered by dependency order like kconfig: — the highest straddle that states one wins, whole (lists are not merged). An entry names an app by any name that surface knows it by, matched case-insensitively: on the panel its LcdApp::Config name or icon basename, in the browser its registerApp id, label or icon — so one token can cover an app the two surfaces label differently, and a name for an app the image doesn't carry is ignored (which is how a list can span both surfaces' apps at once). Desugars to CONFIG_LCD_LAUNCHER_ORDER for the firmware (only when spangap-lcd is staged — the symbol is its) and to a registerAppOrder() call in the generated straddles.gen.ts for the browser. Anything not named falls in after the named ones, in each surface's own default order.",
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[^,\"]+$" }
+    },
     "catalogue_seed": {
       "description": "Where `spangap flashmon` fetches the starting content of this workspace's `builds/local/builds.yaml` from, on the first run that finds none: a URL (or a workspace-relative path) to a published builds.yaml, normally this project's own deployed catalogue. It is a starting point and nothing more — the file is copied once and is the user's from then on, never re-fetched or reconciled. Only read from the BUILT straddle's own straddle.yaml, and only as a one-line scalar, since the host tooling reads it with a plain sed.",
       "type": "string"

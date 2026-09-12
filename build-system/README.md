@@ -106,9 +106,10 @@ device loop is its own section below
 
 **Host-only verbs you can't run from this container:** `monitor`, `probe`, real
 `flash`, `init`, `reset-workspace`, `get-deps` (the cloning side), `push-all`
-(create + push every straddle repo to GitHub — runs `gh`/`git` with the host's
-credentials, never in the container), `detect-build`
-(build flashmon's `esp-idf/` peripheral
+(create + push every straddle repo to GitHub) and `pull-all` (fast-forward every
+straddle repo from GitHub, leaving diverged or locally-modified ones alone) —
+both run `gh`/`git` with the host's credentials, never in the container —
+`detect-build` (build flashmon's `esp-idf/` peripheral
 detector in the container), and `docker <cmd>` — those
 live in **`spangap-outside`** on the host and need the serial port / docker / the
 container lifecycle. There is **no `docker` and no `esptool.py`** in here by design

@@ -1294,16 +1294,16 @@ push-all)
                     "  --force rewrites the remote branch (needed after a history rewrite)." \
                     "  Requires an authenticated \`gh\`; new repos are created PUBLIC."
                 exit 0 ;;
-            -*) die "push-all: unknown option: $1 (try --help)" ;;
+            -*) die "unknown option: $1 (try --help)" ;;
             *)  dir=$1 ;;
         esac
         shift
     done
 
-    [ -d "$dir" ] || die "push-all: not a directory: $dir"
-    command -v gh  >/dev/null 2>&1 || die "push-all: gh not found (install the GitHub CLI)"
-    command -v git >/dev/null 2>&1 || die "push-all: git not found"
-    gh auth status >/dev/null 2>&1 || die "push-all: gh is not authenticated (run: gh auth login)"
+    [ -d "$dir" ] || die "not a directory: $dir"
+    command -v gh  >/dev/null 2>&1 || die "gh not found (install the GitHub CLI)"
+    command -v git >/dev/null 2>&1 || die "git not found"
+    gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run: gh auth login)"
 
     # git@github.com:owner/repo.git | https://github.com/owner/repo(.git) -> owner/repo
     slug_from_url() { printf '%s' "$1" | sed -E 's#.*github\.com[:/]##; s#\.git$##; s#/$##'; }
@@ -1351,6 +1351,93 @@ push-all)
             else
                 printf '%-24s push FAILED (non-fast-forward? re-run with --force)\n' "$name"
             fi
+        fi
+    done
+    exit 0
+    ;;
+pull-all)
+    # Host-only counterpart of push-all. Bring every git repo directly under DIR
+    # (default: the workspace root) up to its origin. Host-only for the same
+    # reason push-all is: `git` reaches github with your credentials here, never
+    # in the build container.
+    #
+    # Fast-forward only, and never over anything you'd have to think about: a
+    # branch that has diverged, a worktree with local changes, a detached HEAD
+    # and a repo with no origin are each reported and left alone. So this verb
+    # only ever advances a branch that was strictly behind — the messy cases stay
+    # yours to resolve, with the line saying which repo and why.
+    shift
+    dir=$workspace
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -h|--help)
+                printf '%s\n' \
+                    "usage: spangap pull-all [DIR]" \
+                    "  Fast-forward every git repo directly under DIR (default: the workspace" \
+                    "  root) to its origin. Repos that have diverged, carry local changes, sit" \
+                    "  on a detached HEAD or have no origin are reported and left untouched."
+                exit 0 ;;
+            -*) die "unknown option: $1 (try --help)" ;;
+            *)  dir=$1 ;;
+        esac
+        shift
+    done
+
+    [ -d "$dir" ] || die "not a directory: $dir"
+    command -v git >/dev/null 2>&1 || die "git not found"
+
+    for repo in "$dir"/*/; do
+        [ -d "$repo.git" ] || continue                       # skip non-git dirs
+        name=$(basename "$repo")
+
+        git -C "$repo" remote get-url origin >/dev/null 2>&1 || {
+            printf '%-24s no origin remote — skipped\n' "$name"; continue; }
+        branch=$(git -C "$repo" symbolic-ref --short -q HEAD) || {
+            printf '%-24s detached HEAD — skipped\n' "$name"; continue; }
+
+        # git says the same thing several ways when a fetch fails; the first line
+        # is the one that names the cause, so keep the report one line per repo.
+        if ! out=$(git -C "$repo" fetch --quiet --prune origin 2>&1); then
+            printf '%-24s fetch FAILED: %s\n' "$name" "$(printf '%s\n' "$out" | grep -m1 . || true)"
+            continue
+        fi
+
+        # Prefer the branch's own upstream; a branch that tracks nothing still
+        # has somewhere to go if origin carries the same name (the state a clone
+        # is in before its first `push -u`).
+        upstream=$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) || upstream=
+        if [ -z "$upstream" ]; then
+            if git -C "$repo" rev-parse --verify -q "refs/remotes/origin/$branch" >/dev/null 2>&1; then
+                upstream="origin/$branch"
+            else
+                printf '%-24s no upstream — skipped\n' "$name"; continue
+            fi
+        fi
+
+        behind=$(git -C "$repo" rev-list --count "HEAD..$upstream" 2>/dev/null || echo 0)
+        ahead=$(git -C "$repo" rev-list --count "$upstream..HEAD" 2>/dev/null || echo 0)
+
+        if [ "$behind" -eq 0 ]; then
+            if [ "$ahead" -gt 0 ]; then
+                printf '%-24s up to date (%s to push)\n' "$name" "$ahead"
+            else
+                printf '%-24s up to date\n' "$name"
+            fi
+            continue
+        fi
+        if [ "$ahead" -gt 0 ]; then
+            printf '%-24s diverged (%s ahead, %s behind) — not pulled\n' "$name" "$ahead" "$behind"
+            continue
+        fi
+        if [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
+            printf '%-24s %s behind, local changes — not pulled\n' "$name" "$behind"
+            continue
+        fi
+
+        if git -C "$repo" merge --ff-only --quiet "$upstream" >/dev/null 2>&1; then
+            printf '%-24s fast-forwarded %s commit(s) from %s\n' "$name" "$behind" "$upstream"
+        else
+            printf '%-24s fast-forward FAILED\n' "$name"
         fi
     done
     exit 0

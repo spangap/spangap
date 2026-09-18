@@ -84,6 +84,15 @@
         "idf"
       ]
     },
+    "target": {
+      "description": "The ESP-IDF target this board straddle builds for. Read from the staged straddle whose repo name starts with 'hw-' and exported as IDF_TARGET around the build. 'linux' builds the firmware as a host process instead of a chip image.",
+      "type": "string",
+      "enum": [
+        "esp32s3",
+        "linux"
+      ],
+      "default": "esp32s3"
+    },
     "requires": {
       "description": "Other straddles this one HARD-depends on — every build that pulls in this straddle must also pull in these. Each entry is '<org>/<repo>' optionally followed by '@<ref>' (tag/branch/SHA). A missing requires: target is a build error.",
       "type": "array",

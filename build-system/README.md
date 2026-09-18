@@ -564,6 +564,14 @@ enumerate the workspace.
    version, and the file carries no comments (esptool `shlex.split`s each line and does not
    strip `#`).
 
+**The target comes from the board.** A board straddle's `target:` (default
+`esp32s3`) is exported as `IDF_TARGET` around the build, so no `sdkconfig.defaults`
+may name one — IDF would write it into `sdkconfig` and then fail its own mismatch
+check. `target: linux` builds the firmware as a host process instead of a chip
+image: step 6 above does not run, because there is nothing to flash, and the
+output is `build/<project>.elf`. That target exists for the simulated testbed —
+see [`hw-linux`](../../hw-linux/README.md) and `reticulous/sim/`.
+
 Consumer CMake idiom: `include(${CMAKE_CURRENT_LIST_DIR}/spangap_requires.cmake)` then
 `REQUIRES ${SPANGAP_REQUIRES} …`. The buildable's `main/CMakeLists.txt` reads
 `${CMAKE_CURRENT_LIST_DIR}/../staging/main_requires.cmake` — **`CMAKE_CURRENT_LIST_DIR`,

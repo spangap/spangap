@@ -403,6 +403,13 @@ DEV_PORT_LAST=9009
 # dev server is one per device — and because the browser has to be sent to it at
 # an address that outlives a container.
 FLASHMON_PORT=${SPANGAP_FLASHMON_PORT:-9010}
+# The simulated testbed's hostname proxy (reticulous/sim/proxy.py), which fronts
+# every simulated station's web UI on one port and routes by `Host:`. Fixed and
+# published like flashmon's rather than taken from the dev range, for the same
+# reason: a browser is sent there and the address has to outlive a container.
+# Out of the range as well as beside it, so a testbed never costs a `spangap
+# dev` a slot.
+SIM_PORT=${SPANGAP_SIM_PORT:-9011}
 # flashmon's own repo (see ensure_flashmon): the platform's, like the
 # build-env itself, and cloned beside the project it flashes.
 FLASHMON_REPO=spangap/flashmon
@@ -1737,14 +1744,15 @@ ensure_daemon() {
 }
 
 # True if the container publishes the browser-facing ports to the host: the
-# whole `spangap dev` range, and flashmon's. The mapping is fixed at `docker
-# run` time, so a container created before one of them existed must be recreated
-# — cheap and lossless, since all state lives in bind mounts. Every port is
-# checked, not just the first: a container that publishes only the bottom of the
-# range could serve one dev run and no flashmon.
+# whole `spangap dev` range, flashmon's, and the simulated testbed's. The
+# mapping is fixed at `docker run` time, so a container created before one of
+# them existed must be recreated — cheap and lossless, since all state lives in
+# bind mounts. Every port is checked, not just the first: a container that
+# publishes only the bottom of the range could serve one dev run and no
+# flashmon.
 container_publishes_dev_port() {
     local p b
-    for p in "$DEV_PORT" "$DEV_PORT_LAST" "$FLASHMON_PORT"; do
+    for p in "$DEV_PORT" "$DEV_PORT_LAST" "$FLASHMON_PORT" "$SIM_PORT"; do
         b=$(docker inspect --format \
             '{{ index .HostConfig.PortBindings "'"$p"'/tcp" }}' \
             "$container" 2>/dev/null) || b=""
@@ -1913,7 +1921,7 @@ ensure_container() {
                 local why=""
                 if ! container_publishes_dev_port; then
                     [ -n "$why" ] && why="$why; the browser-facing ports are unpublished" \
-                                  || why="the browser-facing ports ($DEV_PORT-$DEV_PORT_LAST, $FLASHMON_PORT) are unpublished"
+                                  || why="the browser-facing ports ($DEV_PORT-$DEV_PORT_LAST, $FLASHMON_PORT, $SIM_PORT) are unpublished"
                 elif [ "$(container_host_port "$container" "$DEV_PORT")" = "$DEV_PORT" ]; then
                     # Legacy container pinned the host side to $DEV_PORT, which
                     # blocks every other workspace. Recreate it onto an ephemeral
@@ -2042,6 +2050,7 @@ ensure_container() {
         ${run_user_args[@]+"${run_user_args[@]}"} \
         -p "127.0.0.1::$DEV_PORT-$DEV_PORT_LAST" \
         -p "127.0.0.1:$FLASHMON_PORT:$FLASHMON_PORT" \
+        -p "127.0.0.1:$SIM_PORT:$SIM_PORT" \
         -v "$spangap_home:/home/spangap" \
         -v "$workspace:$container_ws" \
         --workdir "$container_ws" \

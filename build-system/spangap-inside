@@ -242,6 +242,10 @@ class Manifest:
         spangapRegisterServices()."""
         return list(self.data.get("services", []))
     @property
+    def target(self) -> str:
+        """The IDF target a board straddle builds for (schema `target:`)."""
+        return str(self.data.get("target", "esp32s3"))
+    @property
     def kconfig(self) -> list[str]:
         return list(self.data.get("kconfig", []))
     @property
@@ -3156,8 +3160,12 @@ def write_build_manifest(proj: Manifest, deps: list[Manifest], invocation: str) 
         print(f"spangap: could not write build manifest ({e})", file=sys.stderr)
 
 
-def run_build_idf(args: list[str], cwd: Path, quiet: bool, env: dict[str, str] | None = None) -> int:
+def run_build_idf(args: list[str], cwd: Path, quiet: bool, env: dict[str, str] | None = None,
+                  preview: bool = False) -> int:
     """Run `idf.py <args>` for a build, streaming output through the filter.
+
+    `preview` prepends `--preview`, which idf.py requires for a target outside
+    its supported set (the linux host target).
 
     quiet=True keeps only real diagnostics (+ a few lines of trailing context,
     with `[...]` between non-adjacent blocks); quiet=False is pass-through.
@@ -3166,7 +3174,7 @@ def run_build_idf(args: list[str], cwd: Path, quiet: bool, env: dict[str, str] |
     so rather than print a half-right one we print a bare completion line and let
     the user flash however they flash.
     """
-    cmd = ["idf.py", *args]
+    cmd = ["idf.py", *(["--preview"] if preview else []), *args]
     if not quiet:
         print(f"+ {' '.join(cmd)}  (in {cwd})", file=sys.stderr)
     proc = subprocess.Popen(
@@ -3877,9 +3885,21 @@ def cmd_build(args: argparse.Namespace) -> int:
         dropped_out=dropped,
     )
 
+    # The IDF target is a property of the board: the one staged straddle whose
+    # repo name starts with `hw-` names it, and every other straddle inherits it.
+    # A build with no board straddle is a chip build for the default target.
+    idf_target = "esp32s3"
+    for m in deps + [proj]:
+        if m.repo.startswith("hw-"):
+            idf_target = m.target
+            break
+    host_build = idf_target == "linux"
+
     # Flash size must be set explicitly — IDF's silent 2MB default would mismatch
     # the spangap-generated partition table (8MB fallback). Force the user to pick.
-    if not flash_size_configured(proj, deps, flash_mb):
+    # The host target has no flash chip: `esp_partition` maps a file sized from
+    # the built table, so the size is a Kconfig value like any other.
+    if not host_build and not flash_size_configured(proj, deps, flash_mb):
         die(
             "flash size not configured. ESP-IDF would silently fall back to "
             "2MB, which won't match the generated partition table.\n"
@@ -3889,6 +3909,21 @@ def cmd_build(args: argparse.Namespace) -> int:
             "       in a board straddle's `kconfig:` (the right home for a "
             "hardware property)."
         )
+
+    # An sdkconfig carries the target it was generated for, and idf.py refuses
+    # to build when that disagrees with IDF_TARGET — before CMake, so
+    # bootstrap.cmake's own reseed never gets the chance. A target switch
+    # therefore drops the file; every value in it comes from the defaults
+    # layers anyway, which is what regenerates it.
+    sdkconfig = proj.firmware_dir / "sdkconfig"
+    if sdkconfig.exists():
+        for ln in sdkconfig.read_text().splitlines():
+            if ln.startswith("CONFIG_IDF_TARGET="):
+                if ln.strip() != f'CONFIG_IDF_TARGET="{idf_target}"':
+                    print(f"spangap: sdkconfig was generated for {ln.split('=', 1)[1]}"
+                          f" — regenerating for {idf_target}", file=sys.stderr)
+                    sdkconfig.unlink()
+                break
 
     quiet = not args.verbose
     if not quiet:
@@ -3911,6 +3946,8 @@ def cmd_build(args: argparse.Namespace) -> int:
     # write-build-info.py (run by CMake during this build) reads these and
     # emits app_build_{straddle,version,args}, which spangapInit() logs on boot.
     build_env = {
+        # The board's target, which wins over every guess IDF would make.
+        "IDF_TARGET": idf_target,
         "SPANGAP_BUILD_STRADDLE": proj.name,
         "SPANGAP_BUILD_VERSION": proj.version,
         "SPANGAP_BUILD_ARGS": getattr(args, "spangap_invocation", "") or "spangap build",
@@ -3932,7 +3969,8 @@ def cmd_build(args: argparse.Namespace) -> int:
     # (spangap_create_factory_image guards on its existence).
     write_build_manifest(proj, deps, build_env["SPANGAP_BUILD_ARGS"])
     rc = run_build_idf(
-        idf_args or ["build"], cwd=proj.firmware_dir, quiet=quiet, env=build_env
+        idf_args or ["build"], cwd=proj.firmware_dir, quiet=quiet, env=build_env,
+        preview=host_build,
     )
     # On a successful plain build, shrink-wrap `fixed` to the measured data size.
     # Configure sized `fixed` generously (a safe upper bound, so the littlefs pack
@@ -3944,7 +3982,10 @@ def cmd_build(args: argparse.Namespace) -> int:
     # partitions.csv — in-build state, not a cross-run cache. Finalize regenerates
     # the table + fixed image + flash offset in place (no rebuild); on failure it
     # falls back to a rebuild so a broken fixup can't ship a bad image.
-    if rc == 0 and (not idf_args or idf_args == ["build"]):
+    #
+    # The host target produces an ELF the launcher runs, not an image anything
+    # flashes: there is no app image to measure and no flasher bundle to write.
+    if rc == 0 and not host_build and (not idf_args or idf_args == ["build"]):
         build_dir = proj.firmware_dir / "build"
         app_b, fixed_b = measure_build_sizes(build_dir)
         if fixed_b and align_up(fixed_b, 0x1000) != _fixed_size_in(proj.firmware_dir / "partitions.csv"):

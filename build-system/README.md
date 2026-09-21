@@ -106,9 +106,10 @@ device loop is its own section below
 
 **Host-only verbs you can't run from this container:** `monitor`, `probe`, real
 `flash`, `init`, `reset-workspace`, `get-deps` (the cloning side), `push-all`
-(create + push every straddle repo to GitHub) and `pull-all` (fast-forward every
-straddle repo from GitHub, leaving diverged or locally-modified ones alone) —
-both run `gh`/`git` with the host's credentials, never in the container —
+(create + push every straddle repo to GitHub), `pull-all` (fast-forward every
+straddle repo from GitHub, leaving diverged or locally-modified ones alone) and
+`publish-builds` (mirror a built catalogue onto a GitHub release) — all three
+run `gh`/`git` with the host's credentials, never in the container —
 `detect-build` (build flashmon's `esp-idf/` peripheral
 detector in the container), and `docker <cmd>` — those
 live in **`spangap-outside`** on the host and need the serial port / docker / the
@@ -291,8 +292,15 @@ board back into a stranger the user has to pick out of the chooser by hand. Ther
 no fallback port, because a working page at an address the browser has never met is
 the very thing being avoided: a container not publishing 9010 is recreated rather than
 tolerated, a container of this workspace squatting on 9010 is removed to get it back
-(sessions in it and all), and anything else holding it is a hard error naming the
-`lsof` that finds it. Running it again when something
+(sessions in it and all), and anything else holding it is a hard error naming what
+holds it.
+
+All of that is **this verb's** insistence, not the container's. Every other verb gets
+a container whether 9010 is free or not — made without that mapping, with a line
+saying so — because being unable to serve a page nobody asked for is not a reason to
+refuse to build, to open a shell, or to start the testbed. It used to be a reason, and
+the result was `spangap sim` dying on a port it never touches. `spangap flashmon` is
+then what reclaims the mapping, by recreating the container the way it always did. Running it again when something
 is already serving that port opens it rather than starting a second one, for the same
 reason — including when the server is in a container this workspace has replaced but
 not yet removed, which is the usual way that happens. That case costs something: the
@@ -455,6 +463,33 @@ naming it on the flashmon page (`?build=<name>`, or the settings panel's Build s
 is simply left out of the parent `index.html`.
 Catalogues differing only in flavour say so with `--kconfig` in their entries, so they build
 from the same tree with no straddle per combination.
+
+**`spangap publish-builds [<catalogue>]`** — host-only, since it runs `gh` with the host's
+credentials — publishes a built catalogue as a **GitHub release** of the repo the
+catalogue's straddle comes from (its `origin`, or `-R owner/repo`). The tag is a rolling
+label per catalogue, `catalogue-<name>`: one release per catalogue, re-used every run, so an
+image keeps one URL and a consumer has one place to look.
+
+**The release is the catalogue directory.** Every file in it goes up as an asset under its
+own name — the zips, `index.html`, `timestamp`, `builds.yaml`, an `.unlisted` marker — so
+whoever consumes it copies the assets into `builds/<name>/` and has the directory back,
+without knowing which files a catalogue is made of. An asset the directory no longer holds
+is deleted (`--keep-old` leaves it). The build stamp rides in the release title, and every
+catalogue but `stable` is a prerelease.
+
+**A release is the transport, not the serving.** GitHub sends no
+`access-control-allow-origin` on a release asset — not on github.com's redirect, not on the
+signed URL behind it — so a browser cannot fetch one cross-origin and a flasher page can
+never read images off a release directly. Whoever serves the page copies them in at deploy
+time and serves them from its own origin, which is what flashmon assumes: it reaches its
+catalogue at the relative `../builds/<name>/`. A GitHub Pages site does this in its deploy
+workflow, downloading each catalogue's release into `builds/<name>/` beside the page.
+
+**`--notify <owner/repo>`** fires a `catalogue-published` `repository_dispatch` at that
+consumer once every asset is up, with the catalogue name and stamp in the payload, so the
+site redeploys with the new images and nothing has to poll. It needs `gh` auth with write
+access to that repo, and a failed upload stops the run before it notifies — a half-uploaded
+catalogue is not one to publish.
 
 **Device CLI commands are silent on success** (`set` / `unset` / `save` print nothing when
 they work) — no output means it worked, not that it hung.

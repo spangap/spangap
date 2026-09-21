@@ -41,6 +41,13 @@
 #                    --stop stops it in every container of this workspace. The
 #                    alternative to `monitor`, not a companion to it — one of the
 #                    two owns a given board's port.
+#   sim [--dev]      run the simulated testbed in the container and open its
+#                    control page at http://localhost:9011/. One process in
+#                    there is the whole testbed — the ether, the stations, the
+#                    hostname proxy that fronts their web UIs, and the map that
+#                    drives all of it. Runs in the foreground; Ctrl-C stops it,
+#                    which stops everything it started. --dev serves the page
+#                    hot from Vite instead of from its build.
 #   get-deps         git-clone any missing transitive `requires:` siblings
 #                    (uses host github creds; container has none). Also runs
 #                    automatically as part of `build`.
@@ -52,6 +59,13 @@
 #                    and rewriting the listing. The run itself is in-container;
 #                    here we clone the straddles its invocations name first,
 #                    since only the host has the git credentials.
+#   publish-builds [catalogue]
+#                    publish a built catalogue (builds/<catalogue>/) as a
+#                    GitHub release tagged builds-<catalogue>, mirroring the
+#                    directory: its zips, index.html, timestamp and builds.yaml
+#                    are the assets, and one the directory no longer holds is
+#                    deleted. Runs `gh` with the host's credentials, like
+#                    push-all/pull-all.
 #   docker <cmd>…    docker-exec <cmd> in the build-env container, raw —
 #                    e.g. `spangap docker sh` for an unwrapped shell.
 #   shell            synonym for `spangap docker bash`: an interactive bash
@@ -1449,6 +1463,203 @@ pull-all)
     done
     exit 0
     ;;
+publish-builds)
+    # Host-only. Publish a built image catalogue (`builds/<catalogue>/`) as a
+    # GitHub release: the transport a Pages site uses to get the images onto the
+    # web. Host-only for the same reason push-all/pull-all are: `gh` reaches
+    # github with your credentials here, never in the build container.
+    #
+    # The release IS the catalogue directory — every file in it goes up as an
+    # asset under its own name (the zips, `index.html`, `timestamp`,
+    # `builds.yaml`, an `.unlisted` marker), and an asset the directory no
+    # longer holds comes back down (--keep-old leaves it). So a consumer copies
+    # the assets into `builds/<catalogue>/` and has the directory back, without
+    # knowing which files a catalogue is made of.
+    #
+    # The tag is a rolling label per catalogue, `catalogue-<name>` — one release
+    # per catalogue, re-used every run, so an image keeps one URL and a site
+    # deploy has one place to look. The build stamp rides in the release title.
+    # A tag that doesn't exist yet is created at the default branch's tip and
+    # stays there; it labels a catalogue, not a source revision.
+    #
+    # A release asset carries no `access-control-allow-origin` — not on
+    # github.com's redirect, not on the signed URL behind it — so a browser
+    # cannot fetch one cross-origin and a flasher page can never read these
+    # zips off GitHub directly. Whatever serves the page copies them in at
+    # deploy time and serves them from its own origin, which is what flashmon
+    # assumes: it reaches its catalogue at the relative `../builds/<name>/`.
+    # `--notify <owner/repo>` fires a `catalogue-published` repository_dispatch
+    # at that consumer so the copy happens on its own.
+    shift
+    pb_cat=
+    pb_slug=
+    pb_keep=0
+    pb_notify=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -R|--repo) shift; [ $# -gt 0 ] || die "-R needs an owner/repo"; pb_slug=$1 ;;
+            --notify) shift; [ $# -gt 0 ] || die "--notify needs an owner/repo"; pb_notify=$1 ;;
+            --keep-old) pb_keep=1 ;;
+            -h|--help)
+                printf '%s\n' \
+                    "usage: spangap publish-builds [CATALOGUE] [-R owner/repo]" \
+                    "                              [--notify owner/repo] [--keep-old]" \
+                    "  Publish a built catalogue as a GitHub release tagged catalogue-<NAME>," \
+                    "  every file in the directory becoming an asset under its own name." \
+                    "  CATALOGUE defaults to the catalogue directory you are standing in, and" \
+                    "  the repo to the origin of the straddle the catalogue builds." \
+                    "  An asset the catalogue no longer holds is deleted unless --keep-old." \
+                    "  --notify fires a catalogue-published repository_dispatch at the repo" \
+                    "  that serves the images, so its site redeploys with this build." \
+                    "  Requires an authenticated \`gh\`." \
+                    "  Release assets carry no CORS headers, so a flasher page cannot fetch" \
+                    "  them: whoever serves the page copies them in at deploy time."
+                exit 0 ;;
+            -*) die "unknown option: $1 (try --help)" ;;
+            *)  pb_cat=$1 ;;
+        esac
+        shift
+    done
+
+    command -v gh >/dev/null 2>&1 || die "gh not found (install the GitHub CLI)"
+    gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run: gh auth login)"
+
+    # Which catalogue: an argument names one under <workspace>/builds (or is a
+    # path to one); no argument means the directory we are standing in, the same
+    # way `spangap make-builds` takes it.
+    if [ -n "$pb_cat" ]; then
+        if [ -f "$pb_cat/builds.yaml" ]; then
+            pb_dir=$pb_cat
+        elif [ -f "$workspace/builds/$pb_cat/builds.yaml" ]; then
+            pb_dir="$workspace/builds/$pb_cat"
+        else
+            die "no catalogue \`$pb_cat\` (no builds.yaml in $workspace/builds/$pb_cat)"
+        fi
+    elif [ -f "$PWD/builds.yaml" ]; then
+        pb_dir=$PWD
+    else
+        pb_avail=
+        for d in "$workspace"/builds/*/; do
+            if [ -f "$d/builds.yaml" ]; then pb_avail="$pb_avail $(basename "$d")"; fi
+        done
+        die "no builds.yaml here — run this in a builds/<catalogue>/ or name one:${pb_avail:- (none built yet)}"
+    fi
+    pb_dir=$(CDPATH= cd -- "$pb_dir" && pwd)
+    pb_name=$(basename "$pb_dir")
+
+    pb_zips=("$pb_dir"/*.zip)
+    [ -e "${pb_zips[0]}" ] || die "no images in $pb_dir — \`spangap make-builds\` there first"
+    pb_assets=("${pb_zips[@]}")
+    # `.unlisted` rides along like any other file: it is what tells the consumer
+    # to serve this catalogue without offering it in the Build selector, and it
+    # only survives the trip if it is up there with the images.
+    for f in index.html timestamp builds.yaml .unlisted; do
+        if [ -f "$pb_dir/$f" ]; then pb_assets+=("$pb_dir/$f"); fi
+    done
+
+    pb_project=$(sed -n 's/^project:[[:space:]]*//p' "$pb_dir/builds.yaml" | head -1)
+    [ -n "$pb_project" ] || pb_project=$pb_name
+    pb_stamp=
+    if [ -f "$pb_dir/timestamp" ]; then pb_stamp=$(cat "$pb_dir/timestamp"); fi
+
+    # Whose releases these are: the catalogue's entries are `spangap build`
+    # invocations, their target is the project straddle, and that straddle's
+    # origin is the repo. Commented-out entries don't match — the leading `#`
+    # keeps them out — so a catalogue with every entry disabled asks for -R.
+    if [ -z "$pb_slug" ]; then
+        pb_target=$(sed -n 's/^[[:space:]]*invocation:[[:space:]]*//p' "$pb_dir/builds.yaml" \
+            | head -1 | awk '{print $1}')
+        [ -n "$pb_target" ] || die "no invocation: in $pb_dir/builds.yaml — name the repo with -R owner/repo"
+        pb_pdir=$(project_host_dir "$pb_target") \
+            || die "straddle $pb_target is not in this workspace — name the repo with -R owner/repo"
+        pb_url=$(git -C "$pb_pdir" remote get-url origin 2>/dev/null) \
+            || die "$pb_target has no origin remote — name the repo with -R owner/repo"
+        # git@github.com:owner/repo.git | https://github.com/owner/repo(.git) -> owner/repo
+        pb_slug=$(printf '%s' "$pb_url" | sed -E 's#.*github\.com[:/]##; s#\.git$##; s#/$##')
+        [ -n "$pb_slug" ] || die "cannot parse a repo from $pb_url — name the repo with -R owner/repo"
+    fi
+
+    pb_tag="catalogue-$pb_name"
+    pb_title="$pb_project builds — $pb_name${pb_stamp:+ $pb_stamp}"
+    pb_notes=$(
+        printf '%s\n\n' "Catalogue \`$pb_name\`${pb_stamp:+, build stamp \`$pb_stamp\`}."
+        for z in "${pb_zips[@]}"; do
+            printf -- '- `%s` (%s)\n' "$(basename "$z")" \
+                "$(awk -v b="$(wc -c <"$z")" 'BEGIN{printf "%.1f MB", b/1048576}')"
+        done
+        printf '\n%s\n' "Each zip holds the images and the \`.esptool\` argfile naming their offsets."
+    )
+
+    if gh release view "$pb_tag" -R "$pb_slug" >/dev/null 2>&1; then
+        gh release edit "$pb_tag" -R "$pb_slug" --title "$pb_title" --notes "$pb_notes" >/dev/null \
+            || die "could not update release $pb_tag in $pb_slug"
+        log "release $pb_tag in $pb_slug — updated"
+    else
+        # Only a `stable` catalogue is a release in the ordinary sense; every
+        # other one is a moving target and says so on the release page.
+        pb_pre=()
+        [ "$pb_name" = stable ] || pb_pre=(--prerelease)
+        gh release create "$pb_tag" -R "$pb_slug" --title "$pb_title" --notes "$pb_notes" \
+            ${pb_pre[@]+"${pb_pre[@]}"} >/dev/null \
+            || die "could not create release $pb_tag in $pb_slug"
+        log "release $pb_tag in $pb_slug — created${pb_pre[0]+ (prerelease)}"
+    fi
+
+    # One call per asset: a catalogue is a handful of files, and a report that
+    # names the one that failed is worth more than a single batched upload.
+    pb_failed=0
+    for a in "${pb_assets[@]}"; do
+        if pb_out=$(gh release upload "$pb_tag" -R "$pb_slug" --clobber "$a" 2>&1); then
+            printf '%-52s uploaded\n' "$(basename "$a")"
+        else
+            pb_failed=$((pb_failed + 1))
+            printf '%-52s upload FAILED: %s\n' "$(basename "$a")" \
+                "$(printf '%s\n' "$pb_out" | grep -m1 . || true)"
+        fi
+    done
+
+    if [ "$pb_keep" -eq 0 ]; then
+        # Read the list first rather than piping the query straight into the
+        # loop: under `set -o pipefail` a failed query would take the whole run
+        # down with it, silently, after the images were already up.
+        pb_have=$(gh release view "$pb_tag" -R "$pb_slug" --json assets -q '.assets[].name' 2>/dev/null) \
+            || pb_have=
+        printf '%s\n' "$pb_have" \
+        | while IFS= read -r a; do
+            [ -n "$a" ] || continue
+            if [ -f "$pb_dir/$a" ]; then continue; fi
+            if gh release delete-asset "$pb_tag" "$a" -R "$pb_slug" --yes >/dev/null 2>&1; then
+                printf '%-52s removed (gone from the catalogue)\n' "$a"
+            else
+                printf '%-52s removal FAILED\n' "$a"
+            fi
+        done
+    fi
+
+    log "https://github.com/$pb_slug/releases/tag/$pb_tag"
+
+    # The consumer poll nobody wants: a site that assembles itself from these
+    # releases has no way to know a new one landed, so tell it. The event is
+    # `catalogue-published`, carrying the catalogue and its stamp; what the
+    # receiving repo does with it is its own business (a Pages deploy, usually).
+    # Only on a clean run — a half-uploaded catalogue is not one to publish.
+    if [ -n "$pb_notify" ]; then
+        if [ "$pb_failed" -ne 0 ]; then
+            die "$pb_failed asset(s) failed — not notifying $pb_notify; re-run to finish the upload"
+        fi
+        if gh api "repos/$pb_notify/dispatches" \
+            -f event_type=catalogue-published \
+            -f "client_payload[catalogue]=$pb_name" \
+            -f "client_payload[stamp]=$pb_stamp" >/dev/null 2>&1; then
+            log "notified $pb_notify (catalogue-published)"
+        else
+            die "could not notify $pb_notify — does your gh auth carry write access to it?"
+        fi
+    elif [ "$pb_failed" -ne 0 ]; then
+        die "$pb_failed asset(s) failed to upload"
+    fi
+    exit 0
+    ;;
 flash)
     shift
     proj=$(require_straddle flash)
@@ -1750,11 +1961,26 @@ ensure_daemon() {
 # bind mounts. Every port is checked, not just the first: a container that
 # publishes only the bottom of the range could serve one dev run and no
 # flashmon.
+# Set by the `flashmon` verb before ensure_container. Only that verb needs the
+# fixed port; for everything else a container without it is perfectly good, and
+# refusing to make one was turning somebody else's stale port into a wall in
+# front of `spangap sim`, `build`, `dev` and `shell`.
+NEED_FLASHMON_PORT=${NEED_FLASHMON_PORT:-}
+
 container_publishes_dev_port() {
-    local p b
-    for p in "$DEV_PORT" "$DEV_PORT_LAST" "$FLASHMON_PORT" "$SIM_PORT"; do
+    local spec b
+    # The testbed's port is published on UDP as well as TCP: the page and every
+    # station's web UI arrive over TCP, and the WebRTC DataChannel each station
+    # speaks to the browser arrives over UDP on the same number.
+    local specs="$DEV_PORT/tcp $DEV_PORT_LAST/tcp $SIM_PORT/tcp $SIM_PORT/udp"
+    # A container made without flashmon's port is complete for every other verb,
+    # so only ask for it when flashmon is what is being run — otherwise every
+    # command would recreate the container forever trying to get a port it does
+    # not need.
+    [ -n "$NEED_FLASHMON_PORT" ] && specs="$specs $FLASHMON_PORT/tcp"
+    for spec in $specs; do
         b=$(docker inspect --format \
-            '{{ index .HostConfig.PortBindings "'"$p"'/tcp" }}' \
+            '{{ index .HostConfig.PortBindings "'"$spec"'" }}' \
             "$container" 2>/dev/null) || b=""
         case $b in ""|"<no value>"|"[]") return 1 ;; esac
     done
@@ -1775,14 +2001,41 @@ container_host_port() {
 # retired one of ours, an unrelated process — the answer that matters is the
 # same, and only a bind attempt gives it.
 host_port_free() {
-    python3 -c "
+    # SO_REUSEADDR because the question is "can this port be bound", and without
+    # it a socket merely in TIME_WAIT — nothing listening, lsof shows nothing —
+    # answers "no". Docker binds with it, so a test without it says taken about
+    # ports Docker can have. An actively-listening socket still refuses the
+    # bind, so the check keeps its teeth.
+    #
+    # Retried, because a container that has just been removed can leave its
+    # publish held for a moment, and that moment is not a reason to fail.
+    local try
+    for try in 1 2 3 4 5 6; do
+        if python3 -c "
 import socket, sys
 s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     s.bind(('127.0.0.1', $1))
 except OSError:
     sys.exit(1)
-" >/dev/null 2>&1
+" >/dev/null 2>&1; then
+            return 0
+        fi
+        [ "$try" -lt 6 ] && sleep 0.5
+    done
+    return 1
+}
+
+# What is holding a host port, as far as we can tell — a container of ours, a
+# container of another workspace, or nothing we can name. For the message only.
+port_holder() {
+    local name
+    # `|| true`: pipefail plus head(1) closing the pipe early is a failure this
+    # is not interested in, and `set -e` would take the whole command out over it.
+    name=$(docker ps -a --format '{{.Names}}' --filter "publish=$1" 2>/dev/null | head -1 || true)
+    [ -n "$name" ] && { printf 'container %s' "$name"; return 0; }
+    printf 'nothing this command can see'
 }
 
 # flashmon's port is FIXED, and this is what keeps it that way. A browser's
@@ -1870,6 +2123,7 @@ reap_retired() {
 }
 
 ensure_container() {
+    local flashmon_publish
     ensure_daemon
     reap_retired
 
@@ -1921,7 +2175,7 @@ ensure_container() {
                 local why=""
                 if ! container_publishes_dev_port; then
                     [ -n "$why" ] && why="$why; the browser-facing ports are unpublished" \
-                                  || why="the browser-facing ports ($DEV_PORT-$DEV_PORT_LAST, $FLASHMON_PORT, $SIM_PORT) are unpublished"
+                                  || why="the browser-facing ports ($DEV_PORT-$DEV_PORT_LAST, $FLASHMON_PORT, $SIM_PORT tcp+udp) are unpublished"
                 elif [ "$(container_host_port "$container" "$DEV_PORT")" = "$DEV_PORT" ]; then
                     # Legacy container pinned the host side to $DEV_PORT, which
                     # blocks every other workspace. Recreate it onto an ephemeral
@@ -2040,17 +2294,30 @@ ensure_container() {
     # thing being avoided — so if one of this workspace's own containers is
     # squatting on the port, it goes; and if something else is, that is said
     # here rather than papered over with a port the browser has never met.
+    # flashmon's port is fixed and worth insisting on — but only for flashmon.
+    # Every other verb gets a container without it rather than no container at
+    # all: being unable to serve a page nobody asked for is not a reason to
+    # refuse to build, to open a shell, or to start the testbed.
+    flashmon_publish=(-p "127.0.0.1:$FLASHMON_PORT:$FLASHMON_PORT")
     if ! free_flashmon_port; then
-        die "host port $FLASHMON_PORT is taken by something that is not this workspace's" \
-            "(the browser's board grants live on it, so nothing else will do)." \
-            "Find it with: lsof -nP -iTCP:$FLASHMON_PORT -sTCP:LISTEN"
+        if [ -n "$NEED_FLASHMON_PORT" ]; then
+            die "host port $FLASHMON_PORT is held by $(port_holder "$FLASHMON_PORT")" \
+                "(the browser's board grants live on it, so nothing else will do)." \
+                "Find it with: lsof -nP -i :$FLASHMON_PORT"
+        fi
+        flashmon_publish=()
+        if [ -z "$SPANGAP_QUIET" ]; then
+            log "host port $FLASHMON_PORT is held by $(port_holder "$FLASHMON_PORT") —" \
+                "carrying on without it; \`spangap flashmon\` is the only verb that needs it"
+        fi
     fi
 
     docker run -d --name "$container" \
         ${run_user_args[@]+"${run_user_args[@]}"} \
+        ${flashmon_publish[@]+"${flashmon_publish[@]}"} \
         -p "127.0.0.1::$DEV_PORT-$DEV_PORT_LAST" \
-        -p "127.0.0.1:$FLASHMON_PORT:$FLASHMON_PORT" \
         -p "127.0.0.1:$SIM_PORT:$SIM_PORT" \
+        -p "127.0.0.1:$SIM_PORT:$SIM_PORT/udp" \
         -v "$spangap_home:/home/spangap" \
         -v "$workspace:$container_ws" \
         --workdir "$container_ws" \
@@ -2693,7 +2960,9 @@ flashmon)
     # ensure_container is what guarantees flashmon's port: a container that is
     # not publishing $FLASHMON_PORT is recreated here rather than tolerated, so
     # by the time the server starts below there is exactly one address it can be
-    # reached at.
+    # reached at. This is the only verb that asks for it — everything else gets
+    # a container whether the port is free or not.
+    NEED_FLASHMON_PORT=1
     ensure_container
     ensure_flashmon             # the page this serves
     ensure_local_catalogue      # and something for it to offer
@@ -2725,6 +2994,79 @@ flashmon)
     log "in the container: \`spangap log -f\` follows every attached node, \`spangap cli -n <node> <cmd>\` runs a command on one"
     open_url "$url"
     exit 0
+    ;;
+sim)
+    # The simulated testbed, run out of the container and opened in the OS
+    # browser. One `docker exec` in the FOREGROUND: simd is the testbed, so the
+    # terminal this runs in is the testbed's terminal and Ctrl-C there stops
+    # everything it started. Nothing is left running and there is nothing to
+    # stop afterwards, which is why this needs no `--stop` the way flashmon does.
+    #
+    # The page and every station's web UI are on one published port, $SIM_PORT,
+    # which ensure_container guarantees the way it guarantees flashmon's: the
+    # browser is sent to that address and it has to outlive a container.
+    shift
+    sim_dev=""
+    [ "${1:-}" = "--dev" ] && { sim_dev="--dev"; shift; }
+    ensure_container
+    # Read back rather than assumed — the same check flashmon makes before a
+    # URL is handed to a browser that will remember it.
+    sim_port=$(docker port "$container" "$SIM_PORT/tcp" 2>/dev/null \
+                 | awk -F: 'NR==1 {print $NF; exit}')
+    [ "$sim_port" = "$SIM_PORT" ] \
+        || die "the container publishes the testbed on ${sim_port:-nothing}, not $SIM_PORT"
+    url="http://localhost:$SIM_PORT/"
+    sim_env=()
+    if [ -n "$sim_dev" ]; then
+        # simd keeps $SIM_PORT whatever happens — it is what fronts the
+        # stations, and their URLs must not move because the page is being
+        # worked on. So the dev server takes a port out of the published dev
+        # range instead, and that is the one the browser is sent to.
+        sim_inport=""
+        for p in $(seq "$DEV_PORT" "$DEV_PORT_LAST"); do
+            if docker exec "$container" python3 -c "
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(('0.0.0.0', $p))
+except OSError:
+    sys.exit(1)
+" >/dev/null 2>&1; then
+                sim_inport=$p
+                break
+            fi
+        done
+        [ -n "$sim_inport" ] \
+            || die "no free dev port in the container ($DEV_PORT-$DEV_PORT_LAST all in use)"
+        sim_devport=$(docker port "$container" "$sim_inport/tcp" 2>/dev/null \
+                        | awk -F: 'NR==1 {print $NF; exit}')
+        [ -n "$sim_devport" ] || sim_devport=$sim_inport
+        sim_env=(-e "SPANGAP_SIM_DEV_BIND=$sim_inport")
+        url="http://localhost:$sim_devport/"
+    fi
+    log "starting the testbed; the page is $url"
+    log "stations will be at http://<name>.sim.localhost:$SIM_PORT/"
+    # Open once the page answers rather than after a fixed wait: the first run
+    # in a container builds the Quasar app, which takes a while, and a browser
+    # pointed at a dead port is a reload the person has to do by hand.
+    (
+        for _ in $(seq 1 600); do
+            if curl -fsS -o /dev/null --max-time 2 "$url" 2>/dev/null; then
+                open_url "$url"; exit 0
+            fi
+            sleep 0.3
+        done
+    ) &
+    sim_opener=$!
+    trap 'kill "$sim_opener" 2>/dev/null || true' EXIT INT TERM
+    set +e
+    # shellcheck disable=SC2086
+    docker exec $exec_flags -e SPANGAP_WORKSPACE="$container_ws" \
+        ${sim_env[@]+"${sim_env[@]}"} \
+        --workdir "$container_ws" "$container" spangap sim $sim_dev
+    rc=$?
+    set -e
+    exit "$rc"
     ;;
 dev)
     # Run the project's Quasar dev server inside the container and open it in the

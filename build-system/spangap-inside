@@ -6110,6 +6110,88 @@ def cmd_dev(argv: list[str]) -> int:
             continue
 
 
+# ---------------------------------------------------------------------------
+# `spangap sim [--dev]` — the simulated testbed.
+#
+# One process is the whole testbed (reticulous/sim/simd.py): the ether, the
+# stations, the proxy that fronts their web UIs and the control page that
+# drives all of it. This verb builds the page when it needs building and then
+# becomes simd, so the terminal it runs in is the testbed's terminal.
+# ---------------------------------------------------------------------------
+
+def _sim_dir() -> Path:
+    """Where the testbed lives, found the way a straddle's own files are."""
+    for candidate in (find_project().path / "sim", WORKSPACE / "reticulous" / "sim"):
+        if (candidate / "simd.py").is_file():
+            return candidate
+    die("spangap sim: no sim/simd.py in this project or in reticulous/")
+
+
+def _sim_ui_stale(ui: Path) -> bool:
+    """True when the page has to be built before it can be served.
+
+    Newest source against the build's own index.html, so an edit to the page
+    is picked up without anyone having to remember to rebuild it, and an
+    unchanged tree costs one stat walk.
+    """
+    built = ui / "dist" / "spa" / "index.html"
+    if not built.is_file():
+        return True
+    when = built.stat().st_mtime
+    for root, dirs, files in os.walk(ui):
+        dirs[:] = [d for d in dirs if d not in ("node_modules", "dist", ".quasar")]
+        for name in files:
+            if Path(root, name).stat().st_mtime > when:
+                return True
+    return False
+
+
+def cmd_sim(argv: list[str]) -> int:
+    dev = "--dev" in argv
+    rest = [a for a in argv if a != "--dev"]
+    sim = _sim_dir()
+    ui = sim / "ui"
+
+    if not (ui / "node_modules").is_dir():
+        print("spangap sim: installing the page's deps (first run)…", file=sys.stderr)
+        if subprocess.run(["npm", "install"], cwd=ui).returncode != 0:
+            die("spangap sim: npm install failed")
+
+    simd = subprocess.Popen(["/usr/bin/python3", str(sim / "simd.py"), *rest], cwd=sim)
+    vite: subprocess.Popen | None = None
+    try:
+        if dev:
+            # Vite serves the page and proxies /ws and /api to simd, so the dev
+            # origin is same-origin with it and the websocket behaves exactly
+            # as when simd serves the built page itself. simd keeps the
+            # testbed's own port either way — it is what fronts the stations —
+            # so the dev server takes one from the published dev range, which
+            # the host side picked and publishes.
+            port = os.environ.get("SPANGAP_SIM_DEV_BIND") or str(DEV_PORT)
+            print(f"\nspangap sim --dev: the page is served by Vite; the "
+                  f"stations stay on the testbed's own port.\n", file=sys.stderr)
+            vite = subprocess.Popen(
+                ["npm", "run", "dev", "--", "-H", "0.0.0.0", "-p", port], cwd=ui)
+        elif _sim_ui_stale(ui):
+            print("spangap sim: building the page…", file=sys.stderr)
+            if subprocess.run(["npx", "quasar", "build"], cwd=ui).returncode != 0:
+                print("spangap sim: the page did not build; simd will say so "
+                      "when you open it", file=sys.stderr)
+        while True:
+            try:
+                return simd.wait()
+            except KeyboardInterrupt:
+                continue
+    finally:
+        for proc in (vite, simd):
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = sys.argv[1:] if argv is None else argv
     # Pass-through subcommands whose own flag parsing would clash with argparse
@@ -6183,6 +6265,17 @@ def main(argv: list[str] | None = None) -> int:
              "(.spangap-build). TARGET + --with/--without are remembered there.",
     )
     p_build.set_defaults(func=cmd_build)
+
+    p_sim = sub.add_parser(
+        "sim",
+        help="run the simulated testbed: the ether, the stations, the proxy "
+             "that fronts their web UIs and the control page that drives them, "
+             "all in one foreground process. Ctrl-C stops the lot.",
+    )
+    p_sim.add_argument("--dev", action="store_true",
+                       help="serve the control page hot from Vite instead of "
+                            "from its build")
+    p_sim.set_defaults(func=lambda a: cmd_sim(["--dev"] if a.dev else []))
 
     p_web = sub.add_parser(
         "web",

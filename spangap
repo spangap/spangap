@@ -65,6 +65,9 @@ Commands (run inside a workspace):
                              workspace) from GitHub; host-only, same auth. Repos
                              that diverged or carry local changes are reported,
                              not touched
+  publish-builds [cat]       publish a built catalogue (builds/<cat>/) as a
+                             GitHub release tagged catalogue-<cat>; host-only,
+                             same auth
   heal                       repair workspace repos whose git object store reads
                              short in-container (virtiofs); auto-runs before builds
 

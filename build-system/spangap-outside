@@ -1383,10 +1383,16 @@ pull-all)
     # in the build container.
     #
     # Fast-forward only, and never over anything you'd have to think about: a
-    # branch that has diverged, a worktree with local changes, a detached HEAD
-    # and a repo with no origin are each reported and left alone. So this verb
-    # only ever advances a branch that was strictly behind — the messy cases stay
-    # yours to resolve, with the line saying which repo and why.
+    # branch that has diverged, a detached HEAD, an unfinished merge and a repo
+    # with no origin are each reported and left alone. So this verb only ever
+    # advances a branch that was strictly behind — the messy cases stay yours to
+    # resolve, with the line saying which repo and why.
+    #
+    # A dirty worktree is not by itself one of those cases. A fast-forward only
+    # writes the paths the incoming commits touch, so the question is whether a
+    # local change sits on one of them; changes anywhere else survive the pull
+    # untouched, which is what keeps a repo whose build regenerates a tracked
+    # file pullable at all.
     shift
     dir=$workspace
     while [ $# -gt 0 ]; do
@@ -1395,8 +1401,9 @@ pull-all)
                 printf '%s\n' \
                     "usage: spangap pull-all [DIR]" \
                     "  Fast-forward every git repo directly under DIR (default: the workspace" \
-                    "  root) to its origin. Repos that have diverged, carry local changes, sit" \
-                    "  on a detached HEAD or have no origin are reported and left untouched."
+                    "  root) to its origin. Repos that have diverged, sit on a detached HEAD," \
+                    "  have no origin, or carry a local change to a file the incoming commits" \
+                    "  also touch are reported and left untouched."
                 exit 0 ;;
             -*) die "unknown option: $1 (try --help)" ;;
             *)  dir=$1 ;;
@@ -1450,13 +1457,39 @@ pull-all)
             printf '%-24s diverged (%s ahead, %s behind) — not pulled\n' "$name" "$ahead" "$behind"
             continue
         fi
-        if [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
-            printf '%-24s %s behind, local changes — not pulled\n' "$name" "$behind"
+        if [ -n "$(git -C "$repo" ls-files --unmerged 2>/dev/null)" ]; then
+            printf '%-24s %s behind, unresolved merge — not pulled\n' "$name" "$behind"
             continue
         fi
 
+        # The paths a local change would collide with: what the incoming commits
+        # write. Rename detection stays off so a rename contributes both of its
+        # names. Against that, every path this worktree has something of its own
+        # at — modified tracked files, staged or not, and untracked ones, which
+        # git refuses to write an incoming file over just the same. Both sides
+        # come from git with the same quoting, so an exact-line match is the
+        # comparison.
+        blockers=$(
+            { git -C "$repo" diff --name-only HEAD
+              git -C "$repo" ls-files --others --exclude-standard
+            } 2>/dev/null | sort -u | grep -Fxf <(
+                git -C "$repo" diff --name-only "HEAD..$upstream" 2>/dev/null) || true
+        )
+        if [ -n "$blockers" ]; then
+            printf '%-24s %s behind, local changes to %s — not pulled\n' \
+                "$name" "$behind" "$(printf '%s\n' "$blockers" | paste -sd' ' -)"
+            continue
+        fi
+
+        # Said on the way out, because a pull that leaves a worktree dirty looks
+        # like a pull that did nothing until you know the changes were kept.
+        kept=
+        if [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
+            kept=', local changes kept'
+        fi
+
         if git -C "$repo" merge --ff-only --quiet "$upstream" >/dev/null 2>&1; then
-            printf '%-24s fast-forwarded %s commit(s) from %s\n' "$name" "$behind" "$upstream"
+            printf '%-24s fast-forwarded %s commit(s) from %s%s\n' "$name" "$behind" "$upstream" "$kept"
         else
             printf '%-24s fast-forward FAILED\n' "$name"
         fi

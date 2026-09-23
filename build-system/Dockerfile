@@ -84,8 +84,8 @@ RUN { \
 
 # Python deps. Two targets:
 #   - System python3 (/usr/bin/python3): runs the in-container CLI; needs pyyaml+jsonschema.
-#     It also runs the simulated testbed (reticulous/sim/simd.py), whose HTTP and
-#     WebSocket server is aiohttp.
+#     It also runs the simulated testbeds (reticulous/sim/simd.py, SIMesh/testbed/simd.py),
+#     whose HTTP and WebSocket server is aiohttp, and SIMesh's tests, which are pytest.
 #   - IDF Python venv (/opt/esp/python_env/idf5.5_py3.12_env): what `python3` resolves to
 #     once `. $IDF_PATH/export.sh` activates the env. ESP-IDF CMake helpers call
 #     `python3 lcd-icons.py` / `python3 lcd-fonts.py` — those land in the IDF venv, so
@@ -93,13 +93,30 @@ RUN { \
 #     font subsetting. fonttools is load-bearing for size, not just quality: without it
 #     lcd-fonts.py copies the source faces through verbatim (~1.6 MB) and /fixed overflows
 #     its partition.
-RUN pip3 install --no-cache-dir --break-system-packages pyyaml jsonschema aiohttp
+RUN pip3 install --no-cache-dir --break-system-packages pyyaml jsonschema aiohttp pytest
 RUN /opt/esp/python_env/idf5.5_py3.12_env/bin/pip install --no-cache-dir \
         Pillow \
         cairosvg \
         fonttools \
         pypng \
         lz4
+
+# Rust, for the SIMesh station kind that is written in it (sergey/reticulum).
+# rustup ships no linker; gcc is already in the image. Installed into a shared
+# prefix, the way the IDF venv is shared, because the container runs as
+# `spangap` and cargo writes its registry and git caches under CARGO_HOME.
+# libudev-dev + pkg-config are there only because rncfg is a member of that
+# workspace and `cargo … --workspace` builds it.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo
+RUN set -eux; \
+    curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable; \
+    /usr/local/cargo/bin/rustup component add clippy rustfmt; \
+    chmod -R a+rwX /usr/local/rustup /usr/local/cargo; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libudev-dev pkg-config; \
+    rm -rf /var/lib/apt/lists/*
+ENV PATH="/usr/local/cargo/bin:${PATH}"
 
 # In-container CLI. spangap-inside lands at /usr/local/lib/spangap/cli.py.
 # /usr/local/bin/spangap is a tiny bash wrapper that sources IDF's export.sh

@@ -79,7 +79,7 @@ Pass `--no-web` or `--no-lcd` at build time to exclude an activator.
 `requires:` ∪ `additional_installs:` ∪ (any straddles named via `--with`)
 transitively, subtracting any `--without` / `--no-X` entries and the
 straddles that hard-require them (the cascade), then stages each kept dep into
-`staging/components/<repo>/` as a real dir containing per-entry symlinks to
+`build.<target>/staging/components/<repo>/` as a real dir containing per-entry symlinks to
 the source dir's contents plus two generated files:
 
 - **`spangap_requires.cmake`** — `set(SPANGAP_REQUIRES …)` with this
@@ -96,10 +96,10 @@ the source dir's contents plus two generated files:
   ```
 
   The buildable's `main/CMakeLists.txt` reads its own generated file at
-  `${CMAKE_CURRENT_LIST_DIR}/../staging/main_requires.cmake`. (Note:
-  `CMAKE_CURRENT_LIST_DIR`, not `CMAKE_SOURCE_DIR` — in IDF's component-
-  requirements pre-pass the latter resolves to the build dir, breaking
-  the include.)
+  `<BUILD_DIR>/staging/main_requires.cmake`, with `BUILD_DIR` read through
+  `idf_build_get_property` — the one spelling that holds in IDF's component-
+  requirements pre-pass (a script-mode run, where `CMAKE_SOURCE_DIR` and
+  `CMAKE_BINARY_DIR` are not the project's) as well as in the real configure.
 
 - One sibling staged component, **`_spangap_present`**, contains an
   auto-generated `Kconfig.projbuild` declaring one hidden
@@ -143,10 +143,9 @@ the source dir's contents plus two generated files:
 
 - Partition table: `bootstrap.cmake` calls `gen-partitions.py` with the
   flash size from `CONFIG_ESPTOOLPY_FLASHSIZE_*MB`, the app-share percent
-  from `CONFIG_SPANGAP_APP_PERCENT`, and OTA on/off **derived from whether
-  `staging/components/ota/` exists** (not a Kconfig knob — staged set is
-  authoritative). OTA on → paired A/B app + fixed; OTA off → single,
-  bigger app + fixed.
+  from `CONFIG_SPANGAP_APP_PERCENT`, and the updater on/off **derived from
+  whether `staging/components/updater/` exists** (not a Kconfig knob — staged
+  set is authoritative), into the build dir's own `partitions.csv`.
 
 A staging-time **lint** rejects any `idf_component_register(REQUIRES …)`
 that hand-writes a known straddle repo name. Cross-straddle deps must

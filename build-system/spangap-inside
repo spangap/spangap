@@ -176,6 +176,9 @@ class Manifest:
         self.path = manifest_path
         self.dir = manifest_path.parent
         self.data = data
+        # The IDF target this buildable is being built for, set once the staged
+        # set is resolved (resolve_idf_target). It picks build_dir.
+        self.idf_target = "esp32s3"
 
     @property
     def name(self) -> str: return self.data["name"]
@@ -195,6 +198,15 @@ class Manifest:
     @property
     def firmware_dir(self) -> Path:
         return (self.dir / self.data.get("firmware", "idf")).resolve()
+    @property
+    def build_dir(self) -> Path:
+        """Everything one target's build writes: IDF's build tree, sdkconfig,
+        staging/, partitions.csv, dependencies.lock and the web bundle. One dir
+        per target, so a chip build and a host build share no generated file."""
+        return self.firmware_dir / f"build.{self.idf_target}"
+    @property
+    def staging_dir(self) -> Path:
+        return self.build_dir / "staging"
     @property
     def browser_dir(self) -> Path:
         return (self.dir / self.data.get("browser", "browser")).resolve()
@@ -1089,7 +1101,7 @@ def lint_cmakelists(proj: Manifest, deps: list[Manifest], all_straddles: dict[st
     --no-X / additional_installs machinery actually narrows the dep graph.
     """
     known_repos = {m.repo for m in all_straddles.values()}
-    staging = proj.firmware_dir / "staging" / "components"
+    staging = proj.staging_dir / "components"
     targets: list[Path] = []
     for dep in deps:
         cml = staging / dep.repo / "CMakeLists.txt"
@@ -1148,7 +1160,7 @@ def write_main_requires(proj: Manifest, staged_repos: set[str],
     cond_srcs, cond_incs = _conditional_sources(proj.firmware_dir / "main", staged_repos)
     # The buildable's own services: trampoline (if any), path relative to main/.
     cond_srcs = cond_srcs + list(extra_cond_srcs or [])
-    staging_dir = proj.firmware_dir / "staging"
+    staging_dir = proj.staging_dir
     staging_dir.mkdir(parents=True, exist_ok=True)
     body = " ".join(requires_list)
     text = (
@@ -2620,7 +2632,7 @@ def write_init_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
         "    spangapPostAppInit();\n"
         "}\n"
     )
-    staging_dir = proj.firmware_dir / "staging"
+    staging_dir = proj.staging_dir
     staging_dir.mkdir(parents=True, exist_ok=True)
     (staging_dir / "spangap_init_dispatch.gen.cpp").write_text(body)
 
@@ -2946,7 +2958,7 @@ def write_sdkconfig_fragments(proj: Manifest, deps: list[Manifest]) -> None:
         "# Layered into SDKCONFIG_DEFAULTS by bootstrap.cmake; last block wins.\n"
         + ("\n".join(blocks) + "\n" if blocks else "")
     )
-    staging_dir = proj.firmware_dir / "staging"
+    staging_dir = proj.staging_dir
     staging_dir.mkdir(parents=True, exist_ok=True)
     (staging_dir / "sdkconfig.spangap-fragments").write_text(text)
 
@@ -2964,7 +2976,7 @@ def signal_preamble(proj: Manifest, deps: list[Manifest], missing: list[str] = (
 
 
 def stage_components(proj: Manifest, deps: list[Manifest], log_staged: bool = True) -> Path:
-    """Stage each transitive dep into <fw>/staging/components/<repo>/, as a
+    """Stage each transitive dep into <fw>/build.<target>/staging/components/<repo>/, as a
     real dir of per-entry symlinks to the dep's firmware_dir contents plus
     generated build-system files. The per-entry layout (vs. one symlink to
     the whole dep) lets us drop generated files into the staged dir without
@@ -2974,7 +2986,7 @@ def stage_components(proj: Manifest, deps: list[Manifest], log_staged: bool = Tr
     main_requires.cmake. log_staged=False suppresses the per-dep `staged:`
     lines (quiet builds).
     """
-    staging = proj.firmware_dir / "staging" / "components"
+    staging = proj.staging_dir / "components"
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True, exist_ok=True)
@@ -3013,9 +3025,9 @@ def stage_components(proj: Manifest, deps: list[Manifest], log_staged: bool = Tr
     if proj_svc_tu and (proj.firmware_dir / "main").is_dir():
         _require_conditional_srcs_wiring(
             proj.firmware_dir / "main" / "CMakeLists.txt", proj.name)
-        (proj.firmware_dir / "staging").mkdir(parents=True, exist_ok=True)
-        (proj.firmware_dir / "staging" / _SERVICE_TU_NAME).write_text(proj_svc_tu)
-        proj_svc_extra = [f"../staging/{_SERVICE_TU_NAME}"]
+        proj.staging_dir.mkdir(parents=True, exist_ok=True)
+        (proj.staging_dir / _SERVICE_TU_NAME).write_text(proj_svc_tu)
+        proj_svc_extra = [str(proj.staging_dir / _SERVICE_TU_NAME)]
 
     write_presence_component(staging, deps)
     write_main_requires(proj, staged_repos, proj_svc_extra)
@@ -3105,7 +3117,7 @@ def _git_identity(d: Path) -> dict[str, Any]:
 
 
 def write_build_manifest(proj: Manifest, deps: list[Manifest], invocation: str) -> None:
-    """Emit build/spangap-build-manifest.md — the per-build provenance record.
+    """Emit build.<target>/spangap-build-manifest.md — the per-build provenance record.
 
     There are no releases yet (every straddle is version 0.0.0), so the real
     identity of what shipped is the git commit of each staged straddle. This
@@ -3153,11 +3165,30 @@ def write_build_manifest(proj: Manifest, deps: list[Manifest], invocation: str) 
             out.append(" ".join(parts))
         out.append("")
 
-        dst = proj.firmware_dir / "build" / "spangap-build-manifest.md"
+        dst = proj.build_dir / "spangap-build-manifest.md"
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text("\n".join(out))
     except Exception as e:  # provenance is a nicety — never break a build over it
         print(f"spangap: could not write build manifest ({e})", file=sys.stderr)
+
+
+def resolve_idf_target(proj: "Manifest", deps: list["Manifest"]) -> str:
+    """The IDF target is a property of the board: the one staged straddle whose
+    repo name starts with `hw-` names it, and every other straddle inherits it.
+    A build with no board straddle is a chip build for the default target.
+    Recorded on `proj`, where it picks the build dir."""
+    proj.idf_target = "esp32s3"
+    for m in deps + [proj]:
+        if m.repo.startswith("hw-"):
+            proj.idf_target = m.target
+            break
+    return proj.idf_target
+
+
+def idf_dir_args(proj: "Manifest") -> list[str]:
+    """idf.py's global options that put this target's build tree and sdkconfig
+    in its own build dir."""
+    return ["-B", str(proj.build_dir), "-D", f"SDKCONFIG={proj.build_dir / 'sdkconfig'}"]
 
 
 def run_build_idf(args: list[str], cwd: Path, quiet: bool, env: dict[str, str] | None = None,
@@ -3297,7 +3328,7 @@ def write_sdkconfig_overrides(
     up, the partition generator reads the same value from sdkconfig, and the
     layout snaps to match.
     """
-    staging_dir = proj.firmware_dir / "staging"
+    staging_dir = proj.staging_dir
     staging_dir.mkdir(parents=True, exist_ok=True)
     body: list[str] = []
     if flash_mb is not None:
@@ -3313,7 +3344,7 @@ def write_sdkconfig_overrides(
 
     if flash_mb is None:
         return
-    sdkconfig = proj.firmware_dir / "sdkconfig"
+    sdkconfig = proj.build_dir / "sdkconfig"
     if not sdkconfig.exists():
         return  # first build — SDKCONFIG_DEFAULTS path handles it
     target = f"CONFIG_ESPTOOLPY_FLASHSIZE_{flash_mb}MB=y"
@@ -3346,10 +3377,11 @@ def cmd_menuconfig(args: argparse.Namespace) -> int:
     deps, _ = resolve_requires(
         proj, all_straddles, excluded=set(), included=set(), dropped_out=dropped,
     )
+    resolve_idf_target(proj, deps)
     stage_components(proj, deps, log_staged=False)
     write_sdkconfig_overrides(proj, None)
 
-    rc = run_idf(["menuconfig"], cwd=proj.firmware_dir)
+    rc = run_idf([*idf_dir_args(proj), "menuconfig"], cwd=proj.firmware_dir)
     if rc != 0:
         return rc
     # menuconfig exited cleanly — from here on sdkconfig is hand-managed.
@@ -3361,12 +3393,12 @@ def cmd_menuconfig(args: argparse.Namespace) -> int:
         return rc
     print("spangap: writing minimal sdkconfig.defaults (idf.py save-defconfig)",
           file=sys.stderr)
-    return run_idf(["save-defconfig"], cwd=proj.firmware_dir)
+    return run_idf([*idf_dir_args(proj), "save-defconfig"], cwd=proj.firmware_dir)
 
 
 def cmd_autoconfig(args: argparse.Namespace) -> int:
     """Leave manual-kconfig mode: remove the .spangap-manual-kconfig marker and
-    delete the project's sdkconfig so the next build reseeds it from the current
+    delete every target's sdkconfig so the next build reseeds it from the current
     (layered) sdkconfig.defaults. The inverse of `spangap menuconfig`."""
     had_marker = MANUAL_KCONFIG_FILE.exists()
     MANUAL_KCONFIG_FILE.unlink(missing_ok=True)
@@ -3374,9 +3406,9 @@ def cmd_autoconfig(args: argparse.Namespace) -> int:
     proj = find_project()
     if not proj.has_firmware:
         die(f"{proj.name}: firmware dir {proj.firmware_dir} has no CMakeLists.txt")
-    sdkconfig = proj.firmware_dir / "sdkconfig"
-    removed_sdkconfig = sdkconfig.exists()
-    if removed_sdkconfig:
+    sdkconfigs = list(proj.firmware_dir.glob("build.*/sdkconfig"))
+    removed_sdkconfig = bool(sdkconfigs)
+    for sdkconfig in sdkconfigs:
         sdkconfig.unlink()
 
     if not had_marker:
@@ -3434,9 +3466,8 @@ def finalize_shrink_wrap(proj: "Manifest", build_dir: Path,
 
     Returns 0 on success; nonzero lets the caller fall back to a full rebuild.
     """
-    fw = proj.firmware_dir
-    partitions = fw / "partitions.csv"
-    sdk = fw / "sdkconfig"
+    partitions = build_dir / "partitions.csv"
+    sdk = build_dir / "sdkconfig"
     sdk_text = sdk.read_text() if sdk.exists() else ""
 
     def cfg(key: str, default: str = "") -> str:
@@ -3448,9 +3479,9 @@ def finalize_shrink_wrap(proj: "Manifest", build_dir: Path,
     container_mb = int(re.sub(r"[^0-9]", "", fs) or "4")
     max_fw_kb = int(cfg("CONFIG_SPANGAP_MAX_FIRMWARE_KB", "0") or "0")
     state_floor = max_fw_kb * 1024 if max_fw_kb > 0 else container_mb * 1024 * 1024
-    updater = "y" if (fw / "staging/components/updater").exists() else "n"
+    updater = "y" if (proj.staging_dir / "components/updater").exists() else "n"
 
-    gen_parts = fw / "staging/components/spangap-core/scripts/gen-partitions.py"
+    gen_parts = proj.staging_dir / "components/spangap-core/scripts/gen-partitions.py"
     if not gen_parts.exists():
         return 1
 
@@ -3585,11 +3616,11 @@ def print_partition_layout(csv_path: Path) -> None:
     # `app` is the remainder below `fixed`, so its partition is deliberately large
     # and mostly free — report the real firmware size + its headroom, not the slot.
     app_used = 0
-    pd = csv_path.parent / "build" / "project_description.json"
+    pd = csv_path.parent / "project_description.json"
     if pd.exists():
         try:
             ab = json.loads(pd.read_text()).get("app_bin", "")
-            p = csv_path.parent / "build" / ab if ab else None
+            p = csv_path.parent / ab if ab else None
             if p and p.exists():
                 app_used = p.stat().st_size
         except (ValueError, OSError):
@@ -3676,7 +3707,7 @@ def project_name(build_dir: Path, args: dict) -> str:
 
 
 def write_flasher_zip(build_dir: Path) -> None:
-    """Bundle everything needed to flash a board into build/flasher.zip.
+    """Bundle everything needed to flash a board into build.<target>/flasher.zip.
 
     Contents: <project_name>.esptool (the offset→image map and the write_flash
     flags, as an esptool argfile) and every image it names, each stored at its
@@ -3885,14 +3916,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         dropped_out=dropped,
     )
 
-    # The IDF target is a property of the board: the one staged straddle whose
-    # repo name starts with `hw-` names it, and every other straddle inherits it.
-    # A build with no board straddle is a chip build for the default target.
-    idf_target = "esp32s3"
-    for m in deps + [proj]:
-        if m.repo.startswith("hw-"):
-            idf_target = m.target
-            break
+    idf_target = resolve_idf_target(proj, deps)
     host_build = idf_target == "linux"
 
     # Flash size must be set explicitly — IDF's silent 2MB default would mismatch
@@ -3909,21 +3933,6 @@ def cmd_build(args: argparse.Namespace) -> int:
             "       in a board straddle's `kconfig:` (the right home for a "
             "hardware property)."
         )
-
-    # An sdkconfig carries the target it was generated for, and idf.py refuses
-    # to build when that disagrees with IDF_TARGET — before CMake, so
-    # bootstrap.cmake's own reseed never gets the chance. A target switch
-    # therefore drops the file; every value in it comes from the defaults
-    # layers anyway, which is what regenerates it.
-    sdkconfig = proj.firmware_dir / "sdkconfig"
-    if sdkconfig.exists():
-        for ln in sdkconfig.read_text().splitlines():
-            if ln.startswith("CONFIG_IDF_TARGET="):
-                if ln.strip() != f'CONFIG_IDF_TARGET="{idf_target}"':
-                    print(f"spangap: sdkconfig was generated for {ln.split('=', 1)[1]}"
-                          f" — regenerating for {idf_target}", file=sys.stderr)
-                    sdkconfig.unlink()
-                break
 
     quiet = not args.verbose
     if not quiet:
@@ -3969,8 +3978,8 @@ def cmd_build(args: argparse.Namespace) -> int:
     # (spangap_create_factory_image guards on its existence).
     write_build_manifest(proj, deps, build_env["SPANGAP_BUILD_ARGS"])
     rc = run_build_idf(
-        idf_args or ["build"], cwd=proj.firmware_dir, quiet=quiet, env=build_env,
-        preview=host_build,
+        [*idf_dir_args(proj), *(idf_args or ["build"])], cwd=proj.firmware_dir,
+        quiet=quiet, env=build_env, preview=host_build,
     )
     # On a successful plain build, shrink-wrap `fixed` to the measured data size.
     # Configure sized `fixed` generously (a safe upper bound, so the littlefs pack
@@ -3986,18 +3995,18 @@ def cmd_build(args: argparse.Namespace) -> int:
     # The host target produces an ELF the launcher runs, not an image anything
     # flashes: there is no app image to measure and no flasher bundle to write.
     if rc == 0 and not host_build and (not idf_args or idf_args == ["build"]):
-        build_dir = proj.firmware_dir / "build"
+        build_dir = proj.build_dir
         app_b, fixed_b = measure_build_sizes(build_dir)
-        if fixed_b and align_up(fixed_b, 0x1000) != _fixed_size_in(proj.firmware_dir / "partitions.csv"):
+        if fixed_b and align_up(fixed_b, 0x1000) != _fixed_size_in(build_dir / "partitions.csv"):
             frc = finalize_shrink_wrap(proj, build_dir, app_b, fixed_b)
             if frc != 0:
                 print("spangap: in-place finalize failed (%d) — rebuilding "
                       "once" % frc, file=sys.stderr)
-                (proj.firmware_dir / "partitions.csv").touch()
-                rc = run_build_idf(idf_args or ["build"], cwd=proj.firmware_dir,
-                                   quiet=quiet, env=build_env)
+                (build_dir / "partitions.csv").touch()
+                rc = run_build_idf([*idf_dir_args(proj), *(idf_args or ["build"])],
+                                   cwd=proj.firmware_dir, quiet=quiet, env=build_env)
         if rc == 0:
-            print_partition_layout(proj.firmware_dir / "partitions.csv")
+            print_partition_layout(build_dir / "partitions.csv")
             write_flasher_zip(build_dir)
     return rc
 
@@ -4965,7 +4974,10 @@ def _hub_run(node: str | None, cmd: str, timeout: float = 20.0) -> tuple[int, st
 
 def cmd_clean(args: argparse.Namespace) -> int:
     proj = find_project()
-    return run_idf(["fullclean"], cwd=proj.firmware_dir)
+    for d in sorted(proj.firmware_dir.glob("build.*")):
+        print(f"spangap: removing {d}", file=sys.stderr)
+        shutil.rmtree(d)
+    return 0
 
 
 def cmd_detect_build(args: argparse.Namespace) -> int:
@@ -5154,13 +5166,13 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
-# Per-straddle build artifacts reallyclean strips. Firmware: idf build/,
-# generated staging/, downloaded managed_components/, plus the generated
-# sdkconfig (and its .old backup) and dependencies.lock — all gitignored.
-# Dropping sdkconfig matters: it's the file IDF treats as authoritative once
-# it exists, so leaving it behind means changed sdkconfig.defaults are silently
-# ignored on the next build. A source-only reset must remove it (matches
-# spangap-core's reallyclean.sh, which idf.py reallyclean routes through).
+# Per-straddle build artifacts reallyclean strips. Firmware: every
+# build.<target>/ (a spangap build's whole output, sdkconfig and staging
+# included), downloaded managed_components/, and what a raw idf.py project
+# (flashmon's detect app) leaves: build/, staging/, sdkconfig (+ .old) and
+# dependencies.lock — all gitignored. Dropping sdkconfig matters: it's the file
+# IDF treats as authoritative once it exists, so leaving it behind means changed
+# sdkconfig.defaults are silently ignored on the next build.
 # Browser: node_modules/, dist/, .quasar/, package-lock.json.
 _FW_ARTIFACTS = (
     "build", "staging", "managed_components",
@@ -5210,6 +5222,8 @@ def cmd_reallyclean(args: argparse.Namespace) -> int:
     for m in straddles.values():
         for sub in _FW_ARTIFACTS:
             rm(m.firmware_dir / sub)
+        for t in sorted(m.firmware_dir.glob("build.*")):
+            rm(t)
         for sub in _BROWSER_ARTIFACTS:
             rm(m.browser_dir / sub)
     print(
@@ -5899,10 +5913,10 @@ def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
     for name, inv in chosen:
         toks = shlex.split(inv)
         # The invocation leads with the buildable (the pre-flight resolved it);
-        # its own straddle dir is where the build leaves esp-idf/build/flasher.zip.
+        # the build leaves flasher.zip in its firmware dir's build.<target>/.
         target = resolve_target_straddle(toks[0], all_straddles)
         assert target is not None
-        zip_src = target.firmware_dir / "build" / "flasher.zip"
+        started = time.time() - 1
         sys.stdout.write(f"  {inv} ...")
         sys.stdout.flush()
         # This entry's name is the image's distribution identity: free-format, and
@@ -5928,7 +5942,11 @@ def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True,
         )
-        if proc.returncode != 0 or not zip_src.is_file():
+        zips = [z for z in target.firmware_dir.glob("build.*/flasher.zip")
+                if z.stat().st_mtime >= started]
+        zip_src = max(zips, key=lambda z: z.stat().st_mtime) if zips else \
+            target.firmware_dir / "build.<target>" / "flasher.zip"
+        if proc.returncode != 0 or not zips:
             # The first failure ends the run: the remaining entries build from the
             # same tree, so whatever broke this one most likely breaks them too,
             # and stopping here leaves the error at the end of the output. The
@@ -6211,7 +6229,8 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("heal", help="repair workspace repos whose git object store is unreadable in-container (virtiofs truncated packs) by refetching from origin; runs automatically before each build").set_defaults(func=cmd_heal)
     sub.add_parser("validate", help="parse + validate manifest and dep graph").set_defaults(func=cmd_validate)
-    sub.add_parser("clean", help="run idf.py fullclean").set_defaults(func=cmd_clean)
+    sub.add_parser("clean", help="remove every build.<target>/ dir of the project"
+                   ).set_defaults(func=cmd_clean)
     sub.add_parser("reallyclean", help="strip ALL workspace straddles back to source-only state (build/, managed_components/, node_modules/, …)").set_defaults(func=cmd_reallyclean)
 
     p_build = sub.add_parser("build", help="build the project (default: idf.py build)")

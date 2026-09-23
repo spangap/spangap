@@ -996,12 +996,13 @@ run_monitor() {
         stripper=$!
     fi
     # Find the app ELF for panic-backtrace symbolication. It's the only
-    # .elf at build/ root (bootloader/partition ELFs live in subdirs).
-    # Optional — esp-idf-monitor still runs without one. Skipped when we
-    # have no firmware dir (warning was printed at startup).
-    local elf=""
-    if [ -n "$fw" ]; then
-        for e in "$fw/build"/*.elf; do
+    # .elf at the chip build dir's root (bootloader/partition ELFs live in
+    # subdirs). Optional — esp-idf-monitor still runs without one. Skipped
+    # when we have no firmware dir (warning was printed at startup).
+    local elf="" bdir=""
+    [ -n "$fw" ] && bdir=$(chip_build_dir "$fw")
+    if [ -n "$bdir" ]; then
+        for e in "$bdir"/*.elf; do
             [ -f "$e" ] && { elf=$e; break; }
         done
     fi
@@ -1062,10 +1063,21 @@ run_monitor() {
     rm -f "$fifo"
 }
 
+# chip_build_dir <fw>: the firmware dir's most recently built flashable tree —
+# a build.<target>/ holding flasher_args.json. The host target's tree never
+# has one. Prints nothing when there is none.
+chip_build_dir() {
+    local a
+    a=$(ls -td "$1"/build.*/flasher_args.json 2>/dev/null | head -n 1)
+    [ -n "$a" ] && dirname "$a"
+}
+
 # do_flash <port> <fw> <log>: read flasher_args.json, esptool, return 0/1.
 do_flash() {
     local port=$1 fw=$2 log=$3
-    local args_json="$fw/build/flasher_args.json"
+    local bdir
+    bdir=$(chip_build_dir "$fw")
+    local args_json="${bdir:-$fw/build.<target>}/flasher_args.json"
     if [ ! -f "$args_json" ]; then
         log "no build artifacts at $args_json"
         echo "         run \`spangap build\` first" >&2
@@ -1109,7 +1121,7 @@ PY
     log "chip=$chip port=$port baud=$baud project=$fw"
     local rc=0
     (
-        cd "$fw/build"
+        cd "$bdir"
         "$VENV/bin/esptool.py" --chip "$chip" -p "$port" -b "$baud" \
             --before "$before" --after "$after" \
             write_flash "${wf_args[@]}"

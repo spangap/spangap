@@ -56,9 +56,10 @@ tree (see ["What `spangap build` does"](#what-spangap-build-does-under-the-hood)
   then clones the project and every transitive dep into the workspace as flat sibling
   dirs, where they stay pinned. **Look here.**
 
-The workspace is a **host bind mount**, so anything you write under a straddle's `build/`
-is read directly by the host's flashing path, and the container path (`<workspace>/<repo>`) is
-what gets baked into `build/CMakeCache.txt`'s `CMAKE_HOME_DIRECTORY` — stable and
+The workspace is a **host bind mount**, so anything you write under a straddle's
+`build.<target>/` is read directly by the host's flashing path, and the container path
+(`<workspace>/<repo>`) is what gets baked into `build.<target>/CMakeCache.txt`'s
+`CMAKE_HOME_DIRECTORY` — stable and
 host-independent. **Never bake a host-absolute path into the build.**
 
 ## `spangap` in here = the in-container CLI
@@ -70,13 +71,13 @@ container these verbs work directly, with the IDF env already set up:
 
 | works in here | what it does |
 |---|---|
-| `spangap build [-v] [-w/--with <straddle>] [-x/--without <straddle>] [--no-lcd/--no-web/--no-net] [--flash-size MB] [--kconfig CONFIG_X=y] [idf args…]` | resolve deps → stage → lint → `idf.py build` (+ browser build). `--kconfig` (repeatable) forces a Kconfig value for this build — the way a build **flavour** is expressed, where a board's own hardware values belong in its `kconfig:`. It lands in `staging/sdkconfig.spangap-overrides`, the highest-priority `SDKCONFIG_DEFAULTS` entry, and `bootstrap.cmake` reseeds `sdkconfig` when that set changes, so switching flavours in one tree needs no clean (unless `.spangap-manual-kconfig` is set — then the reseed is skipped and the flavour silently doesn't apply). Remembered in `.spangap-build` with `--with`/`--without` |
+| `spangap build [-v] [-w/--with <straddle>] [-x/--without <straddle>] [--no-lcd/--no-web/--no-net] [--flash-size MB] [--kconfig CONFIG_X=y] [idf args…]` | resolve deps → stage → lint → `idf.py build` into `esp-idf/build.<target>/` (+ browser build). `--kconfig` (repeatable) forces a Kconfig value for this build — the way a build **flavour** is expressed, where a board's own hardware values belong in its `kconfig:`. It lands in `staging/sdkconfig.spangap-overrides`, the highest-priority `SDKCONFIG_DEFAULTS` entry, and `bootstrap.cmake` reseeds `sdkconfig` when that set changes, so switching flavours in one tree needs no clean (unless `.spangap-manual-kconfig` is set — then the reseed is skipped and the flavour silently doesn't apply). Remembered in `.spangap-build` with `--with`/`--without` |
 | `spangap web [-w/--with <straddle>] [-x/--without <straddle>]` | regenerate the browser half only (`src/boot/straddles.gen.ts`, `src/app-icons/`, the `file:` deps in `package.json`, `npm install` if those changed) — no IDF compile. Bare, it uses the remembered build's straddle set |
 | `spangap menuconfig [--save]` | interactive Kconfig editor (`idf.py menuconfig`) over the staged project; `--save` writes the minimal `sdkconfig.defaults` (the "configure a board straddle, save as `hw-whatever`" step) |
 | `spangap autoconfig` | leave manual-kconfig mode (drop `.spangap-manual-kconfig`) and reseed `sdkconfig` from `sdkconfig.defaults` on the next build |
 | `spangap validate` | parse + jsonschema-check the manifest and dep graph (fast, read-only) |
 | `spangap list-requires` / `list-deps` | full transitive set / missing siblings (read-only diagnostics) |
-| `spangap clean` / `reallyclean` | `idf.py fullclean` / strip **every** straddle in the active root back to source (gitignored artifacts only) |
+| `spangap clean` / `reallyclean` | remove the project's `build.<target>/` dirs / strip **every** straddle in the active root back to source (gitignored artifacts only) |
 | `spangap show` | project straddle + deps in init order, the env report (python, IDF_PATH, node/npm/idf.py versions), and whether a host `spangap monitor` is ready to flash (bare `spangap` with no subcommand does the same; `show` stays as an explicit alias) |
 | `spangap cli [-n node] [-h host] [<cmd>]` | run a command on a device: through a `spangap flashmon` browser tab holding it (`-n`, over USB — needs no network on the device at all), else over the network (ssh, else TCP CLI) |
 | `spangap flashmon [--nodes] [--stop]` | serve flashmon + the image catalogues on the container's published port, and take the console of every browser tab that connects (see below). Runs in the foreground; the host `spangap flashmon` starts it and prints the URL |
@@ -507,7 +508,8 @@ they work) — no output means it worked, not that it hung.
   `secrets.*` persist but never leave the device; no-prefix keys are ephemeral (gone on
   reboot). So `spangap cli set s.…` survives a reboot; setting a bare key doesn't.
   (Details: `spangap-core/docs/storage.md`.)
-- **Stack decode** needs the build's ELF, which the monitor finds in `esp-idf/build/` —
+- **Stack decode** needs the build's ELF, which the monitor finds in the most recently
+  built flashable `esp-idf/build.<target>/` —
   so flash a build you actually built here and panics in `.spangap-log` resolve to source.
 
 ## The straddle tree (`<workspace>`)
@@ -577,16 +579,16 @@ enumerate the workspace.
 
 1. resolve `spangap-core (implicit) ∪ requires ∪ additional_installs ∪ --with`, transitively,
    minus `--without`/`--no-X` and the reverse-dependency cascade they trigger.
-2. stage each kept dep into `staging/components/<repo>/`: symlinks to source + a generated
+2. stage each kept dep into `build.<target>/staging/components/<repo>/`: symlinks to source + a generated
    `spangap_requires.cmake` (`set(SPANGAP_REQUIRES …)`), plus a synthetic `_spangap_present`
    component whose `Kconfig.projbuild` declares `CONFIG_STRADDLE_<UPPER_REPO>` (default y)
    per staged straddle, with aliases `CONFIG_SPANGAP_LCD/WEB/OTA/WG/UPNP/DUCKDNS/ACME`.
 3. write `staging/sdkconfig.spangap-overrides` (e.g. `--flash-size`); partition table derives
-   from flash size + app-percent + **whether `staging/components/ota/` exists** (not a Kconfig knob).
+   from flash size + app-percent + **whether `staging/components/updater/` exists** (not a Kconfig knob).
 4. **lint**: reject any `idf_component_register(REQUIRES …)` that hand-writes a known straddle
    repo name — cross-straddle deps MUST flow through `${SPANGAP_REQUIRES}`.
-5. `idf.py build` (which drives the browser build).
-6. on a successful plain build, write **`build/flasher.zip`** — `<project>.esptool` (an
+5. `idf.py -B build.<target> build` (which drives the browser build).
+6. on a successful plain build, write **`build.<target>/flasher.zip`** — `<project>.esptool` (an
    esptool argfile: the write_flash flags, then `<offset> <image>` per line) plus every
    image it names (bootloader, partition table, app, data). A self-contained,
    host-independent bundle any flashing tool consumes: `flashmon`, esptool by hand, or
@@ -605,13 +607,26 @@ enumerate the workspace.
 may name one — IDF would write it into `sdkconfig` and then fail its own mismatch
 check. `target: linux` builds the firmware as a host process instead of a chip
 image: step 6 above does not run, because there is nothing to flash, and the
-output is `build/<project>.elf`. That target exists for the simulated testbed —
+output is `build.linux/<project>.elf`. That target exists for the simulated testbed —
 see [`hw-linux`](../../hw-linux/README.md) and `reticulous/sim/`.
 
+**One build dir per target.** Everything a build generates lives in the buildable's
+`esp-idf/build.<target>/`: IDF's build tree, `sdkconfig`, `staging/`, `partitions.csv`,
+`dependencies.lock`, and the web bundle (`web/dist`, laid out as `/fixed` files in
+`web/data`). A chip build and a host build therefore share no generated file, and
+switching between them rebuilds nothing. The one shared directory is
+`managed_components/` — downloaded component sources, the same for every target.
+Two things the web build still writes into its source tree are regenerated from the staged
+set at the start of every build: the rewritten `package.json` (and the `node_modules/` it
+installs) and `src/boot/straddles.gen.ts` + `src/app-icons/`. Sequential builds of different
+targets are therefore correct; two builds of the same buildable must not run at once.
+
 Consumer CMake idiom: `include(${CMAKE_CURRENT_LIST_DIR}/spangap_requires.cmake)` then
-`REQUIRES ${SPANGAP_REQUIRES} …`. The buildable's `main/CMakeLists.txt` reads
-`${CMAKE_CURRENT_LIST_DIR}/../staging/main_requires.cmake` — **`CMAKE_CURRENT_LIST_DIR`,
-not `CMAKE_SOURCE_DIR`** (the latter breaks in IDF's requirements pre-pass).
+`REQUIRES ${SPANGAP_REQUIRES} …`. The buildable's top-level `CMakeLists.txt` finds staging
+at `${CMAKE_BINARY_DIR}/staging` and sets `DEPENDENCIES_LOCK` to
+`${CMAKE_BINARY_DIR}/dependencies.lock` after including `project.cmake`; its
+`main/CMakeLists.txt` reads `<BUILD_DIR>/staging/main_requires.cmake` with `BUILD_DIR` from
+`idf_build_get_property` — the one spelling that holds in IDF's requirements pre-pass.
 
 **Boot registration (don't hand-wire bring-up in `app_main`).** The buildable ships no
 `main.cpp` — `spangap-inside` generates the **entire** entry point into

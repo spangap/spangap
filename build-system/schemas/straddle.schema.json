@@ -85,10 +85,11 @@
       ]
     },
     "target": {
-      "description": "The ESP-IDF target this board straddle builds for. Read from the staged straddle whose repo name starts with 'hw-' and exported as IDF_TARGET around the build. 'linux' builds the firmware as a host process instead of a chip image.",
+      "description": "The ESP-IDF target this board straddle builds for. Read from the staged straddle whose repo name starts with 'hw-' and exported as IDF_TARGET around the build. 'esp32p4' is a chip with no radio of its own, whose Wi-Fi and Bluetooth are a co-processor's reached over ESP-Hosted. 'linux' builds the firmware as a host process instead of a chip image.",
       "type": "string",
       "enum": [
         "esp32s3",
+        "esp32p4",
         "linux"
       ],
       "default": "esp32s3"
@@ -212,7 +213,7 @@
       "default": []
     },
     "kconfig": {
-      "description": "Sdkconfig default lines this straddle contributes to the build — the road by which a NON-buildable straddle (typically a board, e.g. hw-lilygo-tdeck) supplies Kconfig VALUES that another non-buildable straddle's component Kconfig DEFINES (LoRa/SD/LCD pins, etc.). spangap-inside collects every staged straddle's lines into staging/sdkconfig.spangap-fragments, which bootstrap.cmake layers into SDKCONFIG_DEFAULTS between the platform defaults and the buildable's own sdkconfig.defaults. Precedence is the init order: platform band first, then the straddle band in dependency-topo order, then the buildable itself last (the building straddle wins among fragments); the buildable's sdkconfig.defaults and CLI overrides win over all of it. Each item is emitted verbatim as an sdkconfig line, so the RHS (=y, ints, hex, \"quoted strings\") is preserved exactly. The peripheral straddle still owns the option's schema/help/range in its component Kconfig — this only sets the value. Two different straddles setting the same symbol is warned about (silent last-wins otherwise). An item may instead be a `when:`-gated group (when: <org>/<repo>, set: [lines]) whose lines apply only when that straddle is staged in the build — so a board can set a peripheral's Kconfig values (e.g. LoRa/audio pins) without them warning as unknown symbols in a build that omits the consuming straddle.",
+      "description": "Sdkconfig default lines this straddle contributes to the build — the road by which a NON-buildable straddle (typically a board, e.g. hw-lilygo-tdeck) supplies Kconfig VALUES that another non-buildable straddle's component Kconfig DEFINES (LoRa/SD/LCD pins, etc.). spangap-inside collects every staged straddle's lines into staging/sdkconfig.spangap-fragments, which bootstrap.cmake layers into SDKCONFIG_DEFAULTS between the platform defaults and the buildable's own sdkconfig.defaults. Precedence is the init order: platform band first, then the straddle band in dependency-topo order, then the buildable itself last (the building straddle wins among fragments); the buildable's sdkconfig.defaults and CLI overrides win over all of it. Each item is emitted verbatim as an sdkconfig line, so the RHS (=y, ints, hex, \"quoted strings\") is preserved exactly. The peripheral straddle still owns the option's schema/help/range in its component Kconfig — this only sets the value. Two different straddles setting the same symbol is warned about (silent last-wins otherwise). An item may instead be a gated group (when: <org>/<repo> and/or target: <IDF target or list>, set: [lines]) whose lines apply only when every gate it carries holds — `when:` that the straddle is staged in the build, `target:` that the build is for one of those chips — so a board can set a peripheral's Kconfig values (e.g. LoRa/audio pins), and a straddle can set symbols that exist only on some chips, without them warning as unknown symbols in a build that lacks them.",
       "type": "array",
       "items": {
         "oneOf": [
@@ -224,13 +225,27 @@
             "type": "object",
             "additionalProperties": false,
             "required": [
-              "when",
               "set"
+            ],
+            "anyOf": [
+              { "required": ["when"] },
+              { "required": ["target"] }
             ],
             "properties": {
               "when": {
                 "type": "string",
                 "description": "Straddle slug <org>/<repo>; the group's set: lines are applied only when that straddle is staged in the build."
+              },
+              "target": {
+                "description": "IDF target, or a list of them; the group's set: lines are applied only when the build is for one of these chips (the board straddle's `target:`).",
+                "oneOf": [
+                  { "type": "string", "enum": ["esp32s3", "esp32p4", "linux"] },
+                  {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["esp32s3", "esp32p4", "linux"] },
+                    "minItems": 1
+                  }
+                ]
               },
               "set": {
                 "type": "array",

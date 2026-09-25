@@ -2735,10 +2735,17 @@ detect-build)
     case ${1:-} in
         -h|--help)
             printf '%s\n' \
-                "usage: spangap detect-build" \
-                "  Build flashmon/esp-idf (the peripheral detector) in the container." \
-                "  Leaves build/spangap_detect.bin; \`make\` in flashmon/esp-idf stages it."
+                "usage: spangap detect-build [esp32s3|esp32p4]" \
+                "  Build flashmon/esp-idf (the peripheral detector) in the container, for" \
+                "  one chip (default esp32s3). Leaves build/spangap_detect.bin (S3) or" \
+                "  build.<target>/spangap_detect.bin; \`make\` in flashmon/esp-idf stages it."
             exit 0 ;;
+    esac
+    dtarget=${1:-esp32s3}
+    case $dtarget in
+        esp32s3) didf="idf.py set-target esp32s3 build" ;;
+        esp32p4) didf="idf.py -B build.esp32p4 -DSDKCONFIG=build.esp32p4/sdkconfig set-target esp32p4 build" ;;
+        *) die "detect-build: no detector for target '$dtarget' (esp32s3, esp32p4)" ;;
     esac
     espdir="$workspace/flashmon/esp-idf"
     [ -f "$espdir/CMakeLists.txt" ] || die "detect-build: no flashmon/esp-idf in $workspace"
@@ -2746,7 +2753,7 @@ detect-build)
     # bash -lc + explicit export.sh: docker exec skips the image entrypoint that
     # normally activates the IDF env, so idf.py isn't on PATH until we source it.
     docker exec $exec_flags -e SPANGAP_WORKSPACE="$container_ws" --workdir "$cdir" "$container" \
-        bash -lc '. "$IDF_PATH/export.sh" >/dev/null 2>&1; idf.py set-target esp32s3 build'
+        bash -lc '. "$IDF_PATH/export.sh" >/dev/null 2>&1; '"$didf"
     exit $?
     ;;
 build)

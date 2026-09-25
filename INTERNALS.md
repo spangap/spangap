@@ -725,8 +725,10 @@ CFG / POLL remain edge-only.
 
 ## Hardware
 
-ESP32-S3 family, dual-core, 8 MB PSRAM (OPI), 8 MB flash (typical), WiFi.
-No other Espressif chips are currently targeted.
+ESP32-S3 family, dual-core, 8 MB PSRAM (OPI), 8 MB flash (typical), WiFi — and
+the ESP32-P4, which has no radio: its Wi-Fi and Bluetooth are a co-processor's,
+reached over ESP-Hosted (spangap-core `docs/esp32p4.md`). A board straddle's
+`target:` names which.
 
 ## Subsystem deep dives
 

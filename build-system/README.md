@@ -608,7 +608,18 @@ may name one — IDF would write it into `sdkconfig` and then fail its own misma
 check. `target: linux` builds the firmware as a host process instead of a chip
 image: step 6 above does not run, because there is nothing to flash, and the
 output is `build.linux/<project>.elf`. That target exists for the simulated testbed —
-see [`hw-linux`](../../hw-linux/README.md) and `reticulous/sim/`.
+see [`hw-linux`](../../hw-linux/README.md) and [`SIMesh`](../../SIMesh/README.md).
+`target: esp32p4` is a chip with no radio of its own: its Wi-Fi and Bluetooth are a
+co-processor's, reached over ESP-Hosted, and what that changes is spangap-core's
+[`docs/esp32p4.md`](../../spangap-core/docs/esp32p4.md) to state
+([`hw-waveshare-p4-43`](../../hw-waveshare-p4-43/README.md) is the board).
+
+What differs per chip reaches the configuration two ways. IDF layers a file named
+`<defaults>.<target>` straight after any defaults file it is given, so spangap-core's
+`sdkconfig.defaults.spangap.esp32p4` is the platform's P4 policy, applied on no other
+chip. And a `kconfig:` group can carry `target:` (one IDF target or a list) beside or
+instead of `when:`, so a straddle sets symbols that exist only on some chips — a local
+Bluetooth controller's, say — without them warning as unknown everywhere else.
 
 **One build dir per target.** Everything a build generates lives in the buildable's
 `esp-idf/build.<target>/`: IDF's build tree, `sdkconfig`, `staging/`, `partitions.csv`,
@@ -1390,7 +1401,8 @@ superseded per-straddle `CLAUDE.md` files. Four concrete traps when reading them
   "Boot registration" above).
 
 Platform realities not stated elsewhere in this file, but assumed everywhere: target is
-**ESP32-S3 with octal PSRAM (mandatory)**, toolchain is **ESP-IDF 5.5.4** + Node 22.
+**ESP32-S3 with octal PSRAM** or **ESP32-P4 with its in-package hex PSRAM** — PSRAM is
+mandatory either way — and the toolchain is **ESP-IDF 5.5.4** + Node 22.
 The PSRAM/DRAM split is a live firmware hazard — a flash op disables the PSRAM cache, so
 a task on a PSRAM stack that touches LittleFS **crashes**; route all I/O through the
 `fs_*` API (the reason `fs.cpp`'s DRAM worker tasks exist). DMA/WiFi/lwIP need internal

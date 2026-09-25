@@ -1339,8 +1339,8 @@ def collect_kconfig_values(proj: Manifest, deps: list[Manifest]) -> dict[str, st
         if alias:
             out[f"CONFIG_{alias}"] = "y"
     for m in sources:
-        for raw in (_flatten_kconfig(m.kconfig, staged_names) + m.identity_kconfig
-                    + m.app_order_kconfig(staged_names)):
+        for raw in (_flatten_kconfig(m.kconfig, staged_names, proj.idf_target)
+                    + m.identity_kconfig + m.app_order_kconfig(staged_names)):
             line = raw.strip()
             if not _KCONFIG_LINE_RE.match(line) or "=" not in line:
                 continue   # fragment validity is enforced in write_sdkconfig_fragments
@@ -2861,17 +2861,21 @@ def _kconfig_key(line: str) -> str:
     return line.split("=", 1)[0]          # "CONFIG_X=..."
 
 
-def _flatten_kconfig(items: list, staged: set[str] | None = None) -> list[str]:
+def _flatten_kconfig(items: list, staged: set[str] | None = None,
+                     target: str | None = None) -> list[str]:
     """Flatten a straddle's raw `kconfig:` list to plain sdkconfig lines.
 
-    Each item is either a plain `CONFIG_x=y` string or a `when:`-gated group
-    `{when: <org>/<repo>, set: [lines]}`. A group's lines are kept only when
-    `staged` is None (the caller wants every candidate line — the flash-size
-    scan) or its `when` straddle is in `staged`. This mirrors the `when:` gating
+    Each item is either a plain `CONFIG_x=y` string or a gated group
+    `{when: <org>/<repo>, target: <idf target(s)>, set: [lines]}` carrying
+    either gate or both. A group's lines are kept only when each gate it carries
+    holds: its `when` straddle is in `staged`, and the build's `target` is one
+    its `target` names. A caller passing None for either skips that gate (the
+    flash-size scan wants every candidate line). This mirrors the `when:` gating
     hooks use, so a board can declare a peripheral's pins (LoRa/audio) whose
-    CONFIG_* symbols only exist when the consuming straddle is staged, without
-    them warning as unknown symbols in a build that omits it. Plain strings are
-    unconditional.
+    CONFIG_* symbols only exist when the consuming straddle is staged, and a
+    straddle can set symbols that only exist on some chips (a local Bluetooth
+    controller's), without either warning as unknown symbols in a build that
+    lacks them. Plain strings are unconditional.
     """
     out: list[str] = []
     for it in items:
@@ -2879,8 +2883,13 @@ def _flatten_kconfig(items: list, staged: set[str] | None = None) -> list[str]:
             out.append(it)
         elif isinstance(it, dict):
             when = it.get("when")
-            if staged is None or when is None or when in staged:
-                out.extend(it.get("set", []))
+            if staged is not None and when is not None and when not in staged:
+                continue
+            tgt = it.get("target")
+            targets = [tgt] if isinstance(tgt, str) else list(tgt or [])
+            if target is not None and targets and target not in targets:
+                continue
+            out.extend(it.get("set", []))
     return out
 
 
@@ -2931,8 +2940,8 @@ def write_sdkconfig_fragments(proj: Manifest, deps: list[Manifest]) -> None:
         # the app order (app_order: → CONFIG_LCD_LAUNCHER_ORDER). All three ride
         # the same dependency-order precedence, so the built straddle wins its
         # own identity and spangap-core, deepest, loses.
-        lines = (_flatten_kconfig(m.kconfig, staged_names) + m.identity_kconfig
-                 + m.app_order_kconfig(staged_names))
+        lines = (_flatten_kconfig(m.kconfig, staged_names, proj.idf_target)
+                 + m.identity_kconfig + m.app_order_kconfig(staged_names))
         if not lines:
             continue
         clean: list[str] = []
@@ -3293,7 +3302,7 @@ def flash_size_configured(
     staged = {m.name for m in deps} | {proj.name}
     for m in deps + [proj]:
         if any(_FLASHSIZE_SET_RE.match(ln.strip())
-               for ln in _flatten_kconfig(m.kconfig, staged)):
+               for ln in _flatten_kconfig(m.kconfig, staged, proj.idf_target)):
             return True
     for m in deps + [proj]:
         for fname in ("sdkconfig.defaults", "sdkconfig.defaults.spangap"):
@@ -4983,12 +4992,19 @@ def cmd_clean(args: argparse.Namespace) -> int:
 def cmd_detect_build(args: argparse.Namespace) -> int:
     """Build flashmon's peripheral-detection RAM app (flashmon/esp-idf) with
     idf.py. In-container twin of the host `spangap detect-build`, so it works
-    the same however it's reached; leaves build/spangap_detect.bin for
-    flashmon/esp-idf/Makefile to stage into flashmon/flashmon/detect/."""
+    the same however it's reached; leaves build/spangap_detect.bin (the ESP32-S3
+    detector) or build.<target>/spangap_detect.bin for flashmon/esp-idf/Makefile
+    to stage into flashmon/flashmon/detect/. A detector is one chip's RAM image,
+    so each target builds in its own tree."""
     espdir = WORKSPACE / "flashmon" / "esp-idf"
     if not (espdir / "CMakeLists.txt").is_file():
         die(f"detect-build: no flashmon/esp-idf in {WORKSPACE}")
-    return run_idf(["set-target", "esp32s3", "build"], cwd=espdir)
+    target = args.target
+    if target == "esp32s3":
+        return run_idf(["set-target", "esp32s3", "build"], cwd=espdir)
+    bdir = f"build.{target}"
+    return run_idf(["-B", bdir, f"-DSDKCONFIG={bdir}/sdkconfig",
+                    "set-target", target, "build"], cwd=espdir)
 
 
 
@@ -6338,11 +6354,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_mb.set_defaults(func=cmd_make_builds)
 
-    sub.add_parser(
+    p_db = sub.add_parser(
         "detect-build",
         help="build flashmon/esp-idf (the peripheral detector) with idf.py; "
-             "leaves build/spangap_detect.bin for its Makefile to stage",
-    ).set_defaults(func=cmd_detect_build)
+             "leaves build[.<target>]/spangap_detect.bin for its Makefile to stage",
+    )
+    p_db.add_argument("target", nargs="?", default="esp32s3",
+                      choices=["esp32s3", "esp32p4"],
+                      help="the chip the detector runs on (default esp32s3)")
+    p_db.set_defaults(func=cmd_detect_build)
 
     p_mc = sub.add_parser(
         "menuconfig",

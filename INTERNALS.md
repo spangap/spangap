@@ -618,7 +618,8 @@ mymodApplyCron(nullptr, nullptr);
 
 ```cpp
 netRegister(NET_EV_UPSTREAM_UP, [](const char* data) { info("upstream up\n"); });
-// Events: NET_EV_UP, NET_EV_DOWN, NET_EV_UPSTREAM_UP, NET_EV_UPSTREAM_DOWN, NET_EV_CFG_CHANGED, NET_EV_POLL
+// Events: NET_EV_UP, NET_EV_DOWN, NET_EV_UPSTREAM_UP, NET_EV_UPSTREAM_DOWN, NET_EV_CFG_CHANGED, NET_EV_POLL,
+//         NET_EV_PORTS_CHANGED, NET_EV_STA_CONNECTING
 ```
 
 `netRegister()` **level-replays UP edges**: a handler registered for

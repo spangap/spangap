@@ -41,14 +41,7 @@
 #                    --stop stops it in every container of this workspace. The
 #                    alternative to `monitor`, not a companion to it — one of the
 #                    two owns a given board's port.
-#   sim [--dev]      run the simulated testbed in the container and open its
-#                    control page at http://localhost:9011/. One process in
-#                    there is the whole testbed — the ether, the stations, the
-#                    hostname proxy that fronts their web UIs, and the map that
-#                    drives all of it. Runs in the foreground; Ctrl-C stops it,
-#                    which stops everything it started. --dev serves the page
-#                    hot from Vite instead of from its build.
-#   get-deps         git-clone any missing transitive `requires:` siblings
+#   get-deps        git-clone any missing transitive `requires:` siblings
 #                    (uses host github creds; container has none). Also runs
 #                    automatically as part of `build`.
 #   build            same dep-fetch, then forward to spangap-inside.
@@ -417,12 +410,14 @@ DEV_PORT_LAST=9009
 # dev server is one per device — and because the browser has to be sent to it at
 # an address that outlives a container.
 FLASHMON_PORT=${SPANGAP_FLASHMON_PORT:-9010}
-# The simulated testbed's hostname proxy (reticulous/sim/proxy.py), which fronts
-# every simulated station's web UI on one port and routes by `Host:`. Fixed and
+# A port published on TCP and UDP for a simulated testbed run by hand in the
+# container (SIMesh's front with `--bind 0.0.0.0:9011`), which serves its page
+# and every simulated station's web UI on one port and routes by `Host:`. Fixed and
 # published like flashmon's rather than taken from the dev range, for the same
 # reason: a browser is sent there and the address has to outlive a container.
 # Out of the range as well as beside it, so a testbed never costs a `spangap
-# dev` a slot.
+# dev` a slot. SIMesh itself is not a spangap verb: its own launcher,
+# SIMesh/simesh, runs it natively or in its own image on port 8800.
 SIM_PORT=${SPANGAP_SIM_PORT:-9011}
 # flashmon's own repo (see ensure_flashmon): the platform's, like the
 # build-env itself, and cloned beside the project it flashes.
@@ -2009,7 +2004,7 @@ ensure_daemon() {
 # Set by the `flashmon` verb before ensure_container. Only that verb needs the
 # fixed port; for everything else a container without it is perfectly good, and
 # refusing to make one was turning somebody else's stale port into a wall in
-# front of `spangap sim`, `build`, `dev` and `shell`.
+# front of `spangap build`, `dev` and `shell`.
 NEED_FLASHMON_PORT=${NEED_FLASHMON_PORT:-}
 
 container_publishes_dev_port() {
@@ -2342,7 +2337,7 @@ ensure_container() {
     # flashmon's port is fixed and worth insisting on — but only for flashmon.
     # Every other verb gets a container without it rather than no container at
     # all: being unable to serve a page nobody asked for is not a reason to
-    # refuse to build, to open a shell, or to start the testbed.
+    # refuse to build or to open a shell.
     flashmon_publish=(-p "127.0.0.1:$FLASHMON_PORT:$FLASHMON_PORT")
     if ! free_flashmon_port; then
         if [ -n "$NEED_FLASHMON_PORT" ]; then
@@ -3048,77 +3043,9 @@ flashmon)
     exit 0
     ;;
 sim)
-    # The simulated testbed, run out of the container and opened in the OS
-    # browser. One `docker exec` in the FOREGROUND: simd is the testbed, so the
-    # terminal this runs in is the testbed's terminal and Ctrl-C there stops
-    # everything it started. Nothing is left running and there is nothing to
-    # stop afterwards, which is why this needs no `--stop` the way flashmon does.
-    #
-    # The page and every station's web UI are on one published port, $SIM_PORT,
-    # which ensure_container guarantees the way it guarantees flashmon's: the
-    # browser is sent to that address and it has to outlive a container.
-    shift
-    sim_dev=""
-    [ "${1:-}" = "--dev" ] && { sim_dev="--dev"; shift; }
-    ensure_container
-    # Read back rather than assumed — the same check flashmon makes before a
-    # URL is handed to a browser that will remember it.
-    sim_port=$(docker port "$container" "$SIM_PORT/tcp" 2>/dev/null \
-                 | awk -F: 'NR==1 {print $NF; exit}')
-    [ "$sim_port" = "$SIM_PORT" ] \
-        || die "the container publishes the testbed on ${sim_port:-nothing}, not $SIM_PORT"
-    url="http://localhost:$SIM_PORT/"
-    sim_env=()
-    if [ -n "$sim_dev" ]; then
-        # simd keeps $SIM_PORT whatever happens — it is what fronts the
-        # stations, and their URLs must not move because the page is being
-        # worked on. So the dev server takes a port out of the published dev
-        # range instead, and that is the one the browser is sent to.
-        sim_inport=""
-        for p in $(seq "$DEV_PORT" "$DEV_PORT_LAST"); do
-            if docker exec "$container" python3 -c "
-import socket, sys
-s = socket.socket()
-try:
-    s.bind(('0.0.0.0', $p))
-except OSError:
-    sys.exit(1)
-" >/dev/null 2>&1; then
-                sim_inport=$p
-                break
-            fi
-        done
-        [ -n "$sim_inport" ] \
-            || die "no free dev port in the container ($DEV_PORT-$DEV_PORT_LAST all in use)"
-        sim_devport=$(docker port "$container" "$sim_inport/tcp" 2>/dev/null \
-                        | awk -F: 'NR==1 {print $NF; exit}')
-        [ -n "$sim_devport" ] || sim_devport=$sim_inport
-        sim_env=(-e "SPANGAP_SIM_DEV_BIND=$sim_inport")
-        url="http://localhost:$sim_devport/"
-    fi
-    log "starting the testbed; the page is $url"
-    log "stations will be at http://<name>.sim.localhost:$SIM_PORT/"
-    # Open once the page answers rather than after a fixed wait: the first run
-    # in a container builds the Quasar app, which takes a while, and a browser
-    # pointed at a dead port is a reload the person has to do by hand.
-    (
-        for _ in $(seq 1 600); do
-            if curl -fsS -o /dev/null --max-time 2 "$url" 2>/dev/null; then
-                open_url "$url"; exit 0
-            fi
-            sleep 0.3
-        done
-    ) &
-    sim_opener=$!
-    trap 'kill "$sim_opener" 2>/dev/null || true' EXIT INT TERM
-    set +e
-    # shellcheck disable=SC2086
-    docker exec $exec_flags -e SPANGAP_WORKSPACE="$container_ws" \
-        ${sim_env[@]+"${sim_env[@]}"} \
-        --workdir "$container_ws" "$container" spangap sim $sim_dev
-    rc=$?
-    set -e
-    exit "$rc"
+    # Not a spangap verb: SIMesh has its own launcher. Named here only so the
+    # word gets an answer rather than an unknown-command error.
+    die "sim is not a spangap verb: SIMesh runs from its own launcher, \`SIMesh/simesh\` (see SIMesh/README.md)"
     ;;
 dev)
     # Run the project's Quasar dev server inside the container and open it in the

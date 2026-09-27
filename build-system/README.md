@@ -300,9 +300,8 @@ holds it.
 All of that is **this verb's** insistence, not the container's. Every other verb gets
 a container whether 9010 is free or not — made without that mapping, with a line
 saying so — because being unable to serve a page nobody asked for is not a reason to
-refuse to build, to open a shell, or to start the testbed. It used to be a reason, and
-the result was `spangap sim` dying on a port it never touches. `spangap flashmon` is
-then what reclaims the mapping, by recreating the container the way it always did. Running it again when something
+refuse to build or to open a shell. `spangap flashmon` is
+then what reclaims the mapping, by recreating the container. Running it again when something
 is already serving that port opens it rather than starting a second one, for the same
 reason — including when the server is in a container this workspace has replaced but
 not yet removed, which is the usual way that happens. That case costs something: the
@@ -608,7 +607,8 @@ may name one — IDF would write it into `sdkconfig` and then fail its own misma
 check. `target: linux` builds the firmware as a host process instead of a chip
 image: step 6 above does not run, because there is nothing to flash, and the
 output is `build.linux/<project>.elf`. That target exists for the simulated testbed —
-see [`hw-linux`](../../hw-linux/README.md) and [`SIMesh`](../../SIMesh/README.md).
+see [`hw-linux`](../../hw-linux/README.md) and [`SIMesh`](../../SIMesh/README.md), which
+has its own launcher (`SIMesh/simesh`) and is not a spangap verb.
 `target: esp32p4` is a chip with no radio of its own: its Wi-Fi and Bluetooth are a
 co-processor's, reached over ESP-Hosted, and what that changes is spangap-core's
 [`docs/esp32p4.md`](../../spangap-core/docs/esp32p4.md) to state

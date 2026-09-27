@@ -5839,6 +5839,22 @@ def cmd_web(args: argparse.Namespace) -> int:
 #     timestamp    the newest stamp present, for cheap polling: a consumer that
 #                  sees it change re-reads index.html
 #
+# Every link in index.html carries `data-target`: the IDF target the image is
+# for (`esp32s3`, `esp32p4`, `linux`), derived from its entry's invocation the
+# way the build derives it — the board straddle's `target:`. A consumer that
+# flashes chips reads it to leave out what is not a chip image and to refuse a
+# chip the image is not for.
+#
+# **A Linux entry** (`target: linux` and `arch:` in builds.yaml) builds a
+# station that runs as a Linux process rather than a chip image. Its image is a
+# node package instead of a flasher.zip: the ELF, its /fixed tree and a
+# node.yaml describing them, zipped under the same <slug>_<name>_<stamp>.zip
+# name — the entry is named `hw-simesh-<arch>` by convention, so a simulator
+# finds it by that prefix. The ELF is native code linked against the builder's
+# C library, so only a machine of the entry's `arch:` builds it; any other
+# skips the entry, says so, and leaves its image where it was. SIMesh's NODE.md
+# is the package's spec.
+#
 # A catalogue directory holding `.unlisted` still builds and is still reachable
 # by name; it is simply left out of the parent listing.
 #
@@ -5860,12 +5876,22 @@ def cmd_web(args: argparse.Namespace) -> int:
 
 CATALOGUE_CONFIG = "builds.yaml"
 CATALOGUE_UNLISTED = ".unlisted"
+# The architectures a Linux entry can name, spelled as `uname -m` spells them.
+HOST_ARCHES = ("aarch64", "x86_64")
+_ARCH_ALIASES = {"arm64": "aarch64", "amd64": "x86_64"}
 
 
-def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str, str]]:
-    """Return (project, [(name, invocation), …], {name: onboarding}) from a
-    builds.yaml. Keys this doesn't use (a consumer's branding, per-entry photos)
-    are ignored rather than rejected.
+def _builder_arch() -> str:
+    """This machine's architecture, spelled as a Linux entry's `arch:` is."""
+    m = os.uname().machine.lower()
+    return _ARCH_ALIASES.get(m, m)
+
+
+def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str, str],
+                                           dict[str, dict[str, str]]]:
+    """Return (project, [(name, invocation), …], {name: onboarding},
+    {name: {arch, kind}}) from a builds.yaml. Keys this doesn't use (a
+    consumer's branding, per-entry photos) are ignored rather than rejected.
 
     `onboarding:` is the one optional per-entry key that ends up in the listing:
     `device` says this image sets a fresh node up from its own screen, so
@@ -5873,6 +5899,13 @@ def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str,
     written. Anything else (and the absence of the key) means flashmon asks —
     which is the only safe default, since a build that cannot ask for itself and
     is never asked is a node nobody ever set up.
+
+    `target: linux` with `arch:` (one of HOST_ARCHES) marks a Linux entry, whose
+    image is a node package; `kind:` optionally names the station kind its
+    node.yaml declares (default: the built straddle's repo name), and
+    `stands_for:` the hardware the station plays (an `ESP32`, say), which its
+    node.yaml carries for a simulator to show. A chip entry declares none of
+    these: its target is its board's.
     """
     try:
         doc = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -5883,6 +5916,7 @@ def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str,
     project = str(doc.get("project") or "")
     entries: list[tuple[str, str]] = []
     onboarding: dict[str, str] = {}
+    hosts: dict[str, dict[str, str]] = {}
     for n, raw in enumerate(doc.get("builds") or [], 1):
         if not isinstance(raw, dict) or not raw.get("name"):
             die(f"{path}: build #{n} has no name")
@@ -5892,7 +5926,17 @@ def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str,
         entries.append((name, str(raw["invocation"])))
         if raw.get("onboarding"):
             onboarding[name] = str(raw["onboarding"])
-    return project, entries, onboarding
+        if raw.get("target") is not None or raw.get("arch") is not None:
+            if str(raw.get("target")) != "linux":
+                die(f"{path}: build '{name}': `target:` is `linux` or absent — "
+                    f"a chip image's target is its board's")
+            arch = str(raw.get("arch") or "")
+            if arch not in HOST_ARCHES:
+                die(f"{path}: build '{name}': a `target: linux` entry needs "
+                    f"`arch:` ({' or '.join(HOST_ARCHES)})")
+            hosts[name] = {"arch": arch, "kind": str(raw.get("kind") or ""),
+                           "stands_for": str(raw.get("stands_for") or "")}
+    return project, entries, onboarding, hosts
 
 
 def _catalogue_slug(project: str) -> str:
@@ -5944,6 +5988,69 @@ def _prune_older_images(d: Path, entry: str, keep_stamp: str) -> None:
             warn(f"make-builds: could not remove {name}: {exc}")
 
 
+def _entry_target(inv: str, all_straddles: dict[str, Manifest]) -> str | None:
+    """The IDF target an entry's image is for, derived as its build derives it:
+    the buildable, its `--with` straddles and everything they pull in, of which
+    the `hw-` board names the target. None when the buildable is not in the
+    workspace. `--without` is not applied: it never removes the board."""
+    toks = shlex.split(inv)
+    proj = resolve_target_straddle(toks[0], all_straddles) if toks else None
+    if proj is None:
+        return None
+    included: set[str] = set()
+    it = iter(toks[1:])
+    for tok in it:
+        flag, eq, val = tok.partition("=")
+        if flag in ("-w", "--with"):
+            raw = val if eq else next(it, "")
+            if "/" not in raw:
+                raw = next((n for n, m in all_straddles.items() if m.repo == raw), raw)
+            included.add(raw)
+    deps, _ = resolve_requires(proj, all_straddles, missing_ok=True, included=included)
+    return resolve_idf_target(proj, deps)
+
+
+def _libc_version() -> str | None:
+    """The version of the C library this machine links against, or None."""
+    try:
+        return os.confstr("CS_GNU_LIBC_VERSION").split()[-1]
+    except (ValueError, OSError, AttributeError, IndexError):
+        return None
+
+
+def _write_node_package(dest: Path, elf: Path, fixed: Path | None,
+                        node: dict[str, Any]) -> None:
+    """Zip a Linux build into a node package at `dest`: node.yaml, the ELF
+    under its own name (mode 0755 whatever the file's), and the /fixed tree
+    under `fixed/`, every member at the archive's root. Written under a
+    `.part` name and renamed into place, so the catalogue never holds half a
+    package and a listing never names one."""
+    part = dest.with_name(dest.name + ".part")
+    try:
+        with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED) as z:
+            info = zipfile.ZipInfo("node.yaml", time.gmtime()[:6])
+            info.external_attr = 0o100644 << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(info, yaml.safe_dump(node, sort_keys=False, width=1 << 16))
+            info = zipfile.ZipInfo.from_file(elf, elf.name)
+            info.external_attr = 0o100755 << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            with open(elf, "rb") as src, z.open(info, "w") as out:
+                shutil.copyfileobj(src, out, 1 << 20)
+            if fixed is not None:
+                z.write(fixed, "fixed")
+                for top, dirs, files in os.walk(fixed):
+                    dirs.sort()
+                    rel = Path(top).relative_to(fixed)
+                    for name in dirs:
+                        z.write(Path(top) / name, str(Path("fixed") / rel / name))
+                    for name in sorted(files):
+                        z.write(Path(top) / name, str(Path("fixed") / rel / name))
+        part.replace(dest)
+    finally:
+        part.unlink(missing_ok=True)
+
+
 def _fmt_bytes(n: int) -> str:
     for unit, div in (("MB", 1 << 20), ("KB", 1 << 10)):
         if n >= div:
@@ -5972,23 +6079,41 @@ def _listing_page(title: str, rows: list[tuple[str, str, str, str]]) -> str:
             "<ul>\n%s\n</ul>\n" % (title, title, items))
 
 
-def _write_listing(d: Path, project: str, onboarding: dict[str, str]) -> None:
+def _image_is_node_package(path: Path) -> bool:
+    try:
+        with zipfile.ZipFile(path) as z:
+            return "node.yaml" in z.namelist()
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def _write_listing(d: Path, project: str, onboarding: dict[str, str],
+                   targets: dict[str, str | None]) -> None:
     """Rewrite a catalogue's index.html + timestamp from what is on disk, so both
     describe the images actually there — including any a subset run left alone.
 
     `onboarding` maps entry name → the mode declared in builds.yaml, and each
     image whose entry declares one carries it as `data-onboarding` on its link.
-    Derived from the config rather than from the zip, so an entry that changes
-    its answer is re-described by the next run over that catalogue even if the
-    image itself was not rebuilt."""
+    `targets` maps entry name → its derived IDF target, carried as
+    `data-target`. Both come from the config rather than from the zip, so an
+    entry that changes its answer is re-described by the next run over that
+    catalogue even if the image itself was not rebuilt. An image whose entry
+    has no derivable target (it left the config, or its buildable is not in
+    the workspace) is `linux` when it holds a node.yaml and unmarked
+    otherwise."""
     names = _catalogue_zips(d)
     rows = []
     for n in names:
         got = _split_image_name(n)
         mode = onboarding.get(got[0]) if got else None
+        target = targets.get(got[0]) if got else None
+        if target is None and _image_is_node_package(d / n):
+            target = "linux"
+        attrs = (' data-target="%s"' % target if target else "") + \
+                (' data-onboarding="%s"' % mode if mode else "")
         rows.append((n, n,
                      " <small>(%s)</small>" % _fmt_bytes((d / n).stat().st_size),
-                     ' data-onboarding="%s"' % mode if mode else ""))
+                     attrs))
     title = "%s builds — %s" % (project or "spangap", d.name)
     (d / "index.html").write_text(_listing_page(title, rows), encoding="utf-8")
     newest = names[0][:-4].rsplit("_", 1)[-1] if names else ""
@@ -6005,17 +6130,27 @@ def _write_root_listing(root: Path, catalogues: list[Path]) -> None:
 
 
 def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
-                     onboarding: dict[str, str], all_straddles: dict[str, Manifest],
+                     onboarding: dict[str, str], hosts: dict[str, dict[str, str]],
+                     targets: dict[str, str | None], all_straddles: dict[str, Manifest],
                      run_dt: str) -> str | None:
     """Build the selected entries of one catalogue. Returns the name of the entry
     that failed, or None."""
     slug = _catalogue_slug(project)
+    arch = _builder_arch()
     failed = None
     print(f"Catalog: {d.name}", flush=True)
     for name, inv in chosen:
         toks = shlex.split(inv)
+        host = hosts.get(name)
+        if host and host["arch"] != arch:
+            # Native code for another architecture: only a machine of that
+            # architecture builds it, so its image stays exactly as it was.
+            print(f"  {inv} ... skipped: a {host['arch']} build, and this "
+                  f"machine is {arch}", flush=True)
+            continue
         # The invocation leads with the buildable (the pre-flight resolved it);
-        # the build leaves flasher.zip in its firmware dir's build.<target>/.
+        # a chip build leaves flasher.zip in its firmware dir's build.<target>/,
+        # a Linux build its ELF and data_merged/ in build.linux/.
         target = resolve_target_straddle(toks[0], all_straddles)
         assert target is not None
         started = time.time() - 1
@@ -6044,10 +6179,22 @@ def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True,
         )
-        zips = [z for z in target.firmware_dir.glob("build.*/flasher.zip")
-                if z.stat().st_mtime >= started]
-        zip_src = max(zips, key=lambda z: z.stat().st_mtime) if zips else \
-            target.firmware_dir / "build.<target>" / "flasher.zip"
+        if host:
+            # The ELF is named by the build's own description; a build that
+            # exited 0 has just linked it, whatever its mtime says.
+            out_dir = target.firmware_dir / "build.linux"
+            try:
+                elf_name = json.loads((out_dir / "project_description.json")
+                                      .read_text())["app_elf"]
+            except (OSError, json.JSONDecodeError, KeyError):
+                elf_name = f"{target.repo}.elf"
+            zip_src = out_dir / elf_name
+            zips = [zip_src] if zip_src.is_file() else []
+        else:
+            zips = [z for z in target.firmware_dir.glob("build.*/flasher.zip")
+                    if z.stat().st_mtime >= started]
+            zip_src = max(zips, key=lambda z: z.stat().st_mtime) if zips else \
+                target.firmware_dir / "build.<target>" / "flasher.zip"
         if proc.returncode != 0 or not zips:
             # The first failure ends the run: the remaining entries build from the
             # same tree, so whatever broke this one most likely breaks them too,
@@ -6063,14 +6210,34 @@ def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
             failed = name
             break
         zipname = f"{slug}_{name}_{run_dt}.zip"
-        shutil.copyfile(zip_src, d / zipname)
+        if host:
+            fixed = zip_src.parent / "data_merged"
+            node: dict[str, Any] = {
+                "kind": host["kind"] or target.repo,
+                "arch": host["arch"],
+                "stamp": run_dt,
+                "elf": zip_src.name,
+            }
+            if fixed.is_dir():
+                node["fixed"] = "fixed"
+            if host["stands_for"]:
+                node["stands_for"] = host["stands_for"]
+            node.update({"project": project, "catalogue": d.name, "entry": name,
+                         "invocation": inv, "version": target.version})
+            libc = _libc_version()
+            if libc:
+                node["libc"] = libc
+            _write_node_package(d / zipname, zip_src,
+                                fixed if fixed.is_dir() else None, node)
+        else:
+            shutil.copyfile(zip_src, d / zipname)
         sys.stdout.write(" done (%.1f MB)\n" % ((d / zipname).stat().st_size / (1 << 20)))
         sys.stdout.flush()
         # The new image is on disk, so this entry's older ones are superseded.
         # After the copy, never before: a failed build must leave the image that
         # is still the current one exactly where it was.
         _prune_older_images(d, name, run_dt)
-    _write_listing(d, project, onboarding)
+    _write_listing(d, project, onboarding, targets)
     return failed
 
 
@@ -6098,23 +6265,30 @@ def cmd_make_builds(args: argparse.Namespace) -> int:
         root = cwd
     siblings = sorted(p for p in root.iterdir() if (p / CATALOGUE_CONFIG).is_file())
 
+    arch = _builder_arch()
     plan = []
     for d in catalogues:
-        project, entries, onboarding = _catalogue_config(d / CATALOGUE_CONFIG)
+        project, entries, onboarding, hosts = _catalogue_config(d / CATALOGUE_CONFIG)
         if not entries:
             die(f"make-builds: {d / CATALOGUE_CONFIG}: no builds")
         known = {n for n, _ in entries}
         for want in sorted(sel - known):
             die(f"make-builds: no build named '{want}' in {d / CATALOGUE_CONFIG}")
-        plan.append((d, project, [e for e in entries if not sel or e[0] in sel],
-                     onboarding))
+        plan.append((d, project, entries,
+                     [e for e in entries if not sel or e[0] in sel],
+                     onboarding, hosts))
+
+    def native(hosts: dict[str, dict[str, str]], name: str) -> bool:
+        return name not in hosts or hosts[name]["arch"] == arch
 
     if args.invocations:
         # The host dispatcher's shopping list: what this exact run would compile,
-        # so it can clone each invocation's straddles before the run itself.
-        for _, _, chosen, _ in plan:
-            for _, inv in chosen:
-                print(inv)
+        # so it can clone each invocation's straddles before the run itself. A
+        # Linux entry for another architecture is not compiled here.
+        for _, _, _, chosen, _, hosts in plan:
+            for name, inv in chosen:
+                if native(hosts, name):
+                    print(inv)
         return 0
 
     # Pre-flight. Nothing here clones — the host does that, with the credentials
@@ -6122,8 +6296,10 @@ def cmd_make_builds(args: argparse.Namespace) -> int:
     # before it starts, naming what is missing and who wants it.
     all_straddles = scan_workspace_straddles()
     absent: dict[str, list[str]] = {}
-    for d, _, chosen, _ in plan:
+    for d, _, _, chosen, _, hosts in plan:
         for name, inv in chosen:
+            if not native(hosts, name):
+                continue
             toks = shlex.split(inv)
             if not toks or toks[0].startswith("-"):
                 die(f"make-builds: {d.name}/{name}: an entry's invocation must "
@@ -6138,9 +6314,30 @@ def cmd_make_builds(args: argparse.Namespace) -> int:
               "`spangap get-deps` there fetches with the host's git credentials. "
               "This container has none, so it cannot fetch it for you.")
 
+    # Every entry's target, for the listing — the ones this run leaves alone
+    # too, since their links are rewritten with the rest. An entry about to be
+    # built has to agree with what it declares: a Linux build makes a node
+    # package and a chip build a flasher.zip, and the wrong one in the wrong
+    # place is an image nothing can use.
+    targets_of: dict[Path, dict[str, str | None]] = {}
+    for d, _, entries, chosen, _, hosts in plan:
+        derived_of = {name: _entry_target(inv, all_straddles) for name, inv in entries}
+        targets = {**derived_of, **{name: "linux" for name in hosts}}
+        for name, _ in chosen:
+            derived = derived_of[name] if native(hosts, name) else None
+            if name in hosts and derived not in (None, "linux"):
+                die(f"make-builds: {d.name}/{name}: declares `target: linux` but "
+                    f"builds for {derived} — it needs a Linux board (`--with "
+                    f"spangap/hw-linux`)")
+            if name not in hosts and derived == "linux":
+                die(f"make-builds: {d.name}/{name}: builds for linux — give the "
+                    f"entry `target: linux` and `arch:` ({' or '.join(HOST_ARCHES)})")
+        targets_of[d] = targets
+
     failed = None
-    for d, project, chosen, onboarding in plan:
-        failed = _build_catalogue(d, project, chosen, onboarding, all_straddles, run_dt)
+    for d, project, _, chosen, onboarding, hosts in plan:
+        failed = _build_catalogue(d, project, chosen, onboarding, hosts, targets_of[d],
+                                  all_straddles, run_dt)
         if failed:
             break
     _write_root_listing(root, siblings)

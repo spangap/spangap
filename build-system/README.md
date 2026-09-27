@@ -462,6 +462,26 @@ the image that is still the current one stays where it is.
 A catalogue directory holding a **`.unlisted`** file still builds and is still reachable by
 naming it on the flashmon page (`?build=<name>`, or the settings panel's Build selector) — it
 is simply left out of the parent `index.html`.
+
+**Every link in `index.html` carries `data-target`** — `esp32s3`, `esp32p4` or `linux`, the
+target the image is for — derived from the entry's invocation the way its build derives it:
+the board straddle's `target:`. It comes from the config, not the zip, so every image of an
+entry in the config is described whether or not this run rebuilt it. flashmon reads it to
+leave every non-chip image out of what it offers and to refuse a chip the image is not for.
+
+**A Linux entry** — `target: linux` and `arch:` (`aarch64` or `x86_64`) in `builds.yaml`,
+building for the `spangap/hw-linux` board — makes a **node package** instead of copying a
+flasher.zip: `build.linux/<project>.elf`, its `/fixed` tree (`build.linux/data_merged/`, as
+`fixed/`) and a `node.yaml` naming the station kind (`kind:`, default the built straddle's repo
+name), the hardware it plays when the entry says (`stands_for:`, an `ESP32` say), the
+architecture, the stamp and where it came from, zipped under the same
+`<slug>_<entry>_<stamp>.zip` name. The entry is named `hw-simesh-<arch>`, which is how SIMesh
+finds it; SIMesh's [`NODE.md`](../../SIMesh/NODE.md) is the package's spec. The ELF is native
+code dynamically linked against the builder's C library, so only a machine of the entry's
+`arch:` builds it: on any other the run prints `skipped` for it, leaves its image where it
+was, and leaves it out of `--invocations`. An entry whose declared target disagrees with the
+one its invocation derives — `target: linux` without a Linux board, or a Linux board without
+`target: linux` — stops the run before anything is built.
 Catalogues differing only in flavour say so with `--kconfig` in their entries, so they build
 from the same tree with no straddle per combination.
 

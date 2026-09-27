@@ -27,6 +27,7 @@ import socket
 import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 import urllib.parse
@@ -5320,7 +5321,7 @@ def _ensure_workspace_docs() -> None:
 
 
 def cmd_claude(claude_args: list[str]) -> int:
-    """First-run setup (permissions default + workspace docs), install, exec."""
+    """First-run setup (permissions default + workspace docs), install, run."""
     _offer_bypass_permissions()
     _ensure_workspace_docs()
     just_installed = False
@@ -5335,8 +5336,93 @@ def cmd_claude(claude_args: list[str]) -> int:
         die(f"claude still not on PATH after npm install — check {Path.home() / '.npm-global' / 'bin'}")
     if just_installed:
         _verify_fresh_install(claude_path)
-    _exec_claude(claude_path, claude_args)
-    return 1
+    return _run_claude(claude_path, claude_args)
+
+
+# Undoes what a full-screen TUI switches on: mouse reporting (click, drag,
+# any-motion, and the UTF-8/SGR/urxvt encodings), focus events, bracketed paste,
+# the kitty keyboard protocol and xterm modifyOtherKeys, then the alternate
+# screen, a hidden cursor and leftover colours.
+TERMINAL_RESTORE = (
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
+    b"\x1b[?1004l\x1b[?2004l\x1b[<99u\x1b[>4;0m"
+    b"\x1b[?1049l\x1b[?25h\x1b[0m\r\n"
+)
+
+
+def _run_claude(claude_path: str, claude_args: list[str]) -> int:
+    """Run claude as a child and repair the terminal if it dies abnormally.
+
+    A claude that is killed or crashes skips its own teardown, leaving the
+    terminal in raw mode with mouse reporting on, so every click and scroll
+    types escape sequences into the shell. On a nonzero exit or death by signal
+    this writes TERMINAL_RESTORE, then puts back the line discipline saved before
+    the launch — TCSAFLUSH also discards mouse reports already queued as input.
+
+    The parent ignores SIGINT/SIGQUIT (the child owns the keyboard, as under
+    system()), forwards SIGTERM/SIGHUP, and mirrors a job-control stop: claude's
+    ctrl-z stops only claude, and the shell regains the terminal only once this
+    process, the job it is waiting on, stops too."""
+    tty_fd = next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
+    saved = termios.tcgetattr(tty_fd) if tty_fd is not None else None
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        code = 127
+        try:
+            _exec_claude(claude_path, claude_args)
+        except SystemExit as e:
+            code = e.code if isinstance(e.code, int) else 1
+        except OSError as e:
+            sys.stderr.write(f"spangap: cannot run {claude_path}: {e}\n")
+        finally:
+            sys.stderr.flush()
+            os._exit(code)
+
+    def forward(sig, _frame):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+    handlers = {signal.SIGINT: signal.SIG_IGN, signal.SIGQUIT: signal.SIG_IGN,
+                signal.SIGTERM: forward, signal.SIGHUP: forward}
+    previous = {sig: signal.signal(sig, h) for sig, h in handlers.items()}
+    try:
+        while True:
+            _, status = os.waitpid(pid, os.WUNTRACED)
+            if not os.WIFSTOPPED(status):
+                break
+            # By the time we look, a stop signal sent to the whole process group
+            # may already have stopped and resumed us too; stopping again would
+            # cost the user a second `fg`.
+            if _proc_state(pid) == "T":
+                os.kill(os.getpid(), signal.SIGSTOP)
+    finally:
+        for sig, h in previous.items():
+            signal.signal(sig, h)
+
+    if os.WIFSIGNALED(status):
+        code = 128 + os.WTERMSIG(status)
+        sys.stderr.write(f"spangap: claude killed by {signal.Signals(os.WTERMSIG(status)).name}\n")
+    else:
+        code = os.WEXITSTATUS(status)
+    if code != 0 and tty_fd is not None:
+        out_fd = next((fd for fd in (1, 2) if os.isatty(fd)), None)
+        if out_fd is not None:
+            os.write(out_fd, TERMINAL_RESTORE)
+        termios.tcsetattr(tty_fd, termios.TCSAFLUSH, saved)
+    return code
+
+
+def _proc_state(pid: int) -> str:
+    """The one-letter state from /proc/<pid>/stat ("" if the process is gone)."""
+    try:
+        # The command name is parenthesised and may itself contain spaces or ")".
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return ""
 
 
 def _verify_fresh_install(claude_path: str) -> None:

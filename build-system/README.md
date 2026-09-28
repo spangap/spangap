@@ -473,7 +473,8 @@ leave every non-chip image out of what it offers and to refuse a chip the image 
 building for the `spangap/hw-linux` board — makes a **node package** instead of copying a
 flasher.zip: `build.linux/<project>.elf`, its `/fixed` tree (`build.linux/data_merged/`, as
 `fixed/`) and a `node.yaml` naming the station kind (`kind:`, default the built straddle's repo
-name), the hardware it plays when the entry says (`stands_for:`, an `ESP32` say), the
+name), the hardware it plays and the radio chip it drives when the entry says (`virtual_hardware:`,
+an `ESP32` say, and `virtual_radio:`, an `SX1262`), the
 architecture, the stamp and where it came from, zipped under the same
 `<slug>_<entry>_<stamp>.zip` name. The entry is named `hw-simesh-<arch>`, which is how SIMesh
 finds it; SIMesh's [`NODE.md`](../../SIMesh/NODE.md) is the package's spec. The ELF is native

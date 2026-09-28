@@ -5902,8 +5902,9 @@ def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str,
 
     `target: linux` with `arch:` (one of HOST_ARCHES) marks a Linux entry, whose
     image is a node package; `kind:` optionally names the station kind its
-    node.yaml declares (default: the built straddle's repo name), and
-    `stands_for:` the hardware the station plays (an `ESP32`, say), which its
+    node.yaml declares (default: the built straddle's repo name),
+    `virtual_hardware:` the hardware the station plays (an `ESP32`, say), and
+    `virtual_radio:` the radio chip it drives (an `SX1262`, say), which its
     node.yaml carries for a simulator to show. A chip entry declares none of
     these: its target is its board's.
     """
@@ -5935,7 +5936,8 @@ def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str,
                 die(f"{path}: build '{name}': a `target: linux` entry needs "
                     f"`arch:` ({' or '.join(HOST_ARCHES)})")
             hosts[name] = {"arch": arch, "kind": str(raw.get("kind") or ""),
-                           "stands_for": str(raw.get("stands_for") or "")}
+                           "virtual_hardware": str(raw.get("virtual_hardware") or ""),
+                           "virtual_radio": str(raw.get("virtual_radio") or "")}
     return project, entries, onboarding, hosts
 
 
@@ -6220,8 +6222,9 @@ def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
             }
             if fixed.is_dir():
                 node["fixed"] = "fixed"
-            if host["stands_for"]:
-                node["stands_for"] = host["stands_for"]
+            for fact in ("virtual_hardware", "virtual_radio"):
+                if host[fact]:
+                    node[fact] = host[fact]
             node.update({"project": project, "catalogue": d.name, "entry": name,
                          "invocation": inv, "version": target.version})
             libc = _libc_version()

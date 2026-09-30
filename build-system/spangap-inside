@@ -5849,10 +5849,10 @@ def cmd_web(args: argparse.Namespace) -> int:
 # station that runs as a Linux process rather than a chip image. Its image is a
 # node package instead of a flasher.zip: the ELF, its /fixed tree and a
 # node.yaml describing them, zipped under the same <slug>_<name>_<stamp>.zip
-# name — the entry is named `hw-simesh-<arch>` by convention, so a simulator
+# name — the entry is named `hw-sim-mesh-<arch>` by convention, so a simulator
 # finds it by that prefix. The ELF is native code linked against the builder's
 # C library, so only a machine of the entry's `arch:` builds it; any other
-# skips the entry, says so, and leaves its image where it was. SIMesh's NODE.md
+# skips the entry, says so, and leaves its image where it was. sim-mesh's NODE.md
 # is the package's spec.
 #
 # A catalogue directory holding `.unlisted` still builds and is still reachable
@@ -6441,8 +6441,8 @@ def main(argv: list[str] | None = None) -> int:
     if raw and raw[0] == "dev":
         return cmd_dev(raw[1:])
     if raw and raw[0] == "sim":
-        die("sim is not a spangap verb: SIMesh runs from its own launcher, "
-            "`SIMesh/simesh` (see SIMesh/README.md)")
+        die("sim is not a spangap verb: sim-mesh runs from its own launcher, "
+            "`sim-mesh/sim-mesh` (see sim-mesh/README.md)")
 
     p = argparse.ArgumentParser(prog="spangap", description="spangap straddles CLI (in-container)")
     # Bare `spangap` (no subcommand) lists the project + deps + environment —

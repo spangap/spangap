@@ -84,8 +84,8 @@ RUN { \
 
 # Python deps. Two targets:
 #   - System python3 (/usr/bin/python3): runs the in-container CLI; needs pyyaml+jsonschema.
-#     It also runs the simulated testbeds (reticulous/sim/simd.py, SIMesh/testbed/simd.py),
-#     whose HTTP and WebSocket server is aiohttp, and SIMesh's tests, which are pytest.
+#     It also runs the simulated testbeds (reticulous/sim/simd.py, sim-mesh/testbed/simd.py),
+#     whose HTTP and WebSocket server is aiohttp, and sim-mesh's tests, which are pytest.
 #   - IDF Python venv (/opt/esp/python_env/idf5.5_py3.12_env): what `python3` resolves to
 #     once `. $IDF_PATH/export.sh` activates the env. ESP-IDF CMake helpers call
 #     `python3 lcd-icons.py` / `python3 lcd-fonts.py` — those land in the IDF venv, so
@@ -101,7 +101,7 @@ RUN /opt/esp/python_env/idf5.5_py3.12_env/bin/pip install --no-cache-dir \
         pypng \
         lz4
 
-# Rust, for the SIMesh station kind that is written in it (sergey/reticulum).
+# Rust, for the sim-mesh station kind that is written in it (sergey/reticulum).
 # rustup ships no linker; gcc is already in the image. Installed into a shared
 # prefix, the way the IDF venv is shared, because the container runs as
 # `spangap` and cargo writes its registry and git caches under CARGO_HOME.

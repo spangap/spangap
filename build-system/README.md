@@ -476,8 +476,8 @@ flasher.zip: `build.linux/<project>.elf`, its `/fixed` tree (`build.linux/data_m
 name), the hardware it plays and the radio chip it drives when the entry says (`virtual_hardware:`,
 an `ESP32` say, and `virtual_radio:`, an `SX1262`), the
 architecture, the stamp and where it came from, zipped under the same
-`<slug>_<entry>_<stamp>.zip` name. The entry is named `hw-simesh-<arch>`, which is how SIMesh
-finds it; SIMesh's [`NODE.md`](../../SIMesh/NODE.md) is the package's spec. The ELF is native
+`<slug>_<entry>_<stamp>.zip` name. The entry is named `hw-sim-mesh-<arch>`, which is how sim-mesh
+finds it; sim-mesh's [`NODE.md`](../../sim-mesh/NODE.md) is the package's spec. The ELF is native
 code dynamically linked against the builder's C library, so only a machine of the entry's
 `arch:` builds it: on any other the run prints `skipped` for it, leaves its image where it
 was, and leaves it out of `--invocations`. An entry whose declared target disagrees with the
@@ -628,8 +628,8 @@ may name one — IDF would write it into `sdkconfig` and then fail its own misma
 check. `target: linux` builds the firmware as a host process instead of a chip
 image: step 6 above does not run, because there is nothing to flash, and the
 output is `build.linux/<project>.elf`. That target exists for the simulated testbed —
-see [`hw-linux`](../../hw-linux/README.md) and [`SIMesh`](../../SIMesh/README.md), which
-has its own launcher (`SIMesh/simesh`) and is not a spangap verb.
+see [`hw-linux`](../../hw-linux/README.md) and [`sim-mesh`](../../sim-mesh/README.md), which
+has its own launcher (`sim-mesh/sim-mesh`) and is not a spangap verb.
 `target: esp32p4` is a chip with no radio of its own: its Wi-Fi and Bluetooth are a
 co-processor's, reached over ESP-Hosted, and what that changes is spangap-core's
 [`docs/esp32p4.md`](../../spangap-core/docs/esp32p4.md) to state

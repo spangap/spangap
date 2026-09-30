@@ -413,13 +413,13 @@ DEV_PORT_LAST=9009
 # an address that outlives a container.
 FLASHMON_PORT=${SPANGAP_FLASHMON_PORT:-9010}
 # A port published on TCP and UDP for a simulated testbed run by hand in the
-# container (SIMesh's front with `--bind 0.0.0.0:9011`), which serves its page
+# container (sim-mesh's front with `--bind 0.0.0.0:9011`), which serves its page
 # and every simulated station's web UI on one port and routes by `Host:`. Fixed and
 # published like flashmon's rather than taken from the dev range, for the same
 # reason: a browser is sent there and the address has to outlive a container.
 # Out of the range as well as beside it, so a testbed never costs a `spangap
-# dev` a slot. SIMesh itself is not a spangap verb: its own launcher,
-# SIMesh/simesh, runs it natively or in its own image on port 8800.
+# dev` a slot. sim-mesh itself is not a spangap verb: its own launcher,
+# sim-mesh/sim-mesh, runs it natively or in its own image on port 8800.
 SIM_PORT=${SPANGAP_SIM_PORT:-9011}
 # flashmon's own repo (see ensure_flashmon): the platform's, like the
 # build-env itself, and cloned beside the project it flashes.
@@ -1629,7 +1629,7 @@ publish-builds)
             printf -- '- `%s` (%s)\n' "$(basename "$z")" \
                 "$(awk -v b="$(wc -c <"$z")" 'BEGIN{printf "%.1f MB", b/1048576}')"
         done
-        printf '\n%s\n' "Each chip image's zip holds the images and the \`.esptool\` argfile naming their offsets; a \`hw-simesh-<arch>\` zip is a node package (the station ELF, its \`/fixed\` tree and \`node.yaml\`)."
+        printf '\n%s\n' "Each chip image's zip holds the images and the \`.esptool\` argfile naming their offsets; a \`hw-sim-mesh-<arch>\` zip is a node package (the station ELF, its \`/fixed\` tree and \`node.yaml\`)."
     )
 
     if gh release view "$pb_tag" -R "$pb_slug" >/dev/null 2>&1; then
@@ -3045,9 +3045,9 @@ flashmon)
     exit 0
     ;;
 sim)
-    # Not a spangap verb: SIMesh has its own launcher. Named here only so the
+    # Not a spangap verb: sim-mesh has its own launcher. Named here only so the
     # word gets an answer rather than an unknown-command error.
-    die "sim is not a spangap verb: SIMesh runs from its own launcher, \`SIMesh/simesh\` (see SIMesh/README.md)"
+    die "sim is not a spangap verb: sim-mesh runs from its own launcher, \`sim-mesh/sim-mesh\` (see sim-mesh/README.md)"
     ;;
 dev)
     # Run the project's Quasar dev server inside the container and open it in the

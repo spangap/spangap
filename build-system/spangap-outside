@@ -52,8 +52,8 @@
 #                    and rewriting the listing. The run itself is in-container;
 #                    here we clone the straddles its invocations name first,
 #                    since only the host has the git credentials. A `target:
-#                    linux` entry makes a node package, and only on a machine
-#                    of its `arch:`; any other skips it and says so.
+#                    linux` entry makes a node package for its `arch:`,
+#                    cross-compiled when that is not this machine's.
 #   publish-builds [catalogue]
 #                    publish a built catalogue (builds/<catalogue>/) as a
 #                    GitHub release tagged builds-<catalogue>, mirroring the
@@ -295,7 +295,7 @@ remembered_build_includes() {
 first_build_positional() {
     while [ $# -gt 0 ]; do
         case $1 in
-            -w|--with|-x|--without|--flash-size|--kconfig)
+            -w|--with|-x|--without|--flash-size|--kconfig|--arch)
                 shift; [ $# -gt 0 ] && shift ;;
             --) shift; [ $# -gt 0 ] && { printf '%s\n' "$1"; return 0; }; return 1 ;;
             -*) shift ;;

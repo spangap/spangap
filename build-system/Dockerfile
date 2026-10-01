@@ -2,6 +2,8 @@
 #
 # Holds:
 #   - ESP-IDF v5.5.4 (from espressif/idf:v5.5.4, multi-arch incl. arm64)
+#   - the cross g++ for whichever of aarch64 / x86_64 the image is not, with
+#     that architecture's libc, libbsd and zlib (a Linux station for both)
 #   - Node 22 + npm (Quasar/Vite browser build; Claude Code needs >=22)
 #   - cairo + Pillow + cairosvg + pypng + lz4 (LCD launcher-icon rasterizer)
 #   - the in-container `spangap` CLI (Python)
@@ -54,6 +56,42 @@ RUN set -eux; \
         sudo \
         vim-tiny \
         python3-pip; \
+    rm -rf /var/lib/apt/lists/*
+
+# A Linux station (a `target: linux` build) is native code, and a catalogue
+# carries it for both aarch64 and x86_64, so the image cross-compiles for
+# whichever of the two it is not: that architecture's g++, plus the libraries a
+# station links (libc's development files, libbsd, zlib) from its multiarch
+# packages. Ubuntu serves arm64 from ports.ubuntu.com and amd64 from
+# archive/security.ubuntu.com, so the stock sources are pinned to the native
+# architecture and the foreign one gets a sources file of its own.
+RUN set -eux; \
+    native="$(dpkg --print-architecture)"; \
+    case "$native" in \
+        arm64) foreign=amd64; gxx=g++-x86-64-linux-gnu; \
+               main=http://archive.ubuntu.com/ubuntu/; security=http://security.ubuntu.com/ubuntu/ ;; \
+        amd64) foreign=arm64; gxx=g++-aarch64-linux-gnu; \
+               main=http://ports.ubuntu.com/ubuntu-ports/; security=$main ;; \
+        *) echo "no cross toolchain for $native"; exit 1 ;; \
+    esac; \
+    . /etc/os-release; \
+    sed -i "/^Types:/a Architectures: $native" /etc/apt/sources.list.d/ubuntu.sources; \
+    printf '%s\n' \
+        'Types: deb' "URIs: $main" \
+        "Suites: $VERSION_CODENAME $VERSION_CODENAME-updates $VERSION_CODENAME-backports" \
+        'Components: main universe restricted multiverse' "Architectures: $foreign" \
+        'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' '' \
+        'Types: deb' "URIs: $security" "Suites: $VERSION_CODENAME-security" \
+        'Components: main universe restricted multiverse' "Architectures: $foreign" \
+        'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+        > "/etc/apt/sources.list.d/ubuntu-$foreign.sources"; \
+    dpkg --add-architecture "$foreign"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        "$gxx" \
+        "libc6-dev:$foreign" \
+        "libbsd-dev:$foreign" \
+        "zlib1g:$foreign"; \
     rm -rf /var/lib/apt/lists/*
 
 # Passwordless sudo for the `sudo` group. The base image's uid-1000 `ubuntu`

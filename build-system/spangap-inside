@@ -180,6 +180,9 @@ class Manifest:
         # The IDF target this buildable is being built for, set once the staged
         # set is resolved (resolve_idf_target). It picks build_dir.
         self.idf_target = "esp32s3"
+        # A Linux build's architecture when it is not this machine's (`--arch`),
+        # else None. A cross build has a tree of its own: it picks build_dir too.
+        self.cross_arch: str | None = None
 
     @property
     def name(self) -> str: return self.data["name"]
@@ -203,8 +206,10 @@ class Manifest:
     def build_dir(self) -> Path:
         """Everything one target's build writes: IDF's build tree, sdkconfig,
         staging/, partitions.csv, dependencies.lock and the web bundle. One dir
-        per target, so a chip build and a host build share no generated file."""
-        return self.firmware_dir / f"build.{self.idf_target}"
+        per target, so a chip build and a host build share no generated file,
+        and a Linux build for the other architecture is build.linux-<arch>."""
+        suffix = f"-{self.cross_arch}" if self.cross_arch else ""
+        return self.firmware_dir / f"build.{self.idf_target}{suffix}"
     @property
     def staging_dir(self) -> Path:
         return self.build_dir / "staging"
@@ -3197,8 +3202,26 @@ def resolve_idf_target(proj: "Manifest", deps: list["Manifest"]) -> str:
 
 def idf_dir_args(proj: "Manifest") -> list[str]:
     """idf.py's global options that put this target's build tree and sdkconfig
-    in its own build dir."""
-    return ["-B", str(proj.build_dir), "-D", f"SDKCONFIG={proj.build_dir / 'sdkconfig'}"]
+    in its own build dir, and for a cross build the compilers that tree is
+    configured with — the same ones on every run, so idf.py sees no changed
+    cache entry and does not reconfigure."""
+    args = ["-B", str(proj.build_dir), "-D", f"SDKCONFIG={proj.build_dir / 'sdkconfig'}"]
+    if proj.cross_arch:
+        for lang, tool in (("C", "gcc"), ("CXX", "g++"), ("ASM", "gcc")):
+            args += ["-D", f"CMAKE_{lang}_COMPILER={_cross_tool(proj.cross_arch, tool)}"]
+    return args
+
+
+def _cross_tool(arch: str, tool: str) -> str:
+    """The full path of a cross tool for `arch` (`x86_64-linux-gnu-gcc`, say).
+    The build-env image carries the compiler for whichever of HOST_ARCHES it is
+    not, so a missing one means an image older than that."""
+    name = f"{arch}-linux-gnu-{tool}"
+    path = shutil.which(name)
+    if not path:
+        die(f"no {name} in this container: the build-env image carries the "
+            f"cross compiler for the other architecture — rebuild the image")
+    return path
 
 
 def run_build_idf(args: list[str], cwd: Path, quiet: bool, env: dict[str, str] | None = None,
@@ -3928,6 +3951,14 @@ def cmd_build(args: argparse.Namespace) -> int:
 
     idf_target = resolve_idf_target(proj, deps)
     host_build = idf_target == "linux"
+    # --arch is a Linux build's: a chip's architecture is its target's. The
+    # machine's own architecture is the native build, in build.linux.
+    if args.arch:
+        if not host_build:
+            die(f"--arch {args.arch}: only a Linux build (a `target: linux` board) "
+                f"names an architecture, and this one builds for {idf_target}")
+        if args.arch != _builder_arch():
+            proj.cross_arch = args.arch
 
     # Flash size must be set explicitly — IDF's silent 2MB default would mismatch
     # the spangap-generated partition table (8MB fallback). Force the user to pick.
@@ -5850,10 +5881,9 @@ def cmd_web(args: argparse.Namespace) -> int:
 # node package instead of a flasher.zip: the ELF, its /fixed tree and a
 # node.yaml describing them, zipped under the same <slug>_<name>_<stamp>.zip
 # name — the entry is named `hw-sim-mesh-<arch>` by convention, so a simulator
-# finds it by that prefix. The ELF is native code linked against the builder's
-# C library, so only a machine of the entry's `arch:` builds it; any other
-# skips the entry, says so, and leaves its image where it was. sim-mesh's NODE.md
-# is the package's spec.
+# finds it by that prefix. The ELF is native code, built for the entry's
+# `arch:` on any machine: `spangap build --arch` compiles the machine's own
+# architecture natively and the other one with the image's cross compiler.
 #
 # A catalogue directory holding `.unlisted` still builds and is still reachable
 # by name; it is simply left out of the parent listing.
@@ -6144,15 +6174,13 @@ def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
     for name, inv in chosen:
         toks = shlex.split(inv)
         host = hosts.get(name)
-        if host and host["arch"] != arch:
-            # Native code for another architecture: only a machine of that
-            # architecture builds it, so its image stays exactly as it was.
-            print(f"  {inv} ... skipped: a {host['arch']} build, and this "
-                  f"machine is {arch}", flush=True)
-            continue
+        if host:
+            # The entry's architecture is the build's, native or cross.
+            toks += ["--arch", host["arch"]]
         # The invocation leads with the buildable (the pre-flight resolved it);
         # a chip build leaves flasher.zip in its firmware dir's build.<target>/,
-        # a Linux build its ELF and data_merged/ in build.linux/.
+        # a Linux build its ELF and data_merged/ in build.linux/ when it is
+        # native and build.linux-<arch>/ when it is cross.
         target = resolve_target_straddle(toks[0], all_straddles)
         assert target is not None
         started = time.time() - 1
@@ -6184,7 +6212,8 @@ def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
         if host:
             # The ELF is named by the build's own description; a build that
             # exited 0 has just linked it, whatever its mtime says.
-            out_dir = target.firmware_dir / "build.linux"
+            out_dir = target.firmware_dir / (
+                "build.linux" if host["arch"] == arch else f"build.linux-{host['arch']}")
             try:
                 elf_name = json.loads((out_dir / "project_description.json")
                                       .read_text())["app_elf"]
@@ -6268,7 +6297,6 @@ def cmd_make_builds(args: argparse.Namespace) -> int:
         root = cwd
     siblings = sorted(p for p in root.iterdir() if (p / CATALOGUE_CONFIG).is_file())
 
-    arch = _builder_arch()
     plan = []
     for d in catalogues:
         project, entries, onboarding, hosts = _catalogue_config(d / CATALOGUE_CONFIG)
@@ -6281,17 +6309,12 @@ def cmd_make_builds(args: argparse.Namespace) -> int:
                      [e for e in entries if not sel or e[0] in sel],
                      onboarding, hosts))
 
-    def native(hosts: dict[str, dict[str, str]], name: str) -> bool:
-        return name not in hosts or hosts[name]["arch"] == arch
-
     if args.invocations:
         # The host dispatcher's shopping list: what this exact run would compile,
-        # so it can clone each invocation's straddles before the run itself. A
-        # Linux entry for another architecture is not compiled here.
-        for _, _, _, chosen, _, hosts in plan:
-            for name, inv in chosen:
-                if native(hosts, name):
-                    print(inv)
+        # so it can clone each invocation's straddles before the run itself.
+        for _, _, _, chosen, _, _ in plan:
+            for _, inv in chosen:
+                print(inv)
         return 0
 
     # Pre-flight. Nothing here clones — the host does that, with the credentials
@@ -6299,10 +6322,8 @@ def cmd_make_builds(args: argparse.Namespace) -> int:
     # before it starts, naming what is missing and who wants it.
     all_straddles = scan_workspace_straddles()
     absent: dict[str, list[str]] = {}
-    for d, _, _, chosen, _, hosts in plan:
+    for d, _, _, chosen, _, _ in plan:
         for name, inv in chosen:
-            if not native(hosts, name):
-                continue
             toks = shlex.split(inv)
             if not toks or toks[0].startswith("-"):
                 die(f"make-builds: {d.name}/{name}: an entry's invocation must "
@@ -6327,7 +6348,7 @@ def cmd_make_builds(args: argparse.Namespace) -> int:
         derived_of = {name: _entry_target(inv, all_straddles) for name, inv in entries}
         targets = {**derived_of, **{name: "linux" for name in hosts}}
         for name, _ in chosen:
-            derived = derived_of[name] if native(hosts, name) else None
+            derived = derived_of[name]
             if name in hosts and derived not in (None, "linux"):
                 die(f"make-builds: {d.name}/{name}: declares `target: linux` but "
                     f"builds for {derived} — it needs a Linux board (`--with "
@@ -6492,6 +6513,13 @@ def main(argv: list[str] | None = None) -> int:
              "changes, so no clean is needed). This is how a build *flavour* is "
              "expressed — a board's own hardware values belong in its `kconfig:`. "
              "Remembered in .spangap-build alongside --with/--without.",
+    )
+    p_build.add_argument(
+        "--arch", choices=HOST_ARCHES, default=None,
+        help="the architecture a Linux build (a `target: linux` board) compiles "
+             "for. Default: this machine's. The other one is cross-compiled "
+             "into build.linux-<arch>/ with the image's cross compiler. Not "
+             "remembered in .spangap-build.",
     )
     for short, full in _NO_SHORTHANDS.items():
         p_build.add_argument(

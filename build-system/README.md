@@ -471,16 +471,19 @@ leave every non-chip image out of what it offers and to refuse a chip the image 
 
 **A Linux entry** — `target: linux` and `arch:` (`aarch64` or `x86_64`) in `builds.yaml`,
 building for the `spangap/hw-linux` board — makes a **node package** instead of copying a
-flasher.zip: `build.linux/<project>.elf`, its `/fixed` tree (`build.linux/data_merged/`, as
+flasher.zip: `<project>.elf`, its `/fixed` tree (`data_merged/`, as
 `fixed/`) and a `node.yaml` naming the station kind (`kind:`, default the built straddle's repo
 name), the hardware it plays and the radio chip it drives when the entry says (`virtual_hardware:`,
 an `ESP32` say, and `virtual_radio:`, an `SX1262`), the
 architecture, the stamp and where it came from, zipped under the same
-`<slug>_<entry>_<stamp>.zip` name. The entry is named `hw-sim-mesh-<arch>`, which is how sim-mesh
-finds it; sim-mesh's [`NODE.md`](../../sim-mesh/NODE.md) is the package's spec. The ELF is native
-code dynamically linked against the builder's C library, so only a machine of the entry's
-`arch:` builds it: on any other the run prints `skipped` for it, leaves its image where it
-was, and leaves it out of `--invocations`. An entry whose declared target disagrees with the
+`<slug>_<entry>_<stamp>.zip` name. The entry is conventionally named `hw-sim-mesh-<arch>`; the
+package is an input for a simulator, which a project's own script turns into what that simulator
+installs (for sim-mesh, a firmware zip as [its contract](https://sim-mesh.net/contract/) says). The ELF is native
+code, and every machine builds both architectures: the entry's `arch:` reaches the build as
+`spangap build --arch`, so the machine's own architecture builds natively in `build.linux/`
+and the other one is cross-compiled in `build.linux-<arch>/` with the cross `g++` the
+build-env image carries, against that architecture's libc, libbsd and zlib from the image.
+An entry whose declared target disagrees with the
 one its invocation derives — `target: linux` without a Linux board, or a Linux board without
 `target: linux` — stops the run before anything is built.
 Catalogues differing only in flavour say so with `--kconfig` in their entries, so they build
@@ -627,7 +630,9 @@ enumerate the workspace.
 may name one — IDF would write it into `sdkconfig` and then fail its own mismatch
 check. `target: linux` builds the firmware as a host process instead of a chip
 image: step 6 above does not run, because there is nothing to flash, and the
-output is `build.linux/<project>.elf`. That target exists for the simulated testbed —
+output is `build.linux/<project>.elf`. `--arch aarch64|x86_64` names the architecture
+(default: the machine's); the other one is cross-compiled into `build.linux-<arch>/`, a
+tree of its own, with the image's cross compiler. That target exists for the simulated testbed —
 see [`hw-linux`](../../hw-linux/README.md) and [`sim-mesh`](../../sim-mesh/README.md), which
 has its own launcher (`sim-mesh/sim-mesh`) and is not a spangap verb.
 `target: esp32p4` is a chip with no radio of its own: its Wi-Fi and Bluetooth are a

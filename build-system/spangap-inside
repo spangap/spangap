@@ -3898,12 +3898,17 @@ def cmd_build(args: argparse.Namespace) -> int:
         if getattr(args, f"no_{short}", False):
             excluded.add(full)
 
-    # --with → pull additional straddles into the build. Slash-form is
-    # trusted (the host dispatcher pre-clones missing ones); bare-form must
-    # resolve to a workspace straddle.
+    # --with → pull additional straddles into the build. The host dispatcher
+    # clones a missing slash-form one before handing the build in here, so a
+    # named straddle still absent now is a build without it: refused, rather
+    # than dropped like an absent soft dependency.
     included: set[str] = set()
     for raw in (args.include or []):
-        included.add(_resolve_org_repo(raw, all_straddles, "--with"))
+        name = _resolve_org_repo(raw, all_straddles, "--with")
+        if name not in all_straddles:
+            die(f"--with {raw}: not in the workspace (clone it beside the others, or "
+                f"build from the host, which clones what a build names)")
+        included.add(name)
 
     flash_mb = args.flash_size
 

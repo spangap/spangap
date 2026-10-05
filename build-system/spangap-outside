@@ -1285,6 +1285,50 @@ maybe_upgrade_launcher() {
     return 0
 }
 
+# fast_forward_repo NAME REPO UPSTREAM BEHIND: advance REPO's branch, strictly
+# BEHIND commits behind UPSTREAM, to it; one line said, and 0 when it moved.
+#
+# Never over anything you'd have to think about: an unfinished merge, or a
+# local change on a path the incoming commits write. A dirty worktree is not by
+# itself one of those cases: a fast-forward only writes the paths the incoming
+# commits touch, so changes anywhere else survive it untouched, which is what
+# keeps a repo whose build regenerates a tracked file movable at all.
+fast_forward_repo() {
+    local name=$1 repo=$2 upstream=$3 behind=$4 blockers kept=
+    if [ -n "$(git -C "$repo" ls-files --unmerged 2>/dev/null)" ]; then
+        printf '%-24s %s behind, unresolved merge — not fast-forwarded\n' "$name" "$behind"
+        return 1
+    fi
+    # What the incoming commits write, against every path this worktree has
+    # something of its own at: modified tracked files, staged or not, and
+    # untracked ones, which git refuses to write an incoming file over just the
+    # same. Rename detection stays off so a rename contributes both its names;
+    # both sides come from git with the same quoting, so an exact-line match is
+    # the comparison.
+    blockers=$(
+        { git -C "$repo" diff --name-only HEAD
+          git -C "$repo" ls-files --others --exclude-standard
+        } 2>/dev/null | sort -u | grep -Fxf <(
+            git -C "$repo" diff --name-only "HEAD..$upstream" 2>/dev/null) || true
+    )
+    if [ -n "$blockers" ]; then
+        printf '%-24s %s behind, local changes to %s — not fast-forwarded\n' \
+            "$name" "$behind" "$(printf '%s\n' "$blockers" | paste -sd' ' -)"
+        return 1
+    fi
+    # Said on the way out, because a fast-forward that leaves a worktree dirty
+    # looks like one that did nothing until you know the changes were kept.
+    if [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
+        kept=', local changes kept'
+    fi
+    if git -C "$repo" merge --ff-only --quiet "$upstream" >/dev/null 2>&1; then
+        printf '%-24s fast-forwarded %s commit(s) from %s%s\n' "$name" "$behind" "$upstream" "$kept"
+        return 0
+    fi
+    printf '%-24s fast-forward FAILED\n' "$name"
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # Command dispatch (outside).
 # ---------------------------------------------------------------------------
@@ -1320,7 +1364,9 @@ push-all)
                 printf '%s\n' \
                     "usage: spangap push-all [--force] [DIR]" \
                     "  Push every git repo directly under DIR (default: the workspace root)," \
-                    "  creating its GitHub repo first if it doesn't exist yet." \
+                    "  creating its GitHub repo first if it doesn't exist yet. A repo strictly" \
+                    "  behind its origin is fast-forwarded instead (pull-all's rules); one that" \
+                    "  has diverged is reported and left." \
                     "  --force rewrites the remote branch (needed after a history rewrite)." \
                     "  Requires an authenticated \`gh\`; new repos are created PUBLIC."
                 exit 0 ;;
@@ -1348,14 +1394,31 @@ push-all)
         [ -n "$slug" ] || { printf '%-24s cannot parse slug from %s — skipped\n' "$name" "$url"; continue; }
         branch=$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null || echo main)
 
-        # Fast path: nothing new to push if the local tip already equals the
-        # remote-tracking tip that `push -u` maintains. A never-pushed repo has no
-        # tracking ref and falls through to create/push. --force always proceeds.
-        if [ "$force" -eq 0 ]; then
-            rtracking="refs/remotes/origin/$branch"
-            if git -C "$repo" rev-parse --verify -q "$rtracking" >/dev/null 2>&1 &&
-               [ "$(git -C "$repo" rev-parse HEAD)" = "$(git -C "$repo" rev-parse "$rtracking")" ]; then
+        # Against the remote as it is now: a repo pushed before is fetched, and
+        # its branch compared with origin's. Nothing to push when they are equal;
+        # strictly behind (commits pushed from another checkout) it is
+        # fast-forwarded and there is still nothing to push; diverged, it is
+        # said and left, since that takes a rebase, or --force to discard the
+        # remote's side. A never-pushed repo has no tracking ref, and a fetch that
+        # fails leaves the comparison to the push; both fall through to
+        # create/push. --force always proceeds.
+        rtracking="refs/remotes/origin/$branch"
+        if [ "$force" -eq 0 ] &&
+           git -C "$repo" rev-parse --verify -q "$rtracking" >/dev/null 2>&1 &&
+           git -C "$repo" fetch --quiet origin >/dev/null 2>&1; then
+            behind=$(git -C "$repo" rev-list --count "HEAD..$rtracking" 2>/dev/null || echo 0)
+            ahead=$(git -C "$repo" rev-list --count "$rtracking..HEAD" 2>/dev/null || echo 0)
+            if [ "$ahead" -eq 0 ] && [ "$behind" -eq 0 ]; then
                 printf '%-24s up to date — skipped\n' "$name"; continue
+            fi
+            if [ "$ahead" -eq 0 ]; then
+                fast_forward_repo "$name" "$repo" "origin/$branch" "$behind" || true
+                continue
+            fi
+            if [ "$behind" -gt 0 ]; then
+                printf '%-24s diverged (%s ahead, %s behind) — not pushed; rebase, or --force\n' \
+                    "$name" "$ahead" "$behind"
+                continue
             fi
         fi
 
@@ -1392,16 +1455,11 @@ pull-all)
     # in the build container.
     #
     # Fast-forward only, and never over anything you'd have to think about: a
-    # branch that has diverged, a detached HEAD, an unfinished merge and a repo
-    # with no origin are each reported and left alone. So this verb only ever
-    # advances a branch that was strictly behind — the messy cases stay yours to
-    # resolve, with the line saying which repo and why.
-    #
-    # A dirty worktree is not by itself one of those cases. A fast-forward only
-    # writes the paths the incoming commits touch, so the question is whether a
-    # local change sits on one of them; changes anywhere else survive the pull
-    # untouched, which is what keeps a repo whose build regenerates a tracked
-    # file pullable at all.
+    # branch that has diverged, a detached HEAD and a repo with no origin are
+    # each reported and left alone, and so is a branch fast_forward_repo will
+    # not move. So this verb only ever advances a branch that was strictly
+    # behind — the messy cases stay yours to resolve, with the line saying which
+    # repo and why.
     shift
     dir=$workspace
     while [ $# -gt 0 ]; do
@@ -1466,42 +1524,7 @@ pull-all)
             printf '%-24s diverged (%s ahead, %s behind) — not pulled\n' "$name" "$ahead" "$behind"
             continue
         fi
-        if [ -n "$(git -C "$repo" ls-files --unmerged 2>/dev/null)" ]; then
-            printf '%-24s %s behind, unresolved merge — not pulled\n' "$name" "$behind"
-            continue
-        fi
-
-        # The paths a local change would collide with: what the incoming commits
-        # write. Rename detection stays off so a rename contributes both of its
-        # names. Against that, every path this worktree has something of its own
-        # at — modified tracked files, staged or not, and untracked ones, which
-        # git refuses to write an incoming file over just the same. Both sides
-        # come from git with the same quoting, so an exact-line match is the
-        # comparison.
-        blockers=$(
-            { git -C "$repo" diff --name-only HEAD
-              git -C "$repo" ls-files --others --exclude-standard
-            } 2>/dev/null | sort -u | grep -Fxf <(
-                git -C "$repo" diff --name-only "HEAD..$upstream" 2>/dev/null) || true
-        )
-        if [ -n "$blockers" ]; then
-            printf '%-24s %s behind, local changes to %s — not pulled\n' \
-                "$name" "$behind" "$(printf '%s\n' "$blockers" | paste -sd' ' -)"
-            continue
-        fi
-
-        # Said on the way out, because a pull that leaves a worktree dirty looks
-        # like a pull that did nothing until you know the changes were kept.
-        kept=
-        if [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
-            kept=', local changes kept'
-        fi
-
-        if git -C "$repo" merge --ff-only --quiet "$upstream" >/dev/null 2>&1; then
-            printf '%-24s fast-forwarded %s commit(s) from %s%s\n' "$name" "$behind" "$upstream" "$kept"
-        else
-            printf '%-24s fast-forward FAILED\n' "$name"
-        fi
+        fast_forward_repo "$name" "$repo" "$upstream" "$behind" || true
     done
     exit 0
     ;;

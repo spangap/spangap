@@ -107,7 +107,8 @@ device loop is its own section below
 
 **Host-only verbs you can't run from this container:** `monitor`, `probe`, real
 `flash`, `init`, `reset-workspace`, `get-deps` (the cloning side), `push-all`
-(create + push every straddle repo to GitHub), `pull-all` (fast-forward every
+(create + push every straddle repo to GitHub, fast-forwarding instead one that
+is only behind, as `pull-all` would, and leaving a diverged one), `pull-all` (fast-forward every
 straddle repo from GitHub, leaving alone the diverged ones and any whose local
 changes touch a file the incoming commits touch) and
 `publish-builds` (mirror a built catalogue onto a GitHub release) — all three

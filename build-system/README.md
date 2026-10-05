@@ -470,15 +470,21 @@ entry in the config is described whether or not this run rebuilt it. flashmon re
 leave every non-chip image out of what it offers and to refuse a chip the image is not for.
 
 **A Linux entry** — `target: linux` and `arch:` (`aarch64` or `x86_64`) in `builds.yaml`,
-building for the `spangap/hw-linux` board — makes a **node package** instead of copying a
-flasher.zip: `<project>.elf`, its `/fixed` tree (`data_merged/`, as
-`fixed/`) and a `node.yaml` naming the station kind (`kind:`, default the built straddle's repo
-name), the hardware it plays and the radio chip it drives when the entry says (`virtual_hardware:`,
-an `ESP32` say, and `virtual_radio:`, an `SX1262`), the
-architecture, the stamp and where it came from, zipped under the same
-`<slug>_<entry>_<stamp>.zip` name. The entry is conventionally named `hw-sim-mesh-<arch>`; the
-package is an input for a simulator, which a project's own script turns into what that simulator
-installs (for sim-mesh, a firmware zip as [its contract](https://sim-mesh.net/contract/) says). The ELF is native
+building for the `spangap/hw-linux` board — makes a **sim-mesh firmware zip** instead of
+copying a flasher.zip, as [sim-mesh's firmware contract](https://sim-mesh.net/contract/) says,
+under the same `<slug>_<entry>_<stamp>.zip` name, which `sim firmware add` installs as it is:
+`<project>.elf`; its `/fixed` tree (`data_merged/`, as `fixed/`); the driver, the Python file
+the entry's `driver:` names in the built straddle; the shared libraries the ELF needs beyond
+what the contract promises, under `lib/`, from the entry's architecture's multiarch
+directories; and a `node.yaml` in the contract's terms. The entry says the driver's interface
+(`category:`, `reticulum`) and the radio chip the station drives (`virtual_radio:`, an
+`SX1262`, which names the virtual radio it is linked with), and may say the hardware it plays
+(`virtual_hardware:`, an `ESP32-S3`) and the firmware's base (`base:`, by default
+`<repo>-<catalogue>-<radio>`, `reticulous-dev-sx1262`). The firmware is named
+`<base>_<arch>_<stamp>`. The ELF goes in with its debug sections stripped (`strip --strip-debug`
+of the entry's architecture; the symbol table stays, so backtraces still name functions), since
+the DWARF of an optimised build is over nine tenths of the file; `debug_info: true` on the entry
+keeps them. The entry is conventionally named `hw-sim-mesh-<arch>`. The ELF is native
 code, and every machine builds both architectures: the entry's `arch:` reaches the build as
 `spangap build --arch`, so the machine's own architecture builds natively in `build.linux/`
 and the other one is cross-compiled in `build.linux-<arch>/` with the cross `g++` the

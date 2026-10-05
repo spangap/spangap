@@ -5883,10 +5883,14 @@ def cmd_web(args: argparse.Namespace) -> int:
 #
 # **A Linux entry** (`target: linux` and `arch:` in builds.yaml) builds a
 # station that runs as a Linux process rather than a chip image. Its image is a
-# node package instead of a flasher.zip: the ELF, its /fixed tree and a
-# node.yaml describing them, zipped under the same <slug>_<name>_<stamp>.zip
-# name — the entry is named `hw-sim-mesh-<arch>` by convention, so a simulator
-# finds it by that prefix. The ELF is native code, built for the entry's
+# sim-mesh firmware zip instead of a flasher.zip, under the same
+# <slug>_<name>_<stamp>.zip name, which `sim firmware add` installs as it is:
+# the ELF, its /fixed tree, the driver the entry's `driver:` names in the built
+# straddle, the shared libraries the ELF needs beyond what sim-mesh's firmware
+# contract promises (under lib/), and a node.yaml in the contract's terms, the
+# firmware named <base>_<arch>_<stamp>. The ELF goes in without its debug
+# sections unless the entry says `debug_info: true`. The entry is named `hw-sim-mesh-<arch>`
+# by convention. The ELF is native code, built for the entry's
 # `arch:` on any machine: `spangap build --arch` compiles the machine's own
 # architecture natively and the other one with the image's cross compiler.
 #
@@ -5936,12 +5940,15 @@ def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str,
     is never asked is a node nobody ever set up.
 
     `target: linux` with `arch:` (one of HOST_ARCHES) marks a Linux entry, whose
-    image is a node package; `kind:` optionally names the station kind its
-    node.yaml declares (default: the built straddle's repo name),
-    `virtual_hardware:` the hardware the station plays (an `ESP32`, say), and
-    `virtual_radio:` the radio chip it drives (an `SX1262`, say), which its
-    node.yaml carries for a simulator to show. A chip entry declares none of
-    these: its target is its board's.
+    image is a sim-mesh firmware zip. It needs `category:`, the driver
+    interface its station answers (`reticulum`), `driver:`, the path of that
+    driver in the built straddle, and `virtual_radio:`, the radio chip it
+    drives (an `SX1262`, say), whose virtual radio it is linked with;
+    `virtual_hardware:` optionally names the hardware the station plays (an
+    `ESP32-S3`), `base:` the firmware's base (default
+    `<repo>-<catalogue>-<radio>`), and `debug_info: true` keeps the ELF's
+    DWARF sections, which are otherwise stripped. A chip entry declares none
+    of these: its target is its board's.
     """
     try:
         doc = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -5970,9 +5977,15 @@ def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str,
             if arch not in HOST_ARCHES:
                 die(f"{path}: build '{name}': a `target: linux` entry needs "
                     f"`arch:` ({' or '.join(HOST_ARCHES)})")
-            hosts[name] = {"arch": arch, "kind": str(raw.get("kind") or ""),
+            for key in ("category", "driver", "virtual_radio"):
+                if not raw.get(key):
+                    die(f"{path}: build '{name}': a `target: linux` entry needs `{key}:` "
+                        f"(see the Linux entry in `spangap make-builds`'s notes)")
+            hosts[name] = {"arch": arch, "category": str(raw["category"]),
+                           "driver": str(raw["driver"]), "base": str(raw.get("base") or ""),
                            "virtual_hardware": str(raw.get("virtual_hardware") or ""),
-                           "virtual_radio": str(raw.get("virtual_radio") or "")}
+                           "virtual_radio": str(raw["virtual_radio"]),
+                           "debug_info": "yes" if raw.get("debug_info") is True else ""}
     return project, entries, onboarding, hosts
 
 
@@ -6055,25 +6068,80 @@ def _libc_version() -> str | None:
         return None
 
 
-def _write_node_package(dest: Path, elf: Path, fixed: Path | None,
-                        node: dict[str, Any]) -> None:
-    """Zip a Linux build into a node package at `dest`: node.yaml, the ELF
-    under its own name (mode 0755 whatever the file's), and the /fixed tree
-    under `fixed/`, every member at the archive's root. Written under a
-    `.part` name and renamed into place, so the catalogue never holds half a
-    package and a listing never names one."""
+# What sim-mesh's firmware contract promises a station, and the virtual radio
+# it provides: never put in a firmware zip.
+_PROVIDED_LIBS = re.compile(r"^(libc|libm|libdl|librt|libpthread|libstdc\+\+|libgcc_s"
+                            r"|ld-linux.*|libsimradio-.*)\.so")
+_NEEDED = re.compile(r"\(NEEDED\)\s+Shared library: \[(\S+)\]")
+
+
+def _needed_libraries(elf: Path, arch: str) -> list[tuple[str, Path]]:
+    """The shared libraries `elf` loads beyond what the contract promises:
+    [(soname, file)]. Its ELF's NEEDED entries, followed library by library,
+    each found in `arch`'s multiarch directories, which a native build links
+    against and a cross build links against too. None of them found is an
+    error: the station would not start."""
+    dirs = [Path(f"/usr/lib/{arch}-linux-gnu"), Path(f"/lib/{arch}-linux-gnu"),
+            Path(f"/usr/{arch}-linux-gnu/lib")]
+    found: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    todo = [elf]
+    while todo:
+        out = subprocess.run(["readelf", "-d", str(todo.pop())], capture_output=True,
+                             text=True).stdout
+        for soname in _NEEDED.findall(out):
+            if soname in seen or _PROVIDED_LIBS.match(soname):
+                continue
+            seen.add(soname)
+            path = next((d / soname for d in dirs if (d / soname).is_file()), None)
+            if path is None:
+                die(f"{elf} needs {soname}, which is in none of "
+                    f"{', '.join(str(d) for d in dirs)}")
+            found.append((soname, path.resolve()))
+            todo.append(path)
+    return found
+
+
+def _write_firmware_zip(dest: Path, elf: Path, fixed: Path | None, driver: Path,
+                        libs: list[tuple[str, Path]], node: dict[str, Any],
+                        strip_arch: str | None) -> None:
+    """Zip a Linux build into a sim-mesh firmware zip at `dest`: node.yaml,
+    the ELF under its own name (mode 0755 whatever the file's), the driver,
+    the shared libraries under `lib/`, and the /fixed tree under `fixed/`,
+    every member at the archive's root. Written under a `.part` name and
+    renamed into place, so the catalogue never holds half a zip and a listing
+    never names one.
+
+    With `strip_arch`, the ELF goes in without its debug sections, stripped
+    by that architecture's binutils: the DWARF of an optimised build is over
+    nine tenths of the file. The symbol table stays, so a backtrace still
+    names functions."""
     part = dest.with_name(dest.name + ".part")
+    stripped = dest.with_name(dest.name + ".elf.part")
     try:
+        if strip_arch:
+            r = subprocess.run([f"{strip_arch}-linux-gnu-strip", "--strip-debug",
+                                "-o", str(stripped), str(elf)],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                die(f"stripping {elf}: {(r.stderr or r.stdout).strip()}")
+            stripped.chmod(elf.stat().st_mode)
+            elf_src = stripped
+        else:
+            elf_src = elf
         with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED) as z:
             info = zipfile.ZipInfo("node.yaml", time.gmtime()[:6])
             info.external_attr = 0o100644 << 16
             info.compress_type = zipfile.ZIP_DEFLATED
             z.writestr(info, yaml.safe_dump(node, sort_keys=False, width=1 << 16))
-            info = zipfile.ZipInfo.from_file(elf, elf.name)
+            info = zipfile.ZipInfo.from_file(elf_src, elf.name)
             info.external_attr = 0o100755 << 16
             info.compress_type = zipfile.ZIP_DEFLATED
-            with open(elf, "rb") as src, z.open(info, "w") as out:
+            with open(elf_src, "rb") as src, z.open(info, "w") as out:
                 shutil.copyfileobj(src, out, 1 << 20)
+            z.write(driver, driver.name)
+            for soname, path in libs:
+                z.write(path, f"lib/{soname}")
             if fixed is not None:
                 z.write(fixed, "fixed")
                 for top, dirs, files in os.walk(fixed):
@@ -6086,6 +6154,7 @@ def _write_node_package(dest: Path, elf: Path, fixed: Path | None,
         part.replace(dest)
     finally:
         part.unlink(missing_ok=True)
+        stripped.unlink(missing_ok=True)
 
 
 def _fmt_bytes(n: int) -> str:
@@ -6116,7 +6185,7 @@ def _listing_page(title: str, rows: list[tuple[str, str, str, str]]) -> str:
             "<ul>\n%s\n</ul>\n" % (title, title, items))
 
 
-def _image_is_node_package(path: Path) -> bool:
+def _image_is_firmware_zip(path: Path) -> bool:
     try:
         with zipfile.ZipFile(path) as z:
             return "node.yaml" in z.namelist()
@@ -6144,7 +6213,7 @@ def _write_listing(d: Path, project: str, onboarding: dict[str, str],
         got = _split_image_name(n)
         mode = onboarding.get(got[0]) if got else None
         target = targets.get(got[0]) if got else None
-        if target is None and _image_is_node_package(d / n):
+        if target is None and _image_is_firmware_zip(d / n):
             target = "linux"
         attrs = (' data-target="%s"' % target if target else "") + \
                 (' data-onboarding="%s"' % mode if mode else "")
@@ -6247,25 +6316,37 @@ def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
             break
         zipname = f"{slug}_{name}_{run_dt}.zip"
         if host:
+            # A sim-mesh firmware zip, as its contract says: the firmware's
+            # name is <base>_<arch>_<stamp>, which node.yaml carries, so the
+            # image keeps the catalogue's name and installs as it is.
             fixed = zip_src.parent / "data_merged"
+            driver = target.dir / host["driver"]
+            radio = host["virtual_radio"].lower()
+            libs = _needed_libraries(zip_src, host["arch"])
             node: dict[str, Any] = {
-                "kind": host["kind"] or target.repo,
+                "base": host["base"] or f"{target.repo}-{d.name}-{radio}",
                 "arch": host["arch"],
-                "stamp": run_dt,
-                "elf": zip_src.name,
+                "version": run_dt,
+                "category": host["category"],
+                "radio": radio,
+                "title": f"{project or target.repo} {d.name}",
             }
+            if host["virtual_hardware"]:
+                node["hardware"] = host["virtual_hardware"]
+            node.update({"exec": zip_src.name, "driver": driver.name})
             if fixed.is_dir():
                 node["fixed"] = "fixed"
-            for fact in ("virtual_hardware", "virtual_radio"):
-                if host[fact]:
-                    node[fact] = host[fact]
-            node.update({"project": project, "catalogue": d.name, "entry": name,
-                         "invocation": inv, "version": target.version})
+            if libs:
+                node["env"] = {"LD_LIBRARY_PATH": "./lib"}
+            node.update({"built_project": project, "built_catalogue": d.name,
+                         "built_entry": name, "built_invocation": inv,
+                         "built_version": target.version})
             libc = _libc_version()
             if libc:
-                node["libc"] = libc
-            _write_node_package(d / zipname, zip_src,
-                                fixed if fixed.is_dir() else None, node)
+                node["built_libc"] = libc
+            _write_firmware_zip(d / zipname, zip_src, fixed if fixed.is_dir() else None,
+                                driver, libs, node,
+                                None if host["debug_info"] else host["arch"])
         else:
             shutil.copyfile(zip_src, d / zipname)
         sys.stdout.write(" done (%.1f MB)\n" % ((d / zipname).stat().st_size / (1 << 20)))
@@ -6361,6 +6442,13 @@ def cmd_make_builds(args: argparse.Namespace) -> int:
             if name not in hosts and derived == "linux":
                 die(f"make-builds: {d.name}/{name}: builds for linux — give the "
                     f"entry `target: linux` and `arch:` ({' or '.join(HOST_ARCHES)})")
+            if name in hosts:
+                buildable = resolve_target_straddle(shlex.split(dict(chosen)[name])[0],
+                                                    all_straddles)
+                driver = buildable.dir / hosts[name]["driver"]
+                if not driver.is_file():
+                    die(f"make-builds: {d.name}/{name}: no driver at {driver} "
+                        f"(`driver:` is a path in {buildable.name})")
         targets_of[d] = targets
 
     failed = None

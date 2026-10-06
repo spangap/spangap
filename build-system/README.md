@@ -47,6 +47,13 @@ platform — device and browser — as one versioned, dependency-declaring packa
 are **polyrepo** (each its own repo); a build *assembles* a chosen subset into one flat
 tree (see ["What `spangap build` does"](#what-spangap-build-does-under-the-hood)).
 
+Every straddle is a repo, but **not every repo is a straddle**. A workspace also holds
+sub-projects that are nobody's dependency and build into no image — the plans, the
+image catalogues — and they are repos for the same reason anything is: their contents
+are worth a history. What makes a directory a straddle is the `straddle.yaml` at its
+root, and nothing else; the repo-wide verbs below take the whole workspace, which is
+why they say *repo* rather than *straddle*.
+
 ### Where the straddles live
 
 `spangap-inside` scans one container-native root:
@@ -107,10 +114,11 @@ device loop is its own section below
 
 **Host-only verbs you can't run from this container:** `monitor`, `probe`, real
 `flash`, `init`, `reset-workspace`, `get-deps` (the cloning side), `push-all`
-(create + push every straddle repo to GitHub, fast-forwarding instead one that
-is only behind, as `pull-all` would, and leaving a diverged one), `pull-all` (fast-forward every
-straddle repo from GitHub, leaving alone the diverged ones and any whose local
-changes touch a file the incoming commits touch) and
+(create + push every repo in the workspace to GitHub — every repo, not only the
+straddles — fast-forwarding instead one that is only behind, as `pull-all` would,
+and leaving a diverged one), `pull-all` (fast-forward every one of them from
+GitHub, leaving alone the diverged ones and any whose local changes touch a file
+the incoming commits touch) and
 `publish-builds` (mirror a built catalogue onto a GitHub release) — all three
 run `gh`/`git` with the host's credentials, never in the container —
 `detect-build` (build flashmon's `esp-idf/` peripheral

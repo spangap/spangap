@@ -225,7 +225,8 @@ ensure_venv() {
 # are not hashed (the Dockerfile forces them on COPY).
 buildsys_hash() {
     local ctx=$1
-    ( cd "$ctx" && find build-system -type f | LC_ALL=C sort | xargs sha256sum ) \
+    ( cd "$ctx" && find build-system -type f -not -path '*/__pycache__/*' \
+        | LC_ALL=C sort | xargs sha256sum ) \
         | sha256sum | awk '{print $1}'
 }
 
@@ -2007,6 +2008,38 @@ announce_container_setup() {
     SPANGAP_SETUP_ANNOUNCED=1
 }
 
+# build_progress: stdin is `docker build` output (BuildKit plain progress, or
+# the legacy builder's "Step n/m"), stdout is one line per Dockerfile step that
+# actually runs, plus apt's download totals and the wall time of any step over
+# 5s. Cached steps print nothing, so a cache-hit rebuild stays near-silent. A
+# step's title is held until its next line, which is what says CACHED or not.
+# POSIX awk only (macOS ships BSD awk).
+build_progress() {
+    awk -v pfx="$PFX" '
+        function title(s) {
+            gsub(/[ \t]+/, " ", s)
+            if (length(s) > 76) s = substr(s, 1, 73) "..."
+            return s
+        }
+        function emit(s) { print pfx ":   " s; fflush() }
+        /^#[0-9]+ \[[0-9]+\/[0-9]+\] / {
+            id = $1; sub(/^#[0-9]+ /, ""); pend[id] = title($0); next
+        }
+        /^Step [0-9]+\/[0-9]+ : / {
+            id = "legacy"; sub(/^Step /, ""); pend[id] = "[" title($0); sub(/ : /, "] ", pend[id]); next
+        }
+        /^#[0-9]+ CACHED/ || /^ ---> Using cache/ { delete pend[$1]; delete pend["legacy"]; next }
+        {
+            id = ($0 ~ /^#[0-9]+ /) ? $1 : "legacy"
+            if (id in pend) { emit(pend[id]); delete pend[id]; shown[id] = 1 }
+        }
+        /^#[0-9]+ DONE [0-9.]+s/ && ($1 in shown) && $3 + 0 >= 5 { emit("  done in " $3) }
+        /Need to get [0-9.,]+ [kMG]B/ || /Fetched [0-9.,]+ [kMG]B in/ {
+            s = $0; sub(/^#[0-9]+ [0-9.]+ /, "", s); emit("  " s)
+        }
+    '
+}
+
 ensure_daemon() {
     docker info >/dev/null 2>&1 && return 0
     if ! command -v docker >/dev/null 2>&1; then
@@ -2278,13 +2311,18 @@ ensure_container() {
             || die "can't build $IMAGE: no Dockerfile at $ctx/build-system/Dockerfile"
         announce_container_setup
         if [ -n "$SPANGAP_QUIET" ]; then
-            # Quiet build: capture the output to a temp log and only surface it
-            # if the build fails (dump the whole thing in place, then drop the
-            # temp file), so a one-off failure is debuggable without -v.
+            # Quiet build: the full output goes to a temp log, surfaced only if
+            # the build fails (dumped in place, then the temp file dropped), so
+            # a one-off failure is debuggable without -v. The terminal gets one
+            # line per step that runs (build_progress); BUILDKIT_PROGRESS=plain
+            # makes BuildKit emit the line-oriented form that filter reads, and
+            # the legacy builder ignores it.
             local build_log="$workspace/.spangap-build-$(uname -s)-$(uname -m).log"
-            if ! docker build -t "$IMAGE" \
+            log "building image $IMAGE"
+            if ! BUILDKIT_PROGRESS=plain docker build -t "$IMAGE" \
                     --build-arg "BUILDSYS_HASH=$local_hash" \
-                    -f "$ctx/build-system/Dockerfile" "$ctx" >"$build_log" 2>&1; then
+                    -f "$ctx/build-system/Dockerfile" "$ctx" 2>&1 \
+                    | tee "$build_log" | build_progress >&2; then
                 cat "$build_log" >&2
                 rm -f "$build_log"
                 die "docker build failed"

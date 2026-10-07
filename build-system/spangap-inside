@@ -5893,6 +5893,10 @@ def cmd_web(args: argparse.Namespace) -> int:
 # by convention. The ELF is native code, built for the entry's
 # `arch:` on any machine: `spangap build --arch` compiles the machine's own
 # architecture natively and the other one with the image's cross compiler.
+# `post:` names a script in the built straddle that is run with the image's
+# path once the image is in: whatever it writes beside the image as
+# <slug>_<name>+<label>_<stamp>.zip, under the image's stamp, belongs to the
+# catalogue, and supersedes the entry's older `+` images.
 #
 # A catalogue directory holding `.unlisted` still builds and is still reachable
 # by name; it is simply left out of the parent listing.
@@ -5947,8 +5951,9 @@ def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str,
     `virtual_hardware:` optionally names the hardware the station plays (an
     `ESP32-S3`), `base:` the firmware's base (default
     `<repo>-<catalogue>-<radio>`), and `debug_info: true` keeps the ELF's
-    DWARF sections, which are otherwise stripped. A chip entry declares none
-    of these: its target is its board's.
+    DWARF sections, which are otherwise stripped, and `post:` a script's path
+    in the built straddle that is run on the finished image. A chip entry
+    declares none of these: its target is its board's.
     """
     try:
         doc = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -5985,7 +5990,8 @@ def _catalogue_config(path: Path) -> tuple[str, list[tuple[str, str]], dict[str,
                            "driver": str(raw["driver"]), "base": str(raw.get("base") or ""),
                            "virtual_hardware": str(raw.get("virtual_hardware") or ""),
                            "virtual_radio": str(raw["virtual_radio"]),
-                           "debug_info": "yes" if raw.get("debug_info") is True else ""}
+                           "debug_info": "yes" if raw.get("debug_info") is True else "",
+                           "post": str(raw.get("post") or "")}
     return project, entries, onboarding, hosts
 
 
@@ -6355,6 +6361,24 @@ def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
         # After the copy, never before: a failed build must leave the image that
         # is still the current one exactly where it was.
         _prune_older_images(d, name, run_dt)
+        if host and host["post"]:
+            script = target.dir / host["post"]
+            proc = subprocess.run([str(script), str(d / zipname)], cwd=d, env=env,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True)
+            if proc.returncode != 0:
+                sys.stderr.write(proc.stdout or "")
+                sys.stderr.write(f"spangap: make-builds: {name}: `post:` {script} "
+                                 f"exited {proc.returncode}\n")
+                failed = name
+                break
+            for made in sorted(p.name for p in d.iterdir()):
+                got = _split_image_name(made)
+                if got and got[0].startswith(name + "+"):
+                    if got[1] == run_dt:
+                        print(f"    {made}", flush=True)
+                    elif got[1] < run_dt:
+                        (d / made).unlink(missing_ok=True)
     _write_listing(d, project, onboarding, targets)
     return failed
 
@@ -6449,6 +6473,10 @@ def cmd_make_builds(args: argparse.Namespace) -> int:
                 if not driver.is_file():
                     die(f"make-builds: {d.name}/{name}: no driver at {driver} "
                         f"(`driver:` is a path in {buildable.name})")
+                post = buildable.dir / hosts[name]["post"]
+                if hosts[name]["post"] and not os.access(post, os.X_OK):
+                    die(f"make-builds: {d.name}/{name}: no executable at {post} "
+                        f"(`post:` is a path in {buildable.name})")
         targets_of[d] = targets
 
     failed = None

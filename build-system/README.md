@@ -129,6 +129,10 @@ container lifecycle. There is **no `docker` and no `esptool.py`** in here by des
   firmware build (`npm install` only if `node_modules` is missing, then `npx quasar build`).
 - `python3` (system) has `pyyaml` + `jsonschema`; the IDF venv has Pillow/cairosvg/pypng/lz4
   for the LCD icon rasterizer. `git` is present.
+- `gh` (GitHub's CLI) is on PATH, for pull requests, forks and releases from in
+  here. Its login is the container's own (`gh auth login` inside, kept in
+  `~/.config/gh` under the persistent home mount), separate from the host's;
+  the host-only verbs above keep using the host's.
 
 ### `install-reticulum` — the reference Reticulum stack
 
@@ -490,6 +494,12 @@ code, and every machine builds both architectures: the entry's `arch:` reaches t
 `spangap build --arch`, so the machine's own architecture builds natively in `build.linux/`
 and the other one is cross-compiled in `build.linux-<arch>/` with the cross `g++` the
 build-env image carries, against that architecture's libc, libbsd and zlib from the image.
+`post:` on the entry names an executable in the built straddle, run in the catalogue directory
+with the image's path once the image is in, and with the build's `SPANGAP_BUILD_*` environment:
+the zips it writes beside the image as `<slug>_<entry>+<label>_<stamp>.zip`, under the image's
+stamp, are part of the catalogue and supersede the entry's older `+` images. It is how a
+firmware zip is also published repackaged — under another station, say — without being built
+again. A `post:` that exits non-zero ends the run as a failed build does.
 An entry whose declared target disagrees with the
 one its invocation derives — `target: linux` without a Linux board, or a Linux board without
 `target: linux` — stops the run before anything is built.

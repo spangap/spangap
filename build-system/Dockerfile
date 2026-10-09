@@ -5,6 +5,7 @@
 #   - the cross g++ for whichever of aarch64 / x86_64 the image is not, with
 #     that architecture's libc, libbsd and zlib (a Linux station for both)
 #   - Node 22 + npm (Quasar/Vite browser build; Claude Code needs >=22)
+#   - gh, GitHub's CLI (pull requests, releases, forks from inside)
 #   - cairo + Pillow + cairosvg + pypng + lz4 (LCD launcher-icon rasterizer)
 #   - the in-container `spangap` CLI (Python)
 #
@@ -33,6 +34,20 @@ RUN set -eux; \
         > /etc/apt/sources.list.d/nodesource.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends nodejs; \
+    rm -rf /var/lib/apt/lists/*
+
+# gh, GitHub's CLI, from GitHub's own apt repository (Ubuntu's is far behind):
+# pull requests, releases and forks are made from inside the container. Pinned
+# to the native architecture, since a foreign one is added below for the cross
+# toolchain. Its login lives in ~/.config/gh, under the persistent home mount.
+RUN set -eux; \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg; \
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gh; \
     rm -rf /var/lib/apt/lists/*
 
 # Cairo runtime + handy tools. python3-pip because the base image installs

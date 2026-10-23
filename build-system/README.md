@@ -90,7 +90,7 @@ container these verbs work directly, with the IDF env already set up:
 | `spangap flashmon [--nodes] [--stop]` | serve flashmon + the image catalogues on the container's published port, and take the console of every browser tab that connects (see below). Runs in the foreground; the host `spangap flashmon` starts it and prints the URL |
 | `spangap flash` | **signal only** — touches `.spangap-flashme` (workspace root) and waits ≤5s for a host monitor to consume it (see below) |
 | `spangap reset` | **signal only** — touches `.spangap-resetme` (workspace root) and waits ≤5s for a host monitor to consume it; the monitor restarts with a device reset (clean reboot + boot-log capture), no reflash |
-| `spangap make-builds [entry…]` | build the image catalogue described by the `builds.yaml` in the cwd (or every catalogue below it), stamp every image of the run with one datetime, rewrite `index.html` + `timestamp`. Every straddle it compiles must already be in the workspace — cloning is the host's (see below) |
+| `spangap make-builds [-j N] [entry…]` | build the image catalogue described by the `builds.yaml` in the cwd (or every catalogue below it), N images at a time, stamp every image of the run with one datetime, rewrite `index.html` + `timestamp`. Every straddle it compiles must already be in the workspace — cloning is the host's (see below) |
 | `spangap log [-f] [-n node]` | print the device serial log. From a running `spangap flashmon` when there is one (every attached node at once, each line tagged, or one with `-n`), else from the host monitor's relay (`host.docker.internal:2324`) — never by reading `.spangap-log`, which is stale inside the container (a plain `cat`/`tail` — and even `O_DIRECT` — freeze; see below); `-f` follows like `tail -f` and survives flash/reset truncations |
 
 **`spangap flash` / `spangap reset` / `spangap cli` from in here don't touch hardware
@@ -324,14 +324,17 @@ container of this workspace — then a re-run moves it across.
 
 That URL serves **flashmon** and
 the **image catalogues** — the same two trees a deployment serves, at the same two
-paths — and every flashmon tab loaded from it connects back over a WebSocket and
+paths. The catalogues are the current project's: `/builds` is the workspace's
+`<project>-builds/`, named from the `project:` key of the straddle being built
+(`project: Reticulous` → `reticulous-builds/`), re-read whenever the build target
+changes. Every flashmon tab loaded from it connects back over a WebSocket and
 registers the node it is holding. From then on this container can read that node's
 console and run commands on it, with no host-side monitor and no serial port of its
 own.
 
 It is also the whole of getting started, which is why it does two things beyond
 serving: it **clones flashmon** if the workspace hasn't got it, and it **seeds
-`builds/local/builds.yaml`** if there is no such catalogue — from the URL the project
+`<project>-builds/local/builds.yaml`** if there is no such catalogue — from the URL the project
 straddle's `catalogue_seed:` names (its own published catalogue, so the entries are
 the boards it really builds for), falling back to flashmon's shipped template.
 Seeded once and never reconciled: from then on the file is the user's.
@@ -339,7 +342,7 @@ Seeded once and never reconciled: from then on the file is the user's.
 `local` is what a locally served page offers, and it **stays** on it — a board flashed
 from some other catalogue does not move a local page, because that catalogue is the
 one being built a few metres away. A tab opened there also starts with **auto-flash
-on**. So the loop is one command: `spangap make-builds` in `builds/local`, and every
+on**. So the loop is one command: `spangap make-builds` in `<project>-builds/local`, and every
 attached board takes the new image by itself. (Both are defaults of the page, not of
 the server: `?build=<catalogue>` and the settings panel still win, and unticking
 auto-flash is remembered.)
@@ -427,7 +430,7 @@ no compile: run it after changing a `browser_register:`/`settings:` block or the
 set, and the running dev server reloads on the generated file. A full `spangap build` is
 needed only when the firmware half has to change too.
 
-**`spangap make-builds`** builds an image catalogue: run it in a `builds/<catalogue>/`
+**`spangap make-builds`** builds an image catalogue: run it in a `<project>-builds/<catalogue>/`
 directory holding a `builds.yaml` (or in the tree above them, for all of them). Every image
 of one run shares one datetime stamp, and it rewrites the `index.html` + `timestamp` that
 flashmon reads. Each image is a `spangap build`, run from in here like any other. Each is
@@ -446,18 +449,28 @@ stops before building anything, and names the straddle together with the catalog
 that want it — clone it from the host (`spangap build <org>/<repo>`, `spangap get-deps`) and
 re-run.
 
-**A clean run prints nothing but its report** — one `Catalog:` line per catalogue and one
-indented line per image, with each build's output (and the toolchain's under it) captured
-rather than streamed:
+**Images build side by side.** `-j N` builds up to N at once (default: one per CPU the
+container sees), across every catalogue the run covers. Each entry builds in a tree of its
+own, `<firmware>/build.<catalogue>.<entry>/`, which also holds the mirror of the project dir
+it compiles from — ESP-IDF's component manager keeps `managed_components/` in the project
+dir and deletes whatever the current build does not use, so a shared one would be pulled
+out from under the builds beside it. Only the SPA takes turns: it compiles in the
+buildable's own `web-interface/`, so spangap-core's `browser-build.sh` holds a lock on that
+dir while it lays in the build's generated files and runs `deploy.sh`. A tree per entry also
+makes the next run of that entry incremental. Afterwards `.spangap-build` names the run's
+last entry, so a bare `spangap build` repeats it.
+
+**A clean run prints nothing but its report** — one line per image as it finishes, with each
+build's output (and the toolchain's under it) captured rather than streamed:
 
 ```
-Catalog: stable
-  reticulous/reticulous --with spangap/hw-lilygo-tdeck --kconfig CONFIG_LORA_NO_SUPE=y ... done (3.4 MB)
+make-builds: 16 image(s), 8 at a time
+  stable/hw-heltecv4-r2: spangap/spangap-demo --with spangap/hw-heltecv4-r2 done (1.4 MB, 2m34s)
 ```
 
-On a failure that suppression lifts — the failing build's captured output is printed in
-full, the run stops there, the listing is still rewritten from what is on disk, and the exit
-status is non-zero.
+On a failure that suppression lifts — nothing new starts, the builds already running
+finish, the failing builds' captured output is printed in full at the end, the listing is
+still rewritten from what is on disk, and the exit status is non-zero.
 
 **`spangap make-builds <entry> [<entry>…]`** — inside one catalogue — builds only those
 entries. The listing is still rewritten, from **what is on disk**: the boards you didn't

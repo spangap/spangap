@@ -57,7 +57,11 @@
       "items": { "type": "string", "pattern": "^[^,\"]+$" }
     },
     "catalogue_seed": {
-      "description": "Where `spangap flashmon` fetches the starting content of this workspace's `builds/local/builds.yaml` from, on the first run that finds none: a URL (or a workspace-relative path) to a published builds.yaml, normally this project's own deployed catalogue. It is a starting point and nothing more — the file is copied once and is the user's from then on, never re-fetched or reconciled. Only read from the BUILT straddle's own straddle.yaml, and only as a one-line scalar, since the host tooling reads it with a plain sed.",
+      "description": "Where `spangap flashmon` fetches the starting content of this project's `<project>-builds/local/builds.yaml` (see `project`) from, on the first run that finds none: a URL (or a workspace-relative path) to a published builds.yaml, normally this project's own deployed catalogue. It is a starting point and nothing more — the file is copied once and is the user's from then on, never re-fetched or reconciled. Only read from the BUILT straddle's own straddle.yaml, and only as a one-line scalar, since the host tooling reads it with a plain sed.",
+      "type": "string"
+    },
+    "project": {
+      "description": "The project this buildable's images are published under, as a proper name (e.g. 'Reticulous'). Its slug (lowercased, every run of other characters a '-') names the workspace directory holding the project's image catalogues, <slug>-builds/ (reticulous-builds/), and that directory is what `spangap flashmon` serves as /builds while this is the straddle being built. Without it, the repo name is the slug. Only read from the BUILT straddle's own straddle.yaml, and only as a one-line scalar, since the host tooling reads it with a plain sed.",
       "type": "string"
     },
     "firmware": {

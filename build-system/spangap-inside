@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+import concurrent.futures
 import errno
 import hashlib
 import http.server
@@ -183,6 +184,10 @@ class Manifest:
         # A Linux build's architecture when it is not this machine's (`--arch`),
         # else None. A cross build has a tree of its own: it picks build_dir too.
         self.cross_arch: str | None = None
+        # A catalogue entry's build (`make-builds` sets SPANGAP_BUILD_VARIANT,
+        # <catalogue>.<entry>), else None. It replaces build_dir and project_dir
+        # wholesale, so entries built side by side share no generated file.
+        self.variant: str | None = None
 
     @property
     def name(self) -> str: return self.data["name"]
@@ -207,9 +212,26 @@ class Manifest:
         """Everything one target's build writes: IDF's build tree, sdkconfig,
         staging/, partitions.csv, dependencies.lock and the web bundle. One dir
         per target, so a chip build and a host build share no generated file,
-        and a Linux build for the other architecture is build.linux-<arch>."""
+        and a Linux build for the other architecture is build.linux-<arch>.
+        A variant build is build.<variant> whatever its target, and holds the
+        project mirror it compiles from as well (see project_dir)."""
+        if self.variant:
+            return self.firmware_dir / f"build.{self.variant}"
         suffix = f"-{self.cross_arch}" if self.cross_arch else ""
         return self.firmware_dir / f"build.{self.idf_target}{suffix}"
+    @property
+    def project_dir(self) -> Path:
+        """The ESP-IDF project dir idf.py runs in. Normally the firmware dir
+        itself; for a variant build, a mirror of the straddle inside its build
+        dir (mirror_project), because ESP-IDF's component manager keeps
+        managed_components/ in the project dir and deletes from it whatever the
+        current build does not use — out from under any other build compiling
+        from it."""
+        if not self.variant:
+            return self.firmware_dir
+        if self.firmware_dir == self.dir:
+            return self.build_dir / "project"
+        return self.build_dir / "project" / self.firmware_dir.name
     @property
     def staging_dir(self) -> Path:
         return self.build_dir / "staging"
@@ -426,6 +448,38 @@ def write_remembered_build(
     for line in (kconfig or []):
         parts += ["--kconfig", line]     # order-preserving: later lines win
     SPANGAP_BUILD_FILE.write_text(shlex.join(parts) + "\n")
+
+
+def builds_dir_of(proj: Manifest) -> Path:
+    """The workspace directory holding a buildable's image catalogues:
+    <slug>-builds, the slug of its `project:` (its repo name without one)."""
+    return WORKSPACE / f"{_catalogue_slug(str(proj.data.get('project') or proj.repo))}-builds"
+
+
+_builds_dir_cache: tuple[str, Path] | None = None
+
+
+def current_builds_dir() -> Path:
+    """builds_dir_of the remembered build target (.spangap-build) — the project
+    being worked on. Re-resolved whenever that file changes. With no remembered
+    target, a workspace holding a single <x>-builds dir has that one."""
+    global _builds_dir_cache
+    try:
+        line = SPANGAP_BUILD_FILE.read_text().strip()
+    except OSError:
+        line = ""
+    if _builds_dir_cache and _builds_dir_cache[0] == line:
+        return _builds_dir_cache[1]
+    proj = None
+    if line:
+        proj = resolve_target_straddle(shlex.split(line)[0], scan_workspace_straddles())
+    if proj is not None:
+        found = builds_dir_of(proj)
+    else:
+        dirs = sorted(WORKSPACE.glob("*-builds"))
+        found = dirs[0] if len(dirs) == 1 else WORKSPACE / "no-project-builds"
+    _builds_dir_cache = (line, found)
+    return found
 
 
 def straddle_at_or_above(start: Path) -> Path | None:
@@ -2656,7 +2710,7 @@ def _browser_pkg_name(m: Manifest) -> str:
     return name
 
 
-def stage_web_icons(proj: Manifest, deps: list[Manifest]) -> None:
+def stage_web_icons(proj: Manifest, deps: list[Manifest], root: Path) -> None:
     """Surface every staged straddle's launcher SVGs to the web build, parallel
     to how spangap_lcd_icons() collects them for the firmware. Each straddle's
     assets/lcd-icons/*.svg (at the straddle root or under its firmware half) is
@@ -2671,7 +2725,7 @@ def stage_web_icons(proj: Manifest, deps: list[Manifest]) -> None:
     dropped straddle's icon disappears."""
     if not proj.has_browser:
         return
-    out = proj.browser_dir / "src" / "app-icons"
+    out = root / "src" / "app-icons"
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -2701,10 +2755,14 @@ def effective_app_order(proj: Manifest, deps: list[Manifest]) -> list[str]:
     return order
 
 
-def write_browser_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
+def write_browser_dispatch(proj: Manifest, deps: list[Manifest],
+                           root: Path | None = None) -> None:
     """The browser-half parallel to write_init_dispatch. For a buildable with a
     browser half, collect every staged straddle's browser_register: hooks (same
-    init_order as the firmware dispatcher) and:
+    init_order as the firmware dispatcher) and write the files below into
+    `root`, laid out as in <browser> — <browser> itself by default. A build
+    passes a dir in its build tree instead, and spangap-core's browser-build.sh
+    lays them into <browser> under a lock just before the SPA builds:
 
       1. generate <browser>/src/boot/straddles.gen.ts — a default-export
          registerStraddles() that imports each hook's symbol from its straddle's
@@ -2726,6 +2784,8 @@ def write_browser_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
     """
     if not proj.has_browser:
         return
+    if root is None:
+        root = proj.browser_dir
 
     ordered = init_order(deps) + [proj]
     staged_names = {m.name for m in ordered}
@@ -2827,11 +2887,11 @@ def write_browser_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
         f"{gen_call}"
         "}\n"
     )
-    boot_dir = proj.browser_dir / "src" / "boot"
+    boot_dir = root / "src" / "boot"
     boot_dir.mkdir(parents=True, exist_ok=True)
     (boot_dir / "straddles.gen.ts").write_text(body)
 
-    stage_web_icons(proj, deps)
+    stage_web_icons(proj, deps, root)
 
     # Inject/refresh the file: deps so the imports resolve. A spangap-managed
     # straddle dep is recognised by its self-referential value
@@ -2853,8 +2913,9 @@ def write_browser_dispatch(proj: Manifest, deps: list[Manifest]) -> None:
     # rest of the file's key order; only this block is normalised).
     manifest["dependencies"] = dict(sorted(deps_obj.items()))
     new_text = json.dumps(manifest, indent=2) + "\n"
-    if new_text != pkg_path.read_text():
-        pkg_path.write_text(new_text)
+    out_pkg = root / "package.json"
+    if not out_pkg.is_file() or new_text != out_pkg.read_text():
+        out_pkg.write_text(new_text)
 
 
 _KCONFIG_LINE_RE = re.compile(r"^(CONFIG_[A-Z0-9_]+=.+|# CONFIG_[A-Z0-9_]+ is not set)$")
@@ -3047,7 +3108,7 @@ def stage_components(proj: Manifest, deps: list[Manifest], log_staged: bool = Tr
     write_presence_component(staging, deps)
     write_main_requires(proj, staged_repos, proj_svc_extra)
     write_init_dispatch(proj, deps)
-    write_browser_dispatch(proj, deps)
+    write_browser_dispatch(proj, deps, proj.build_dir / "web-src")
     write_sdkconfig_fragments(proj, deps)
     return staging
 
@@ -3210,6 +3271,45 @@ def idf_dir_args(proj: "Manifest") -> list[str]:
         for lang, tool in (("C", "gcc"), ("CXX", "g++"), ("ASM", "gcc")):
             args += ["-D", f"CMAKE_{lang}_COMPILER={_cross_tool(proj.cross_arch, tool)}"]
     return args
+
+
+_MIRROR_SKIP_FW = {"managed_components", "sdkconfig", "sdkconfig.old", "dependencies.lock"}
+
+
+def _mirror_entries(src: Path, dst: Path, skip) -> None:
+    """Make dst hold one symlink per entry of src that skip(name) passes over,
+    dropping symlinks whose entry is gone or skipped. dst's real files and dirs
+    are left alone."""
+    dst.mkdir(parents=True, exist_ok=True)
+    want = {e.name: e for e in src.iterdir() if not skip(e.name)}
+    for link in dst.iterdir():
+        if link.is_symlink() and (link.name not in want
+                                  or Path(os.readlink(link)) != want[link.name]):
+            link.unlink()
+    for name, entry in want.items():
+        link = dst / name
+        if not link.is_symlink() and not link.exists():
+            link.symlink_to(entry)
+
+
+def mirror_project(proj: "Manifest") -> None:
+    """Lay out a variant build's project dir: the straddle's top level and its
+    firmware dir as symlinks, except the firmware dir itself (a real dir, so
+    managed_components/ is this build's own), straddle.yaml (a lookup upward
+    from the build must find the real one), and build output."""
+    if not proj.variant:
+        return
+    fw = proj.firmware_dir
+    if fw != proj.dir:
+        _mirror_entries(proj.dir, proj.project_dir.parent,
+                        lambda n: n in (fw.name, ".git", "straddle.yaml"))
+    _mirror_entries(fw, proj.project_dir,
+                    lambda n: n.startswith("build") or n in _MIRROR_SKIP_FW
+                    or n in (".git", "straddle.yaml"))
+
+
+def _variant_name(catalogue: str, entry: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", f"{catalogue}.{entry}")
 
 
 def _cross_tool(arch: str, tool: str) -> str:
@@ -3862,7 +3962,9 @@ def cmd_heal(args: argparse.Namespace) -> int:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    heal_truncated_packs()   # repair any virtiofs-truncated packs before we build
+    variant = os.environ.get("SPANGAP_BUILD_VARIANT") or None
+    if not variant:          # make-builds heals once for all of its entries
+        heal_truncated_packs()   # repair any virtiofs-truncated packs before we build
     all_straddles = scan_workspace_straddles()
 
     # Optional leading positional target: `spangap build <straddle> [idf args…]`.
@@ -3889,6 +3991,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         source = "cwd" if straddle_at_or_above(Path.cwd()) else "remembered"
     if not proj.has_firmware:
         die(f"{proj.name}: firmware dir {proj.firmware_dir} has no CMakeLists.txt")
+    proj.variant = variant
 
     # --without (with --no-X shorthands) → drop from staged set.
     excluded: set[str] = set()
@@ -3933,8 +4036,11 @@ def cmd_build(args: argparse.Namespace) -> int:
         args.include or args.exclude or flash_mb is not None or kconfig
         or any(getattr(args, f"no_{s}", False) for s in _NO_SHORTHANDS)
     )
-    persist = not (source == "remembered" and not has_selection)
-    if not persist:
+    replay = source == "remembered" and not has_selection
+    # A variant build is one of many running at once; make-builds records the
+    # run's last entry itself when they are done.
+    persist = not replay and not proj.variant
+    if replay:
         rb = remembered_build()
         if rb is not None:
             r_inc, r_exc, r_flash, r_kconfig = parse_selection(rb[1])
@@ -4023,8 +4129,9 @@ def cmd_build(args: argparse.Namespace) -> int:
     # run so it's on disk when project_include.cmake's configure step picks it up
     # (spangap_create_factory_image guards on its existence).
     write_build_manifest(proj, deps, build_env["SPANGAP_BUILD_ARGS"])
+    mirror_project(proj)
     rc = run_build_idf(
-        [*idf_dir_args(proj), *(idf_args or ["build"])], cwd=proj.firmware_dir,
+        [*idf_dir_args(proj), *(idf_args or ["build"])], cwd=proj.project_dir,
         quiet=quiet, env=build_env, preview=host_build,
     )
     # On a successful plain build, shrink-wrap `fixed` to the measured data size.
@@ -4050,7 +4157,7 @@ def cmd_build(args: argparse.Namespace) -> int:
                       "once" % frc, file=sys.stderr)
                 (build_dir / "partitions.csv").touch()
                 rc = run_build_idf([*idf_dir_args(proj), *(idf_args or ["build"])],
-                                   cwd=proj.firmware_dir, quiet=quiet, env=build_env)
+                                   cwd=proj.project_dir, quiet=quiet, env=build_env)
         if rc == 0:
             print_partition_layout(build_dir / "partitions.csv")
             write_flasher_zip(build_dir)
@@ -4633,7 +4740,7 @@ class _HubHandler(http.server.BaseHTTPRequestHandler):
         if path == "/log":
             return self._log(q)
         for prefix, root in (("/flashmon", WORKSPACE / "flashmon" / "flashmon"),
-                             ("/builds", WORKSPACE / "builds")):
+                             ("/builds", current_builds_dir())):
             if path == prefix or path.startswith(prefix + "/"):
                 return self._static(root, prefix, path)
         self._text(404, "not found\n")
@@ -4641,7 +4748,9 @@ class _HubHandler(http.server.BaseHTTPRequestHandler):
     # -- static ------------------------------------------------------------
     # flashmon and the catalogues, at the two paths a deployment serves them at:
     # the page reaches its images at the relative ../builds/, so these two have
-    # to be siblings here as they are there.
+    # to be siblings here as they are there. /builds is the catalogues of the
+    # project being built (current_builds_dir), as a deployment's is its own
+    # project's.
     def _static(self, root: Path, prefix: str, path: str) -> None:
         try:
             rel = urllib.parse.unquote(path[len(prefix):]).lstrip("/")
@@ -5207,7 +5316,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         print(
             "  spangap flash: nothing to signal — the browser tabs holding "
             "these boards flash them from the catalogue, so `spangap "
-            "make-builds` in builds/<catalogue> is the whole of it"
+            "make-builds` in <project>-builds/<catalogue> is the whole of it"
         )
     else:
         print(
@@ -6241,146 +6350,132 @@ def _write_root_listing(root: Path, catalogues: list[Path]) -> None:
     (root / "index.html").write_text(_listing_page("builds", rows), encoding="utf-8")
 
 
-def _build_catalogue(d: Path, project: str, chosen: list[tuple[str, str]],
-                     onboarding: dict[str, str], hosts: dict[str, dict[str, str]],
-                     targets: dict[str, str | None], all_straddles: dict[str, Manifest],
-                     run_dt: str) -> str | None:
-    """Build the selected entries of one catalogue. Returns the name of the entry
-    that failed, or None."""
+def _build_entry(d: Path, project: str, name: str, inv: str,
+                 hosts: dict[str, dict[str, str]], all_straddles: dict[str, Manifest],
+                 run_dt: str) -> tuple[bool, str]:
+    """Build one catalogue entry and put its image in the catalogue. Returns
+    (ok, report): the line to print for it, followed on failure by the build's
+    output. Entries run side by side, each in its own build dir (its variant,
+    <catalogue>.<entry>), so nothing here touches another entry's files."""
     slug = _catalogue_slug(project)
-    arch = _builder_arch()
-    failed = None
-    print(f"Catalog: {d.name}", flush=True)
-    for name, inv in chosen:
-        toks = shlex.split(inv)
-        host = hosts.get(name)
-        if host:
-            # The entry's architecture is the build's, native or cross.
-            toks += ["--arch", host["arch"]]
-        # The invocation leads with the buildable (the pre-flight resolved it);
-        # a chip build leaves flasher.zip in its firmware dir's build.<target>/,
-        # a Linux build its ELF and data_merged/ in build.linux/ when it is
-        # native and build.linux-<arch>/ when it is cross.
-        target = resolve_target_straddle(toks[0], all_straddles)
-        assert target is not None
-        started = time.time() - 1
-        sys.stdout.write(f"  {inv} ...")
-        sys.stdout.flush()
-        # This entry's name is the image's distribution identity: free-format, and
-        # separate from the sortable stamp because the two answer different
-        # questions — which image this is, versus whether something newer exists.
-        # The build bakes it in; the device reports it back as sys.build.dist.
-        #
-        # The catalogue's own directory name (`stable`, `dev`, …) goes in beside
-        # it: it is the channel the image was published on, which flashmon needs
-        # to know before any stamp comparison means anything — the newest image
-        # in `stable` is not newer than a `dev` image that happens to sort below
-        # it. The device reports it back as sys.build.catalogue.
-        env = {**os.environ,
-               "SPANGAP_BUILD_DATETIME": run_dt,
-               "SPANGAP_BUILD_DIST": name,
-               "SPANGAP_BUILD_CATALOGUE": d.name}
-        # The `spangap` wrapper rather than this file, so each image is compiled
-        # by exactly the command an operator would type, with the IDF environment
-        # set up the way every other build gets it. Output is captured, not
-        # streamed: a clean run says nothing beyond the line above.
-        proc = subprocess.run(
-            ["spangap", "build", *toks], cwd=WORKSPACE, env=env,
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True,
-        )
-        if host:
-            # The ELF is named by the build's own description; a build that
-            # exited 0 has just linked it, whatever its mtime says.
-            out_dir = target.firmware_dir / (
-                "build.linux" if host["arch"] == arch else f"build.linux-{host['arch']}")
-            try:
-                elf_name = json.loads((out_dir / "project_description.json")
-                                      .read_text())["app_elf"]
-            except (OSError, json.JSONDecodeError, KeyError):
-                elf_name = f"{target.repo}.elf"
-            zip_src = out_dir / elf_name
-            zips = [zip_src] if zip_src.is_file() else []
-        else:
-            zips = [z for z in target.firmware_dir.glob("build.*/flasher.zip")
-                    if z.stat().st_mtime >= started]
-            zip_src = max(zips, key=lambda z: z.stat().st_mtime) if zips else \
-                target.firmware_dir / "build.<target>" / "flasher.zip"
-        if proc.returncode != 0 or not zips:
-            # The first failure ends the run: the remaining entries build from the
-            # same tree, so whatever broke this one most likely breaks them too,
-            # and stopping here leaves the error at the end of the output. The
-            # suppression lifts with it — a build nobody can see fail is worse
-            # than a noisy one.
-            sys.stdout.write(" FAILED\n")
-            sys.stdout.flush()
-            sys.stderr.write(proc.stdout or "")
-            reason = (f"exited {proc.returncode}" if proc.returncode
-                      else f"left no {zip_src}")
-            sys.stderr.write(f"spangap: make-builds: `spangap build {inv}` {reason}\n")
-            failed = name
-            break
-        zipname = f"{slug}_{name}_{run_dt}.zip"
-        if host:
-            # A sim-mesh firmware zip, as its contract says: the firmware's
-            # name is <base>_<arch>_<stamp>, which node.yaml carries, so the
-            # image keeps the catalogue's name and installs as it is.
-            fixed = zip_src.parent / "data_merged"
-            driver = target.dir / host["driver"]
-            radio = host["virtual_radio"].lower()
-            libs = _needed_libraries(zip_src, host["arch"])
-            node: dict[str, Any] = {
-                "base": host["base"] or f"{target.repo}-{d.name}-{radio}",
-                "arch": host["arch"],
-                "version": run_dt,
-                "category": host["category"],
-                "radio": radio,
-                "title": f"{project or target.repo} {d.name}",
-            }
-            if host["virtual_hardware"]:
-                node["hardware"] = host["virtual_hardware"]
-            node.update({"exec": zip_src.name, "driver": driver.name})
-            if fixed.is_dir():
-                node["fixed"] = "fixed"
-            if libs:
-                node["env"] = {"LD_LIBRARY_PATH": "./lib"}
-            node.update({"built_project": project, "built_catalogue": d.name,
-                         "built_entry": name, "built_invocation": inv,
-                         "built_version": target.version})
-            libc = _libc_version()
-            if libc:
-                node["built_libc"] = libc
-            _write_firmware_zip(d / zipname, zip_src, fixed if fixed.is_dir() else None,
-                                driver, libs, node,
-                                None if host["debug_info"] else host["arch"])
-        else:
-            shutil.copyfile(zip_src, d / zipname)
-        sys.stdout.write(" done (%.1f MB)\n" % ((d / zipname).stat().st_size / (1 << 20)))
-        sys.stdout.flush()
-        # The new image is on disk, so this entry's older ones are superseded.
-        # After the copy, never before: a failed build must leave the image that
-        # is still the current one exactly where it was.
-        _prune_older_images(d, name, run_dt)
-        if host and host["post"]:
-            script = target.dir / host["post"]
-            proc = subprocess.run([str(script), str(d / zipname)], cwd=d, env=env,
-                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT, text=True)
-            if proc.returncode != 0:
-                sys.stderr.write(proc.stdout or "")
-                sys.stderr.write(f"spangap: make-builds: {name}: `post:` {script} "
-                                 f"exited {proc.returncode}\n")
-                failed = name
-                break
-            for made in sorted(p.name for p in d.iterdir()):
-                got = _split_image_name(made)
-                if got and got[0].startswith(name + "+"):
-                    if got[1] == run_dt:
-                        print(f"    {made}", flush=True)
-                    elif got[1] < run_dt:
-                        (d / made).unlink(missing_ok=True)
-    _write_listing(d, project, onboarding, targets)
-    return failed
+    toks = shlex.split(inv)
+    host = hosts.get(name)
+    if host:
+        # The entry's architecture is the build's, native or cross.
+        toks += ["--arch", host["arch"]]
+    # The invocation leads with the buildable (the pre-flight resolved it).
+    target = resolve_target_straddle(toks[0], all_straddles)
+    assert target is not None
+    variant = _variant_name(d.name, name)
+    out_dir = target.firmware_dir / f"build.{variant}"
+    started = time.time()
+    head = f"  {d.name}/{name}: {inv}"
+
+    def took() -> str:
+        s = int(time.time() - started)
+        return f"{s // 60}m{s % 60:02d}s"
+
+    # This entry's name is the image's distribution identity: free-format, and
+    # separate from the sortable stamp because the two answer different
+    # questions — which image this is, versus whether something newer exists.
+    # The build bakes it in; the device reports it back as sys.build.dist.
+    #
+    # The catalogue's own directory name (`stable`, `dev`, …) goes in beside
+    # it: it is the channel the image was published on, which flashmon needs
+    # to know before any stamp comparison means anything — the newest image
+    # in `stable` is not newer than a `dev` image that happens to sort below
+    # it. The device reports it back as sys.build.catalogue.
+    env = {**os.environ,
+           "SPANGAP_BUILD_DATETIME": run_dt,
+           "SPANGAP_BUILD_DIST": name,
+           "SPANGAP_BUILD_CATALOGUE": d.name,
+           "SPANGAP_BUILD_VARIANT": variant}
+    # The `spangap` wrapper rather than this file, so each image is compiled
+    # by exactly the command an operator would type, with the IDF environment
+    # set up the way every other build gets it. Output is captured, not
+    # streamed: a clean run says nothing beyond its one line.
+    proc = subprocess.run(
+        ["spangap", "build", *toks], cwd=WORKSPACE, env=env,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True,
+    )
+    if host:
+        # The ELF is named by the build's own description; a build that
+        # exited 0 has just linked it, whatever its mtime says.
+        try:
+            elf_name = json.loads((out_dir / "project_description.json")
+                                  .read_text())["app_elf"]
+        except (OSError, json.JSONDecodeError, KeyError):
+            elf_name = f"{target.repo}.elf"
+        zip_src = out_dir / elf_name
+    else:
+        zip_src = out_dir / "flasher.zip"
+    if proc.returncode != 0 or not zip_src.is_file() or \
+            (not host and zip_src.stat().st_mtime < started - 1):
+        # The suppression lifts with a failure — a build nobody can see fail
+        # is worse than a noisy one.
+        reason = (f"exited {proc.returncode}" if proc.returncode
+                  else f"left no new {zip_src}")
+        return False, (f"{head} FAILED ({took()})\n{proc.stdout or ''}"
+                       f"spangap: make-builds: `spangap build {inv}` {reason}\n")
+    zipname = f"{slug}_{name}_{run_dt}.zip"
+    if host:
+        # A sim-mesh firmware zip, as its contract says: the firmware's
+        # name is <base>_<arch>_<stamp>, which node.yaml carries, so the
+        # image keeps the catalogue's name and installs as it is.
+        fixed = zip_src.parent / "data_merged"
+        driver = target.dir / host["driver"]
+        radio = host["virtual_radio"].lower()
+        libs = _needed_libraries(zip_src, host["arch"])
+        node: dict[str, Any] = {
+            "base": host["base"] or f"{target.repo}-{d.name}-{radio}",
+            "arch": host["arch"],
+            "version": run_dt,
+            "category": host["category"],
+            "radio": radio,
+            "title": f"{project or target.repo} {d.name}",
+        }
+        if host["virtual_hardware"]:
+            node["hardware"] = host["virtual_hardware"]
+        node.update({"exec": zip_src.name, "driver": driver.name})
+        if fixed.is_dir():
+            node["fixed"] = "fixed"
+        if libs:
+            node["env"] = {"LD_LIBRARY_PATH": "./lib"}
+        node.update({"built_project": project, "built_catalogue": d.name,
+                     "built_entry": name, "built_invocation": inv,
+                     "built_version": target.version})
+        libc = _libc_version()
+        if libc:
+            node["built_libc"] = libc
+        _write_firmware_zip(d / zipname, zip_src, fixed if fixed.is_dir() else None,
+                            driver, libs, node,
+                            None if host["debug_info"] else host["arch"])
+    else:
+        shutil.copyfile(zip_src, d / zipname)
+    report = "%s done (%.1f MB, %s)\n" % (head, (d / zipname).stat().st_size / (1 << 20),
+                                         took())
+    # The new image is on disk, so this entry's older ones are superseded.
+    # After the copy, never before: a failed build must leave the image that
+    # is still the current one exactly where it was.
+    _prune_older_images(d, name, run_dt)
+    if host and host["post"]:
+        script = target.dir / host["post"]
+        proc = subprocess.run([str(script), str(d / zipname)], cwd=d, env=env,
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+        if proc.returncode != 0:
+            return False, (f"{report}{proc.stdout or ''}"
+                           f"spangap: make-builds: {name}: `post:` {script} "
+                           f"exited {proc.returncode}\n")
+        for made in sorted(p.name for p in d.iterdir()):
+            got = _split_image_name(made)
+            if got and got[0].startswith(name + "+"):
+                if got[1] == run_dt:
+                    report += f"    {made}\n"
+                elif got[1] < run_dt:
+                    (d / made).unlink(missing_ok=True)
+    return True, report
 
 
 def cmd_make_builds(args: argparse.Namespace) -> int:
@@ -6479,15 +6574,47 @@ def cmd_make_builds(args: argparse.Namespace) -> int:
                         f"(`post:` is a path in {buildable.name})")
         targets_of[d] = targets
 
-    failed = None
-    for d, project, _, chosen, onboarding, hosts in plan:
-        failed = _build_catalogue(d, project, chosen, onboarding, hosts, targets_of[d],
-                                  all_straddles, run_dt)
-        if failed:
-            break
+    # Every entry of the run, across catalogues, goes through one pool of
+    # `--jobs` builds at a time. The first failure starts nothing new; the
+    # builds already running finish, and every failure's output is printed
+    # once the run is over, so it is not interleaved with the progress lines.
+    heal_truncated_packs()
+    jobs = [(d, project, name, inv, hosts)
+            for d, project, _, chosen, _, hosts in plan for name, inv in chosen]
+    n_jobs = max(1, min(args.jobs, len(jobs)))
+    print(f"make-builds: {len(jobs)} image(s), {n_jobs} at a time", flush=True)
+    failures: list[tuple[str, str]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as pool:
+        futures = {pool.submit(_build_entry, d, project, name, inv, hosts,
+                               all_straddles, run_dt): f"{d.name}/{name}"
+                   for d, project, name, inv, hosts in jobs}
+        for fut in concurrent.futures.as_completed(futures):
+            ok, report = fut.result()
+            if ok:
+                sys.stdout.write(report)
+            else:
+                sys.stdout.write(report.split("\n", 1)[0] + "\n")
+                failures.append((futures[fut], report.split("\n", 1)[1]))
+                for other in futures:
+                    other.cancel()
+            sys.stdout.flush()
+    for d, project, _, _, onboarding, _ in plan:
+        _write_listing(d, project, onboarding, targets_of[d])
     _write_root_listing(root, siblings)
-    if failed:
-        die(f"make-builds: build '{failed}' failed")
+    if failures:
+        for _, output in failures:
+            sys.stderr.write(output)
+        die(f"make-builds: {', '.join(n for n, _ in failures)} failed")
+    # A bare `spangap build` afterwards repeats the run's last entry, as if the
+    # entries had been built one after the other.
+    _, _, _, last_inv, _ = jobs[-1]
+    toks = shlex.split(last_inv)
+    inc, exc, flash_mb, kconfig = parse_selection(toks[1:])
+    write_remembered_build(
+        resolve_target_straddle(toks[0], all_straddles),
+        {_resolve_org_repo(r, all_straddles, "--with") for r in inc},
+        {_resolve_org_repo(r, all_straddles, "--without") for r in exc},
+        flash_mb, kconfig)
     return 0
 
 
@@ -6696,6 +6823,12 @@ def main(argv: list[str] | None = None) -> int:
              "dispatcher, which clones each one's missing straddles with the "
              "host's git credentials (this container has none) before handing "
              "the run in here.",
+    )
+    p_mb.add_argument(
+        "-j", "--jobs", type=int, default=len(os.sched_getaffinity(0)),
+        metavar="N",
+        help="build up to N images at once, each in its own build dir "
+             "(build.<catalogue>.<entry>); default: one per CPU this container sees",
     )
     p_mb.set_defaults(func=cmd_make_builds)
 

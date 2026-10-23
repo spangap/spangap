@@ -35,7 +35,7 @@
 #                    container the console of the node it is holding, so
 #                    in-container `spangap log` / `spangap cli` reach devices
 #                    nothing on the host is holding. Clones the flashmon repo and
-#                    seeds a `builds/local` catalogue on first run. Idempotent:
+#                    seeds a `<project>-builds/local` catalogue on first run. Idempotent:
 #                    one already serving the port is opened rather than replaced,
 #                    since its origin is where the browser's board grants live.
 #                    --stop stops it in every container of this workspace. The
@@ -45,7 +45,7 @@
 #                    (uses host github creds; container has none). Also runs
 #                    automatically as part of `build`.
 #   build            same dep-fetch, then forward to spangap-inside.
-#   make-builds [entry…]
+#   make-builds [-j N] [entry…]
 #                    build the image catalogue described by the builds.yaml in
 #                    the current directory (or by each one in the directories
 #                    below it), stamping every image of a run with one datetime
@@ -55,7 +55,7 @@
 #                    linux` entry makes a node package for its `arch:`,
 #                    cross-compiled when that is not this machine's.
 #   publish-builds [catalogue]
-#                    publish a built catalogue (builds/<catalogue>/) as a
+#                    publish a built catalogue (<project>-builds/<catalogue>/) as a
 #                    GitHub release tagged builds-<catalogue>, mirroring the
 #                    directory: its zips, index.html, timestamp and builds.yaml
 #                    are the assets, and one the directory no longer holds is
@@ -1530,7 +1530,7 @@ pull-all)
     exit 0
     ;;
 publish-builds)
-    # Host-only. Publish a built image catalogue (`builds/<catalogue>/`) as a
+    # Host-only. Publish a built image catalogue (`<project>-builds/<catalogue>/`) as a
     # GitHub release: the transport a Pages site uses to get the images onto the
     # web. Host-only for the same reason push-all/pull-all are: `gh` reaches
     # github with your credentials here, never in the build container.
@@ -1590,25 +1590,29 @@ publish-builds)
     command -v gh >/dev/null 2>&1 || die "gh not found (install the GitHub CLI)"
     gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run: gh auth login)"
 
-    # Which catalogue: an argument names one under <workspace>/builds (or is a
-    # path to one); no argument means the directory we are standing in, the same
-    # way `spangap make-builds` takes it.
+    # Which catalogue: an argument names one under the current project's
+    # <project>-builds (or is a path to one); no argument means the directory we
+    # are standing in, the same way `spangap make-builds` takes it.
+    pb_root=
+    if pb_proj=$(require_straddle publish-builds 2>/dev/null); then
+        pb_root=$(builds_dir_of "$pb_proj")
+    fi
     if [ -n "$pb_cat" ]; then
         if [ -f "$pb_cat/builds.yaml" ]; then
             pb_dir=$pb_cat
-        elif [ -f "$workspace/builds/$pb_cat/builds.yaml" ]; then
-            pb_dir="$workspace/builds/$pb_cat"
+        elif [ -n "$pb_root" ] && [ -f "$pb_root/$pb_cat/builds.yaml" ]; then
+            pb_dir="$pb_root/$pb_cat"
         else
-            die "no catalogue \`$pb_cat\` (no builds.yaml in $workspace/builds/$pb_cat)"
+            die "no catalogue \`$pb_cat\` (no builds.yaml in ${pb_root:-<project>-builds}/$pb_cat)"
         fi
     elif [ -f "$PWD/builds.yaml" ]; then
         pb_dir=$PWD
     else
         pb_avail=
-        for d in "$workspace"/builds/*/; do
+        for d in "${pb_root:-$workspace/none}"/*/; do
             if [ -f "$d/builds.yaml" ]; then pb_avail="$pb_avail $(basename "$d")"; fi
         done
-        die "no builds.yaml here — run this in a builds/<catalogue>/ or name one:${pb_avail:- (none built yet)}"
+        die "no builds.yaml here — run this in a <project>-builds/<catalogue>/ or name one:${pb_avail:- (none built yet)}"
     fi
     pb_dir=$(CDPATH= cd -- "$pb_dir" && pwd)
     pb_name=$(basename "$pb_dir")
@@ -2504,17 +2508,6 @@ ensure_flashmon() {
     return 0
 }
 
-# `builds/local` — the catalogue this workspace builds for itself, and the one a
-# locally served flashmon offers. Seeded once, so a fresh checkout has somewhere
-# to point `spangap make-builds` at instead of a blank page and an empty
-# directory; after that the file is the user's and is never touched again.
-#
-# The starting content is whatever the project's `catalogue_seed:` names —
-# normally its own published catalogue, so the entries are the boards it really
-# builds for. A project that names none, or a fetch that fails, falls back to the
-# flashmon's shipped template, which builds nothing until it is edited but is
-# still a valid catalogue. Non-fatal either way: this is a convenience, and a
-# workspace with no network still serves whatever catalogues it already has.
 # True if a flashmon server — ours, not something else that happens to hold the
 # port — is answering on this host port. Asked of the server rather than of the
 # port, so an unrelated listener is not mistaken for one of ours.
@@ -2524,13 +2517,38 @@ flashmon_serving() {
     curl -fsS --max-time 2 "http://127.0.0.1:$port/hub/nodes" >/dev/null 2>&1
 }
 
+# builds_dir_of <straddle dir>: the workspace directory holding that buildable's
+# image catalogues, <slug>-builds — the slug of its `project:`, or of its repo
+# name without one (the same slug spangap-inside's builds_dir_of makes).
+builds_dir_of() {
+    local name
+    name=$(sed -n 's/^project:[[:space:]]*//p' "$1/straddle.yaml" 2>/dev/null | head -1)
+    name=${name%\"}; name=${name#\"}; name=${name%\'}; name=${name#\'}
+    [ -n "$name" ] || name=$(basename "$1")
+    name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')
+    name=${name#-}; name=${name%-}
+    printf '%s/%s-builds\n' "$workspace" "${name:-builds}"
+}
+
+# `<project>-builds/local` — the catalogue this workspace builds for itself, and
+# the one a locally served flashmon offers. Seeded once, so a fresh checkout has
+# somewhere to point `spangap make-builds` at instead of a blank page and an
+# empty directory; after that the file is the user's and is never touched again.
+#
+# The starting content is whatever the project's `catalogue_seed:` names —
+# normally its own published catalogue, so the entries are the boards it really
+# builds for. A project that names none, or a fetch that fails, falls back to the
+# flashmon's shipped template, which builds nothing until it is edited but is
+# still a valid catalogue. Non-fatal either way: this is a convenience, and a
+# workspace with no network still serves whatever catalogues it already has.
 ensure_local_catalogue() {
-    local dir="$workspace/builds/local"
+    local seed proj dir rel
+    proj=$(require_straddle cli 2>/dev/null) || return 0
+    dir="$(builds_dir_of "$proj")/local"
+    rel=${dir#"$workspace"/}
     [ -f "$dir/builds.yaml" ] && return 0
-    local seed proj
-    proj=$(require_straddle cli 2>/dev/null) || proj=""
-    [ -n "$proj" ] && seed=$(sed -n 's/^[[:space:]]*catalogue_seed:[[:space:]]*//p' \
-                                 "$proj/straddle.yaml" 2>/dev/null | head -1)
+    seed=$(sed -n 's/^[[:space:]]*catalogue_seed:[[:space:]]*//p' \
+               "$proj/straddle.yaml" 2>/dev/null | head -1)
     mkdir -p "$dir" || return 0
     case $seed in
     http://*|https://*)
@@ -2538,23 +2556,23 @@ ensure_local_catalogue() {
            && curl -fsSL --max-time 20 "$seed" -o "$dir/builds.yaml.part" 2>/dev/null \
            && [ -s "$dir/builds.yaml.part" ]; then
             mv "$dir/builds.yaml.part" "$dir/builds.yaml"
-            log "seeded builds/local/builds.yaml from $seed"
+            log "seeded $rel/builds.yaml from $seed"
             return 0
         fi
         rm -f "$dir/builds.yaml.part"
-        log "warning: could not fetch $seed — seeding builds/local from flashmon's template"
+        log "warning: could not fetch $seed — seeding $rel from flashmon's template"
         ;;
     ?*)
         if [ -f "$workspace/$seed" ]; then
             cp "$workspace/$seed" "$dir/builds.yaml"
-            log "seeded builds/local/builds.yaml from $seed"
+            log "seeded $rel/builds.yaml from $seed"
             return 0
         fi
         ;;
     esac
     if [ -f "$workspace/flashmon/builds.yaml.example" ]; then
         cp "$workspace/flashmon/builds.yaml.example" "$dir/builds.yaml"
-        log "seeded builds/local/builds.yaml from flashmon's template — edit it, then \`spangap make-builds\` in that directory"
+        log "seeded $rel/builds.yaml from flashmon's template — edit it, then \`spangap make-builds\` in that directory"
     fi
     return 0
 }
@@ -3013,7 +3031,7 @@ flashmon)
     # no relay to keep alive and nothing to leave running in a terminal.
     #
     # It is also the whole of getting started: flashmon is cloned if it isn't
-    # there and a `builds/local` catalogue is seeded if there is none, so this
+    # there and a `<project>-builds/local` catalogue is seeded if there is none, so this
     # one command takes a bare workspace to a page that can flash a board.
     shift
     ensure_daemon

@@ -117,7 +117,7 @@ GitHub — every repo, not only the straddles — fast-forwarding instead one th
 only behind, as `pull-all` would, and leaving a diverged one), `pull-all`
 (fast-forward every one of them from GitHub, leaving alone the diverged ones and
 any whose local changes touch a file the incoming commits touch) and
-`publish-builds` (mirror a built catalogue onto a GitHub release) — run
+`publish-builds` (mirror built catalogues onto GitHub releases) — run
 `gh`/`git` with whoever's credentials are where they run. On the host they always
 work. In here they work when the container has a `gh` login of its own (`gh auth
 status`); without one they say so and point at the host. There is one
@@ -532,11 +532,19 @@ one its invocation derives — `target: linux` without a Linux board, or a Linux
 Catalogues differing only in flavour say so with `--kconfig` in their entries, so they build
 from the same tree with no straddle per combination.
 
-**`spangap publish-builds [<catalogue>]`** — one of the GitHub verbs, so it runs `gh` with
-the host's credentials, or the container's own `gh` login where there is one — publishes a built catalogue as a **GitHub release** of the repo the
-catalogue's straddle comes from (its `origin`, or `-R owner/repo`). The tag is a rolling
-label per catalogue, `catalogue-<name>`: one release per catalogue, re-used every run, so an
-image keeps one URL and a consumer has one place to look.
+**`spangap publish-builds [<catalogue>…]`** — one of the GitHub verbs, so it runs `gh` with
+the host's credentials, or the container's own `gh` login where there is one — publishes
+built catalogues, each as a **GitHub release** of the repo the catalogue's straddle comes
+from (its `origin`, or `-R owner/repo`). The tag is a rolling label per catalogue,
+`catalogue-<name>`: one release per catalogue, re-used every run, so an image keeps one URL
+and a consumer has one place to look.
+
+**Which catalogues.** Each one named, as a path or as a name under the project's
+`<project>-builds/`. With none named: the catalogue directory you stand in, else every
+catalogue below you, else every one in `<project>-builds/`. That sweep leaves out `local`
+(whatever this machine last compiled) and any catalogue holding a `.nodeploy` file — somebody's
+bench output rather than a distribution. Naming one, or standing in it, publishes it
+regardless. `--dry-run` says what would be uploaded, deleted and notified, and touches nothing.
 
 **The release is the catalogue directory.** Every file in it goes up as an asset under its
 own name — the zips, `index.html`, `timestamp`, `builds.yaml`, an `.unlisted` marker — so
@@ -544,6 +552,12 @@ whoever consumes it copies the assets into `builds/<name>/` and has the director
 without knowing which files a catalogue is made of. An asset the directory no longer holds
 is deleted (`--keep-old` leaves it). The build stamp rides in the release title, and every
 catalogue but `stable` is a prerelease.
+
+**Only what changed is uploaded.** A zip carries its build's stamp in its name, so one the
+release lacks, or holds at another size, is a new image. `index.html`, `timestamp` and
+`builds.yaml` keep their names across every rebuild and, as a rule, their sizes — a stamp is
+fixed-width — so the release's copies are fetched and compared byte for byte. A catalogue
+with nothing new is reported up to date and left alone.
 
 **A release is the transport, not the serving.** GitHub sends no
 `access-control-allow-origin` on a release asset — not on github.com's redirect, not on the
@@ -553,11 +567,13 @@ time and serves them from its own origin, which is what flashmon assumes: it rea
 catalogue at the relative `../builds/<name>/`. A GitHub Pages site does this in its deploy
 workflow, downloading each catalogue's release into `builds/<name>/` beside the page.
 
-**`--notify <owner/repo>`** fires a `catalogue-published` `repository_dispatch` at that
-consumer once every asset is up, with the catalogue name and stamp in the payload, so the
-site redeploys with the new images and nothing has to poll. It needs `gh` auth with write
-access to that repo, and a failed upload stops the run before it notifies — a half-uploaded
-catalogue is not one to publish.
+**`notify: <owner/repo>`** in a catalogue's `builds.yaml` names that consumer. Once the run's
+uploads are done, each such repo gets one `catalogue-published` `repository_dispatch`, with
+the catalogues that changed for it in `client_payload.catalogues` (space-separated), so the
+site redeploys with the new images and nothing has to poll. A catalogue that was already up
+to date notifies nobody. It needs `gh` auth with write access to that repo, and a repo with a
+failed upload among its catalogues is not notified — a half-uploaded catalogue is not one to
+publish; re-running finishes the upload and notifies then.
 
 **Device CLI commands are silent on success** (`set` / `unset` / `save` print nothing when
 they work) — no output means it worked, not that it hung.

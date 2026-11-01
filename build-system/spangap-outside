@@ -54,12 +54,16 @@
 #                    since only the host has the git credentials. A `target:
 #                    linux` entry makes a node package for its `arch:`,
 #                    cross-compiled when that is not this machine's.
-#   publish-builds [catalogue]
-#                    publish a built catalogue (<project>-builds/<catalogue>/) as a
-#                    GitHub release tagged builds-<catalogue>, mirroring the
+#   publish-builds [catalogue…] [--dry-run]
+#                    publish built catalogues (<project>-builds/<catalogue>/) as
+#                    GitHub releases tagged catalogue-<catalogue>, mirroring the
 #                    directory: its zips, index.html, timestamp and builds.yaml
-#                    are the assets, and one the directory no longer holds is
-#                    deleted. Runs `gh` with the credentials where it runs, like
+#                    are the assets, only changed ones are uploaded, and one the
+#                    directory no longer holds is deleted. A builds.yaml's
+#                    `notify:` repo is sent a catalogue-published dispatch once
+#                    its catalogues are up. With no catalogue named, the one
+#                    you stand in, else every one below (less `local` and
+#                    .nodeploy ones). Runs `gh` with the credentials where it runs, like
 #                    push-all/pull-all: the host, or a container with a `gh`
 #                    login of its own (spangap-inside hands these three here).
 #   docker <cmd>…    docker-exec <cmd> in the build-env container, raw —
@@ -1540,9 +1544,9 @@ pull-all)
     exit 0
     ;;
 publish-builds)
-    # Publish a built image catalogue (`<project>-builds/<catalogue>/`) as a
-    # GitHub release: the transport a Pages site uses to get the images onto the
-    # web. `gh` with the credentials where it runs, as push-all/pull-all.
+    # Publish built image catalogues (`<project>-builds/<catalogue>/`) as GitHub
+    # releases: the transport a Pages site uses to get the images onto the web.
+    # `gh` with the credentials where it runs, as push-all/pull-all.
     #
     # The release IS the catalogue directory — every file in it goes up as an
     # asset under its own name (the zips, `index.html`, `timestamp`,
@@ -1550,6 +1554,12 @@ publish-builds)
     # longer holds comes back down (--keep-old leaves it). So a consumer copies
     # the assets into `builds/<catalogue>/` and has the directory back, without
     # knowing which files a catalogue is made of.
+    #
+    # Only what changed goes up. A zip carries its build's stamp in its name, so
+    # a name the release lacks, or has at another size, is a new image. The other
+    # four keep their names across every rebuild and usually their sizes too — a
+    # stamp is fixed-width — so the release's copies are fetched and compared
+    # byte for byte.
     #
     # The tag is a rolling label per catalogue, `catalogue-<name>` — one release
     # per catalogue, re-used every run, so an image keeps one URL and a site
@@ -1563,35 +1573,39 @@ publish-builds)
     # zips off GitHub directly. Whatever serves the page copies them in at
     # deploy time and serves them from its own origin, which is what flashmon
     # assumes: it reaches its catalogue at the relative `../builds/<name>/`.
-    # `--notify <owner/repo>` fires a `catalogue-published` repository_dispatch
-    # at that consumer so the copy happens on its own.
+    # A catalogue's `notify: <owner/repo>` names that consumer; once its
+    # catalogues are up it gets one `catalogue-published` repository_dispatch,
+    # so the copy happens on its own.
     shift
-    pb_cat=
-    pb_slug=
+    pb_args=()
+    pb_slug_arg=
     pb_keep=0
-    pb_notify=
+    pb_dry=0
     while [ $# -gt 0 ]; do
         case $1 in
-            -R|--repo) shift; [ $# -gt 0 ] || die "-R needs an owner/repo"; pb_slug=$1 ;;
-            --notify) shift; [ $# -gt 0 ] || die "--notify needs an owner/repo"; pb_notify=$1 ;;
+            -R|--repo) shift; [ $# -gt 0 ] || die "-R needs an owner/repo"; pb_slug_arg=$1 ;;
             --keep-old) pb_keep=1 ;;
+            -n|--dry-run) pb_dry=1 ;;
             -h|--help)
                 printf '%s\n' \
-                    "usage: spangap publish-builds [CATALOGUE] [-R owner/repo]" \
-                    "                              [--notify owner/repo] [--keep-old]" \
-                    "  Publish a built catalogue as a GitHub release tagged catalogue-<NAME>," \
-                    "  every file in the directory becoming an asset under its own name." \
-                    "  CATALOGUE defaults to the catalogue directory you are standing in, and" \
-                    "  the repo to the origin of the straddle the catalogue builds." \
+                    "usage: spangap publish-builds [CATALOGUE…] [-R owner/repo] [--keep-old] [--dry-run]" \
+                    "  Publish built catalogues as GitHub releases tagged catalogue-<NAME>," \
+                    "  every file in the directory becoming an asset under its own name;" \
+                    "  only what changed is uploaded." \
+                    "  With no CATALOGUE: the catalogue directory you are standing in, else" \
+                    "  every catalogue below you (or in the project's <project>-builds/)," \
+                    "  less \`local\` and any holding a .nodeploy file. Naming one publishes" \
+                    "  it regardless." \
+                    "  The repo is the origin of the straddle the catalogue builds, or -R." \
                     "  An asset the catalogue no longer holds is deleted unless --keep-old." \
-                    "  --notify fires a catalogue-published repository_dispatch at the repo" \
-                    "  that serves the images, so its site redeploys with this build." \
-                    "  Requires an authenticated \`gh\`." \
-                    "  Release assets carry no CORS headers, so a flasher page cannot fetch" \
-                    "  them: whoever serves the page copies them in at deploy time."
+                    "  A builds.yaml's \`notify: owner/repo\` names the repo serving the" \
+                    "  images; it gets a catalogue-published repository_dispatch once its" \
+                    "  catalogues are up, so its site redeploys with them." \
+                    "  --dry-run says what would be uploaded, deleted and notified." \
+                    "  Requires an authenticated \`gh\`."
                 exit 0 ;;
             -*) die "unknown option: $1 (try --help)" ;;
-            *)  pb_cat=$1 ;;
+            *)  pb_args+=("$1") ;;
         esac
         shift
     done
@@ -1599,144 +1613,250 @@ publish-builds)
     command -v gh >/dev/null 2>&1 || die "gh not found (install the GitHub CLI)"
     gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run: gh auth login)"
 
-    # Which catalogue: an argument names one under the current project's
-    # <project>-builds (or is a path to one); no argument means the directory we
-    # are standing in, the same way `spangap make-builds` takes it.
+    # Which catalogues. An argument names one under the current project's
+    # <project>-builds (or is a path to one). With none, the directory we are
+    # standing in if it is a catalogue, else every catalogue below it, else
+    # every catalogue in the project's <project>-builds — the same way `spangap
+    # make-builds` takes it. Naming a catalogue, or standing in it, is the
+    # deliberate act `.nodeploy` exists to require; a sweep skips those and
+    # `local`, which is whatever this machine last compiled.
     pb_root=
     if pb_proj=$(require_straddle publish-builds 2>/dev/null); then
         pb_root=$(builds_dir_of "$pb_proj")
     fi
-    if [ -n "$pb_cat" ]; then
-        if [ -f "$pb_cat/builds.yaml" ]; then
-            pb_dir=$pb_cat
-        elif [ -n "$pb_root" ] && [ -f "$pb_root/$pb_cat/builds.yaml" ]; then
-            pb_dir="$pb_root/$pb_cat"
+    pb_dirs=()
+    pb_sweep=0
+    for c in ${pb_args[@]+"${pb_args[@]}"}; do
+        if [ -f "$c/builds.yaml" ]; then
+            pb_dirs+=("$c")
+        elif [ -n "$pb_root" ] && [ -f "$pb_root/$c/builds.yaml" ]; then
+            pb_dirs+=("$pb_root/$c")
         else
-            die "no catalogue \`$pb_cat\` (no builds.yaml in ${pb_root:-<project>-builds}/$pb_cat)"
+            die "no catalogue \`$c\` (no builds.yaml in ${pb_root:-<project>-builds}/$c)"
         fi
-    elif [ -f "$PWD/builds.yaml" ]; then
-        pb_dir=$PWD
-    else
-        pb_avail=
-        for d in "${pb_root:-$workspace/none}"/*/; do
-            if [ -f "$d/builds.yaml" ]; then pb_avail="$pb_avail $(basename "$d")"; fi
-        done
-        die "no builds.yaml here — run this in a <project>-builds/<catalogue>/ or name one:${pb_avail:- (none built yet)}"
-    fi
-    pb_dir=$(CDPATH= cd -- "$pb_dir" && pwd)
-    pb_name=$(basename "$pb_dir")
-
-    pb_zips=("$pb_dir"/*.zip)
-    [ -e "${pb_zips[0]}" ] || die "no images in $pb_dir — \`spangap make-builds\` there first"
-    pb_assets=("${pb_zips[@]}")
-    # `.unlisted` rides along like any other file: it is what tells the consumer
-    # to serve this catalogue without offering it in the Build selector, and it
-    # only survives the trip if it is up there with the images.
-    for f in index.html timestamp builds.yaml .unlisted; do
-        if [ -f "$pb_dir/$f" ]; then pb_assets+=("$pb_dir/$f"); fi
     done
-
-    pb_project=$(sed -n 's/^project:[[:space:]]*//p' "$pb_dir/builds.yaml" | head -1)
-    [ -n "$pb_project" ] || pb_project=$pb_name
-    pb_stamp=
-    if [ -f "$pb_dir/timestamp" ]; then pb_stamp=$(cat "$pb_dir/timestamp"); fi
-
-    # Whose releases these are: the catalogue's entries are `spangap build`
-    # invocations, their target is the project straddle, and that straddle's
-    # origin is the repo. Commented-out entries don't match — the leading `#`
-    # keeps them out — so a catalogue with every entry disabled asks for -R.
-    if [ -z "$pb_slug" ]; then
-        pb_target=$(sed -n 's/^[[:space:]]*invocation:[[:space:]]*//p' "$pb_dir/builds.yaml" \
-            | head -1 | awk '{print $1}')
-        [ -n "$pb_target" ] || die "no invocation: in $pb_dir/builds.yaml — name the repo with -R owner/repo"
-        pb_pdir=$(project_host_dir "$pb_target") \
-            || die "straddle $pb_target is not in this workspace — name the repo with -R owner/repo"
-        pb_url=$(git -C "$pb_pdir" remote get-url origin 2>/dev/null) \
-            || die "$pb_target has no origin remote — name the repo with -R owner/repo"
-        # git@github.com:owner/repo.git | https://github.com/owner/repo(.git) -> owner/repo
-        pb_slug=$(printf '%s' "$pb_url" | sed -E 's#.*github\.com[:/]##; s#\.git$##; s#/$##')
-        [ -n "$pb_slug" ] || die "cannot parse a repo from $pb_url — name the repo with -R owner/repo"
+    if [ ${#pb_dirs[@]} -eq 0 ]; then
+        if [ -f "$PWD/builds.yaml" ]; then
+            pb_dirs=("$PWD")
+        else
+            pb_sweep=1
+            pb_tree=$PWD
+            if ! compgen -G "$PWD/*/builds.yaml" >/dev/null; then pb_tree=${pb_root:-$PWD}; fi
+            for d in "$pb_tree"/*/; do
+                if [ -f "$d/builds.yaml" ]; then pb_dirs+=("${d%/}"); fi
+            done
+            [ ${#pb_dirs[@]} -gt 0 ] \
+                || die "no catalogues here — run this in <project>-builds/ or a catalogue in it, or name one"
+        fi
     fi
 
-    pb_tag="catalogue-$pb_name"
-    pb_title="$pb_project builds — $pb_name${pb_stamp:+ $pb_stamp}"
-    pb_notes=$(
-        printf '%s\n\n' "Catalogue \`$pb_name\`${pb_stamp:+, build stamp \`$pb_stamp\`}."
-        for z in "${pb_zips[@]}"; do
-            printf -- '- `%s` (%s)\n' "$(basename "$z")" \
-                "$(awk -v b="$(wc -c <"$z")" 'BEGIN{printf "%.1f MB", b/1048576}')"
-        done
-        printf '\n%s\n' "Each chip image's zip holds the images and the \`.esptool\` argfile naming their offsets; a \`hw-sim-mesh-<arch>\` zip is a node package (the station ELF, its \`/fixed\` tree and \`node.yaml\`)."
-    )
+    # The release's own copies of the rewritten-in-place files land here, to be
+    # compared against the local ones. A few kilobytes per catalogue.
+    pb_tmp=$(mktemp -d)
+    trap 'rm -rf "$pb_tmp"' EXIT
 
-    if gh release view "$pb_tag" -R "$pb_slug" >/dev/null 2>&1; then
-        gh release edit "$pb_tag" -R "$pb_slug" --title "$pb_title" --notes "$pb_notes" >/dev/null \
-            || die "could not update release $pb_tag in $pb_slug"
-        log "release $pb_tag in $pb_slug — updated"
-    else
-        # Only a `stable` catalogue is a release in the ordinary sense; every
-        # other one is a moving target and says so on the release page.
-        pb_pre=()
-        [ "$pb_name" = stable ] || pb_pre=(--prerelease)
-        gh release create "$pb_tag" -R "$pb_slug" --title "$pb_title" --notes "$pb_notes" \
-            ${pb_pre[@]+"${pb_pre[@]}"} >/dev/null \
-            || die "could not create release $pb_tag in $pb_slug"
-        log "release $pb_tag in $pb_slug — created${pb_pre[0]+ (prerelease)}"
-    fi
+    # A top-level scalar of the catalogue's builds.yaml, unquoted, comment cut.
+    pb_yaml_key() {
+        sed -n "s/^$1:[[:space:]]*//p" "$pb_dir/builds.yaml" | head -1 \
+            | sed -E -e 's/[[:space:]]+#.*$//; s/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'\$/\\1/"
+    }
 
-    # One call per asset: a catalogue is a handful of files, and a report that
-    # names the one that failed is worth more than a single batched upload.
+    pb_mutable=(index.html timestamp builds.yaml .unlisted)
     pb_failed=0
-    for a in "${pb_assets[@]}"; do
-        if pb_out=$(gh release upload "$pb_tag" -R "$pb_slug" --clobber "$a" 2>&1); then
-            printf '%-52s uploaded\n' "$(basename "$a")"
+    pb_sent=     # "<notify-repo> <catalogue>" per catalogue now fully up
+    pb_spoilt=   # notify repos with a catalogue whose upload failed
+
+    for pb_dir in "${pb_dirs[@]}"; do
+        pb_dir=$(CDPATH= cd -- "$pb_dir" && pwd)
+        pb_name=$(basename "$pb_dir")
+        if [ "$pb_sweep" -eq 1 ]; then
+            if [ "$pb_name" = local ] || [ -f "$pb_dir/.nodeploy" ]; then
+                pb_why=$([ -f "$pb_dir/.nodeploy" ] && echo ".nodeploy" || echo "local catalogue")
+                printf '== %s: not published (%s) — name it to publish anyway\n' "$pb_name" "$pb_why"
+                continue
+            fi
+        fi
+
+        pb_zips=()
+        for z in "$pb_dir"/*.zip; do
+            if [ -f "$z" ]; then pb_zips+=("$z"); fi
+        done
+        if [ ${#pb_zips[@]} -eq 0 ]; then
+            printf '== %s: no images — `spangap make-builds` there first\n' "$pb_name"
+            continue
+        fi
+
+        pb_project=$(pb_yaml_key project)
+        [ -n "$pb_project" ] || pb_project=$pb_name
+        pb_notify=$(pb_yaml_key notify)
+        pb_stamp=
+        if [ -f "$pb_dir/timestamp" ]; then pb_stamp=$(cat "$pb_dir/timestamp"); fi
+
+        # Whose releases these are: the catalogue's entries are `spangap build`
+        # invocations, their target is the project straddle, and that straddle's
+        # origin is the repo. Commented-out entries don't match — the leading `#`
+        # keeps them out — so a catalogue with every entry disabled asks for -R.
+        pb_slug=$pb_slug_arg
+        if [ -z "$pb_slug" ]; then
+            pb_target=$(sed -n 's/^[[:space:]]*invocation:[[:space:]]*//p' "$pb_dir/builds.yaml" \
+                | head -1 | awk '{print $1}')
+            [ -n "$pb_target" ] || die "no invocation: in $pb_dir/builds.yaml — name the repo with -R owner/repo"
+            pb_pdir=$(project_host_dir "$pb_target") \
+                || die "straddle $pb_target is not in this workspace — name the repo with -R owner/repo"
+            pb_url=$(git -C "$pb_pdir" remote get-url origin 2>/dev/null) \
+                || die "$pb_target has no origin remote — name the repo with -R owner/repo"
+            # git@github.com:owner/repo.git | https://github.com/owner/repo(.git) -> owner/repo
+            pb_slug=$(printf '%s' "$pb_url" | sed -E 's#.*github\.com[:/]##; s#\.git$##; s#/$##')
+            [ -n "$pb_slug" ] || die "cannot parse a repo from $pb_url — name the repo with -R owner/repo"
+        fi
+        pb_tag="catalogue-$pb_name"
+
+        # What the release holds now: "<name> <size>" per asset, empty when
+        # there is no release yet.
+        pb_exists=0
+        pb_remote=
+        if gh release view "$pb_tag" -R "$pb_slug" >/dev/null 2>&1; then
+            pb_exists=1
+            pb_remote=$(gh release view "$pb_tag" -R "$pb_slug" \
+                --json assets -q '.assets[] | "\(.name) \(.size)"' | sort) \
+                || die "could not list the assets of $pb_tag in $pb_slug"
+        fi
+        pb_remote_names=$(printf '%s\n' "$pb_remote" | awk 'NF {print $1}' | sort -u)
+
+        # The zips, by name and size: a name the release carries at the same
+        # size is that same build.
+        pb_local=$(
+            for z in "${pb_zips[@]}"; do
+                printf '%s %s\n' "$(basename "$z")" "$(wc -c <"$z" | tr -d ' ')"
+            done | sort
+        )
+        pb_up=$(comm -23 <(printf '%s\n' "$pb_local") <(printf '%s\n' "$pb_remote") | awk 'NF {print $1}')
+        pb_names=$(printf '%s\n' "$pb_local" | awk 'NF {print $1}')
+
+        # The rewritten-in-place files, by content. A fetch that does not
+        # produce the file leaves cmp to fail, which is the right answer anyway.
+        pb_fetched=0
+        for m in "${pb_mutable[@]}"; do
+            [ -f "$pb_dir/$m" ] || continue
+            pb_names=$(printf '%s\n%s' "$pb_names" "$m")
+            if printf '%s\n' "$pb_remote_names" | grep -qxF -- "$m"; then
+                if [ "$pb_fetched" -eq 0 ]; then
+                    mkdir -p "$pb_tmp/$pb_name"
+                    gh release download "$pb_tag" -R "$pb_slug" --dir "$pb_tmp/$pb_name" --clobber \
+                        "${pb_mutable[@]/#/--pattern=}" >/dev/null 2>&1 || true
+                    pb_fetched=1
+                fi
+                if cmp -s "$pb_dir/$m" "$pb_tmp/$pb_name/$m"; then continue; fi
+            fi
+            pb_up=$(printf '%s\n%s' "$pb_up" "$m")
+        done
+        pb_up=$(printf '%s\n' "$pb_up" | awk 'NF' | sort -u)
+
+        pb_stale=
+        if [ "$pb_keep" -eq 0 ]; then
+            pb_stale=$(comm -13 <(printf '%s\n' "$pb_names" | sort -u) <(printf '%s\n' "$pb_remote_names") \
+                | awk 'NF')
+        fi
+
+        if [ "$pb_exists" -eq 1 ] && [ -z "$pb_up" ] && [ -z "$pb_stale" ]; then
+            printf '== %s: up to date (%s images)\n' "$pb_name" "${#pb_zips[@]}"
+            continue
+        fi
+        printf '== %s: %s to upload, %s to drop — %s %s\n' "$pb_name" \
+            "$(printf '%s' "$pb_up" | grep -c . || true)" \
+            "$(printf '%s' "$pb_stale" | grep -c . || true)" "$pb_slug" "$pb_tag"
+
+        if [ "$pb_dry" -eq 1 ]; then
+            [ "$pb_exists" -eq 1 ] || printf '    (release created)\n'
+            while read -r a; do [ -n "$a" ] && printf '    + %s\n' "$a"; done <<<"$pb_up"
+            while read -r a; do [ -n "$a" ] && printf '    - %s\n' "$a"; done <<<"$pb_stale"
+            if [ -n "$pb_notify" ]; then pb_sent=$(printf '%s\n%s %s' "$pb_sent" "$pb_notify" "$pb_name"); fi
+            continue
+        fi
+
+        pb_title="$pb_project builds — $pb_name${pb_stamp:+ $pb_stamp}"
+        pb_notes=$(
+            printf '%s\n\n' "Catalogue \`$pb_name\`${pb_stamp:+, build stamp \`$pb_stamp\`}."
+            for z in "${pb_zips[@]}"; do
+                printf -- '- `%s` (%s)\n' "$(basename "$z")" \
+                    "$(awk -v b="$(wc -c <"$z")" 'BEGIN{printf "%.1f MB", b/1048576}')"
+            done
+            printf '\n%s\n' "Each chip image's zip holds the images and the \`.esptool\` argfile naming their offsets; a \`hw-sim-mesh-<arch>\` zip is a node package (the station ELF, its \`/fixed\` tree and \`node.yaml\`)."
+        )
+        if [ "$pb_exists" -eq 1 ]; then
+            gh release edit "$pb_tag" -R "$pb_slug" --title "$pb_title" --notes "$pb_notes" >/dev/null \
+                || die "could not update release $pb_tag in $pb_slug"
         else
-            pb_failed=$((pb_failed + 1))
-            printf '%-52s upload FAILED: %s\n' "$(basename "$a")" \
-                "$(printf '%s\n' "$pb_out" | grep -m1 . || true)"
+            # Only a `stable` catalogue is a release in the ordinary sense; every
+            # other one is a moving target and says so on the release page.
+            pb_pre=()
+            [ "$pb_name" = stable ] || pb_pre=(--prerelease)
+            gh release create "$pb_tag" -R "$pb_slug" --title "$pb_title" --notes "$pb_notes" \
+                ${pb_pre[@]+"${pb_pre[@]}"} >/dev/null \
+                || die "could not create release $pb_tag in $pb_slug"
+            printf '    (release created%s)\n' "${pb_pre[0]+, prerelease}"
+        fi
+
+        # One call per asset: a catalogue is a handful of files, and a report
+        # that names the one that failed is worth more than a batched upload.
+        pb_bad=0
+        while read -r a; do
+            [ -n "$a" ] || continue
+            if pb_out=$(gh release upload "$pb_tag" -R "$pb_slug" --clobber "$pb_dir/$a" 2>&1); then
+                printf '    + %s\n' "$a"
+            else
+                pb_bad=$((pb_bad + 1))
+                printf '    + %s  upload FAILED: %s\n' "$a" "$(printf '%s\n' "$pb_out" | grep -m1 . || true)"
+            fi
+        done <<<"$pb_up"
+        while read -r a; do
+            [ -n "$a" ] || continue
+            if gh release delete-asset "$pb_tag" "$a" -R "$pb_slug" --yes >/dev/null 2>&1; then
+                printf '    - %s\n' "$a"
+            else
+                printf '    - %s  removal FAILED\n' "$a"
+            fi
+        done <<<"$pb_stale"
+
+        pb_failed=$((pb_failed + pb_bad))
+        if [ -n "$pb_notify" ]; then
+            if [ "$pb_bad" -eq 0 ]; then
+                pb_sent=$(printf '%s\n%s %s' "$pb_sent" "$pb_notify" "$pb_name")
+            else
+                pb_spoilt=$(printf '%s\n%s' "$pb_spoilt" "$pb_notify")
+            fi
         fi
     done
-
-    if [ "$pb_keep" -eq 0 ]; then
-        # Read the list first rather than piping the query straight into the
-        # loop: under `set -o pipefail` a failed query would take the whole run
-        # down with it, silently, after the images were already up.
-        pb_have=$(gh release view "$pb_tag" -R "$pb_slug" --json assets -q '.assets[].name' 2>/dev/null) \
-            || pb_have=
-        printf '%s\n' "$pb_have" \
-        | while IFS= read -r a; do
-            [ -n "$a" ] || continue
-            if [ -f "$pb_dir/$a" ]; then continue; fi
-            if gh release delete-asset "$pb_tag" "$a" -R "$pb_slug" --yes >/dev/null 2>&1; then
-                printf '%-52s removed (gone from the catalogue)\n' "$a"
-            else
-                printf '%-52s removal FAILED\n' "$a"
-            fi
-        done
-    fi
-
-    log "https://github.com/$pb_slug/releases/tag/$pb_tag"
 
     # The consumer poll nobody wants: a site that assembles itself from these
-    # releases has no way to know a new one landed, so tell it. The event is
-    # `catalogue-published`, carrying the catalogue and its stamp; what the
-    # receiving repo does with it is its own business (a Pages deploy, usually).
-    # Only on a clean run — a half-uploaded catalogue is not one to publish.
-    if [ -n "$pb_notify" ]; then
-        if [ "$pb_failed" -ne 0 ]; then
-            die "$pb_failed asset(s) failed — not notifying $pb_notify; re-run to finish the upload"
-        fi
-        if gh api "repos/$pb_notify/dispatches" \
-            -f event_type=catalogue-published \
-            -f "client_payload[catalogue]=$pb_name" \
-            -f "client_payload[stamp]=$pb_stamp" >/dev/null 2>&1; then
-            log "notified $pb_notify (catalogue-published)"
+    # releases has no way to know a new one landed, so tell it — once per site,
+    # naming the catalogues that changed. What the receiving repo does with the
+    # event is its own business (a Pages deploy, usually). A site with a
+    # half-uploaded catalogue is not told: re-running finishes the upload and
+    # notifies then.
+    pb_unsent=0
+    for t in $(printf '%s\n' "$pb_sent" | awk 'NF {print $1}' | sort -u); do
+        pb_cats=$(printf '%s\n' "$pb_sent" | awk -v t="$t" '$1 == t {print $2}' | paste -sd' ' -)
+        if printf '%s\n' "$pb_spoilt" | grep -qxF -- "$t"; then
+            printf '==> not notifying %s: an upload failed\n' "$t"
+            pb_unsent=1
+        elif [ "$pb_dry" -eq 1 ]; then
+            printf '==> would notify %s (%s)\n' "$t" "$pb_cats"
+        elif gh api "repos/$t/dispatches" -f event_type=catalogue-published \
+                 -f "client_payload[catalogues]=$pb_cats" >/dev/null 2>&1; then
+            printf '==> notified %s (%s)\n' "$t" "$pb_cats"
         else
-            die "could not notify $pb_notify — does your gh auth carry write access to it?"
+            printf '==> could not notify %s — does your gh auth carry write access to it?\n' "$t"
+            pb_unsent=1
         fi
-    elif [ "$pb_failed" -ne 0 ]; then
-        die "$pb_failed asset(s) failed to upload"
-    fi
+    done
+    for t in $(printf '%s\n' "$pb_spoilt" | awk 'NF' | sort -u); do
+        printf '%s\n' "$pb_sent" | awk '{print $1}' | grep -qxF -- "$t" \
+            || printf '==> not notifying %s: an upload failed\n' "$t"
+    done
+
+    [ "$pb_failed" -eq 0 ] || die "$pb_failed asset(s) failed to upload — re-run to finish"
+    [ "$pb_unsent" -eq 0 ] || die "a site was not notified"
     exit 0
     ;;
 flash)

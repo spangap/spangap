@@ -112,15 +112,20 @@ serial-interactive stay user-driven. The full
 device loop is its own section below
 ([Working with a real device](#working-with-a-real-device--the-you--user--board-loop)).
 
+**The GitHub verbs** — `push-all` (create + push every repo in the workspace to
+GitHub — every repo, not only the straddles — fast-forwarding instead one that is
+only behind, as `pull-all` would, and leaving a diverged one), `pull-all`
+(fast-forward every one of them from GitHub, leaving alone the diverged ones and
+any whose local changes touch a file the incoming commits touch) and
+`publish-builds` (mirror a built catalogue onto a GitHub release) — run
+`gh`/`git` with whoever's credentials are where they run. On the host they always
+work. In here they work when the container has a `gh` login of its own (`gh auth
+status`); without one they say so and point at the host. There is one
+implementation, in `spangap-outside`: in here `spangap` hands these three verbs
+to it, and it refuses every other verb when run that way.
+
 **Host-only verbs you can't run from this container:** `monitor`, `probe`, real
-`flash`, `init`, `reset-workspace`, `get-deps` (the cloning side), `push-all`
-(create + push every repo in the workspace to GitHub — every repo, not only the
-straddles — fast-forwarding instead one that is only behind, as `pull-all` would,
-and leaving a diverged one), `pull-all` (fast-forward every one of them from
-GitHub, leaving alone the diverged ones and any whose local changes touch a file
-the incoming commits touch) and
-`publish-builds` (mirror a built catalogue onto a GitHub release) — all three
-run `gh`/`git` with the host's credentials, never in the container —
+`flash`, `init`, `reset-workspace`, `get-deps` (the cloning side),
 `detect-build` (build flashmon's `esp-idf/` peripheral
 detector in the container), and `docker <cmd>` — those
 live in **`spangap-outside`** on the host and need the serial port / docker / the
@@ -527,8 +532,8 @@ one its invocation derives — `target: linux` without a Linux board, or a Linux
 Catalogues differing only in flavour say so with `--kconfig` in their entries, so they build
 from the same tree with no straddle per combination.
 
-**`spangap publish-builds [<catalogue>]`** — host-only, since it runs `gh` with the host's
-credentials — publishes a built catalogue as a **GitHub release** of the repo the
+**`spangap publish-builds [<catalogue>]`** — one of the GitHub verbs, so it runs `gh` with
+the host's credentials, or the container's own `gh` login where there is one — publishes a built catalogue as a **GitHub release** of the repo the
 catalogue's straddle comes from (its `origin`, or `-R owner/repo`). The tag is a rolling
 label per catalogue, `catalogue-<name>`: one release per catalogue, re-used every run, so an
 image keeps one URL and a consumer has one place to look.

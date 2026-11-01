@@ -6699,8 +6699,30 @@ def cmd_dev(argv: list[str]) -> int:
             continue
 
 
+# The verbs that reach GitHub with somebody's credentials. They are written once,
+# in spangap-outside, and are plain git/gh with no docker in them; in here they
+# run that same code when this container has a `gh` login of its own, and say to
+# run them on the host when it has none — where they work as they always have.
+GITHUB_VERBS = ("push-all", "pull-all", "publish-builds")
+
+
+def cmd_github(raw: list[str]) -> int:
+    outside = WORKSPACE / "spangap" / "build-system" / "spangap-outside"
+    if not outside.is_file():
+        die(f"{raw[0]}: {outside} not found")
+    if not shutil.which("gh") or subprocess.run(
+            ["gh", "auth", "status"], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL).returncode != 0:
+        die(f"{raw[0]}: no GitHub login in this container — run `spangap {raw[0]}` "
+            "on the host, or `gh auth login` in here")
+    env = dict(os.environ, SPANGAP_WORKSPACE=str(WORKSPACE), SPANGAP_IN_CONTAINER="1")
+    os.execvpe("bash", ["bash", str(outside), *raw], env)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = sys.argv[1:] if argv is None else argv
+    if raw and raw[0] in GITHUB_VERBS:
+        return cmd_github(raw)
     # Pass-through subcommands whose own flag parsing would clash with argparse
     # (their own -h is a hostname, not argparse's --help).
     if raw and raw[0] == "claude":

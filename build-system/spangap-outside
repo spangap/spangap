@@ -59,8 +59,9 @@
 #                    GitHub release tagged builds-<catalogue>, mirroring the
 #                    directory: its zips, index.html, timestamp and builds.yaml
 #                    are the assets, and one the directory no longer holds is
-#                    deleted. Runs `gh` with the host's credentials, like
-#                    push-all/pull-all.
+#                    deleted. Runs `gh` with the credentials where it runs, like
+#                    push-all/pull-all: the host, or a container with a `gh`
+#                    login of its own (spangap-inside hands these three here).
 #   docker <cmd>…    docker-exec <cmd> in the build-env container, raw —
 #                    e.g. `spangap docker sh` for an unwrapped shell.
 #   shell            synonym for `spangap docker bash`: an interactive bash
@@ -1334,7 +1335,17 @@ fast_forward_repo() {
 # Command dispatch (outside).
 # ---------------------------------------------------------------------------
 
-case ${1:-} in init-continue|ensure-venv|ensure-container) ;; *) maybe_upgrade_launcher ;; esac
+# Run by spangap-inside for the GitHub verbs (push-all, pull-all,
+# publish-builds) when the container has a `gh` login: those arms are plain
+# git/gh, and everything else here is host business it must not reach.
+if [ -n "${SPANGAP_IN_CONTAINER:-}" ]; then
+    case ${1:-} in
+        push-all|pull-all|publish-builds) ;;
+        *) die "only push-all, pull-all and publish-builds run in the container" ;;
+    esac
+else
+    case ${1:-} in init-continue|ensure-venv|ensure-container) ;; *) maybe_upgrade_launcher ;; esac
+fi
 
 case ${1:-} in
 ensure-venv)
@@ -1349,12 +1360,12 @@ ensure-venv)
 # workspace's container/image down is still the host-only `spangap
 # reset-workspace`.)
 push-all)
-    # Host-only. Push every git repo directly under DIR (default: the workspace
-    # root, where straddles live as flat siblings), creating its GitHub repo
-    # (public) first if it doesn't exist yet. This runs entirely on the host —
-    # `gh`/`git` and your credentials live here, never in the build container —
-    # so it is handled in this arm and NOT forwarded inside. --force rewrites the
-    # remote branch (needed after a history rewrite).
+    # Push every git repo directly under DIR (default: the workspace root, where
+    # straddles live as flat siblings), creating its GitHub repo (public) first
+    # if it doesn't exist yet. Plain `gh`/`git` with the credentials where it
+    # runs — the host, or a container with its own `gh` login, whose
+    # spangap-inside hands the verb here — so it is never forwarded inside.
+    # --force rewrites the remote branch (needed after a history rewrite).
     shift
     force=0
     dir=$workspace
@@ -1450,10 +1461,9 @@ push-all)
     exit 0
     ;;
 pull-all)
-    # Host-only counterpart of push-all. Bring every git repo directly under DIR
-    # (default: the workspace root) up to its origin. Host-only for the same
-    # reason push-all is: `git` reaches github with your credentials here, never
-    # in the build container.
+    # Counterpart of push-all. Bring every git repo directly under DIR (default:
+    # the workspace root) up to its origin, with the credentials where it runs,
+    # as push-all does.
     #
     # Fast-forward only, and never over anything you'd have to think about: a
     # branch that has diverged, a detached HEAD and a repo with no origin are
@@ -1530,10 +1540,9 @@ pull-all)
     exit 0
     ;;
 publish-builds)
-    # Host-only. Publish a built image catalogue (`<project>-builds/<catalogue>/`) as a
+    # Publish a built image catalogue (`<project>-builds/<catalogue>/`) as a
     # GitHub release: the transport a Pages site uses to get the images onto the
-    # web. Host-only for the same reason push-all/pull-all are: `gh` reaches
-    # github with your credentials here, never in the build container.
+    # web. `gh` with the credentials where it runs, as push-all/pull-all.
     #
     # The release IS the catalogue directory — every file in it goes up as an
     # asset under its own name (the zips, `index.html`, `timestamp`,

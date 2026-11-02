@@ -323,6 +323,19 @@ default_straddle() {
     project_host_dir "$t"
 }
 
+# builds_dir_of <straddle dir>: the workspace directory holding that buildable's
+# image catalogues, <slug>-builds — the slug of its `project:`, or of its repo
+# name without one (the same slug spangap-inside's builds_dir_of makes).
+builds_dir_of() {
+    local name
+    name=$(sed -n 's/^project:[[:space:]]*//p' "$1/straddle.yaml" 2>/dev/null | head -1)
+    name=${name%\"}; name=${name#\"}; name=${name%\'}; name=${name#\'}
+    [ -n "$name" ] || name=$(basename "$1")
+    name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')
+    name=${name#-}; name=${name%-}
+    printf '%s/%s-builds\n' "$workspace" "${name:-builds}"
+}
+
 # require_straddle: cmd-name → straddle-dir on stdout, or die.
 require_straddle() {
     local cmd=$1
@@ -2644,19 +2657,6 @@ flashmon_serving() {
     local port=$1
     command -v curl >/dev/null 2>&1 || return 1
     curl -fsS --max-time 2 "http://127.0.0.1:$port/hub/nodes" >/dev/null 2>&1
-}
-
-# builds_dir_of <straddle dir>: the workspace directory holding that buildable's
-# image catalogues, <slug>-builds — the slug of its `project:`, or of its repo
-# name without one (the same slug spangap-inside's builds_dir_of makes).
-builds_dir_of() {
-    local name
-    name=$(sed -n 's/^project:[[:space:]]*//p' "$1/straddle.yaml" 2>/dev/null | head -1)
-    name=${name%\"}; name=${name#\"}; name=${name%\'}; name=${name#\'}
-    [ -n "$name" ] || name=$(basename "$1")
-    name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')
-    name=${name#-}; name=${name%-}
-    printf '%s/%s-builds\n' "$workspace" "${name:-builds}"
 }
 
 # `<project>-builds/local` — the catalogue this workspace builds for itself, and

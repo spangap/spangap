@@ -724,6 +724,20 @@ at `${CMAKE_BINARY_DIR}/staging` and sets `DEPENDENCIES_LOCK` to
 `main/CMakeLists.txt` reads `<BUILD_DIR>/staging/main_requires.cmake` with `BUILD_DIR` from
 `idf_build_get_property` — the one spelling that holds in IDF's requirements pre-pass.
 
+**A Kconfig-gated piece of a straddle is a CMake source choice.** A
+component CMakeLists can read `CONFIG_*` to pick its SRCS: the real configure
+runs after sdkconfig is generated. That covers a symbol a board sets, a
+derived one, a `--kconfig` flavour and `menuconfig` alike. It cannot gate
+REQUIRES. The requirements pre-pass has no sdkconfig, and its REQUIRES are
+the ones IDF builds with, so require the component unconditionally (unused,
+it links nothing). Where the optional piece has callers, build a null
+implementation of the same API in its place rather than `#if` the file.
+spangap/audio builds `audio.cpp` or `audio_null.cpp` from
+`CONFIG_AUDIO_ENGINE`, and a consumer with its own piece on top of the engine
+builds that piece or a null one from the same symbol. A `services:` entry's `when:` sees only straddle presence. A
+service whose behaviour hangs on a Kconfig symbol therefore stays registered,
+and the source choice decides what its `onInit` does.
+
 **Boot registration (don't hand-wire bring-up in `app_main`).** The buildable ships no
 `main.cpp` — `spangap-inside` generates the **entire** entry point into
 `staging/spangap_init_dispatch.gen.cpp`: a `spangapRegisterServices()` that constructs every

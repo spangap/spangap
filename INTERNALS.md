@@ -109,6 +109,12 @@ the source dir's contents plus two generated files:
   `SPANGAP_DUCKDNS`, `SPANGAP_ACME`). IDF picks `Kconfig.projbuild` up
   automatically from any component, so the corresponding `CONFIG_*` symbols
   are visible to every source file and every CMakeLists `if(CONFIG_*)`.
+  **Rule:** such an `if` may choose SRCS (or compile options) but not
+  REQUIRES. IDF runs every component CMakeLists first in a script-mode
+  requirements pass that has no sdkconfig, and the REQUIRES recorded there
+  are the ones it builds with, so a Kconfig-dependent REQUIRES never applies.
+  Require the component unconditionally; an archive nothing references links
+  nothing. spangap/audio's engine split is the worked case.
 
 - A generated **`staging/spangap_init_dispatch.gen.cpp`** is the buildable's
   **entire** entry point — it ships no hand-written `main.cpp`. spangap-inside

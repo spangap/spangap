@@ -931,7 +931,7 @@ and dots only and refusing anything that is not four octets of 0-255, with the
 same warning modal. **Empty is always accepted** and means unset: that is how a
 fixed address is handed back to DHCP, and how a mask or gateway is left for the
 network to supply.
-`text{label,key,secret?,placeholder?,placeholder_key?}`,
+`text{label,key,secret?,placeholder?,placeholder_key?,split?}`,
 `dropdown{label,key,options:[{v,l}],searchable?}`,
 `timezone{label,field,placeholder_key?}` (an IANA zone picker, form fields only:
 optionless in the yaml, because each surface brings its own list — the browser
@@ -1005,6 +1005,14 @@ A text row's **`placeholder_key:`** names a key holding the placeholder text, fo
 only the device can supply — the MAC it would use if the field is left blank, the port it
 would pick. It wins over a literal `placeholder:`, and like every other published string it
 is shown verbatim.
+
+A form text field's **`split: {at, to}`** ends it at a character: typing `at`, or
+entering text that holds one (a paste), keeps what is before it in this field and carries
+the rest into the sibling field `to`, which takes the caret — `host` with
+`split: { at: ":", to: port }` turns "example.org:4242" into the two fields as it is
+typed. The character itself is never stored. `to` must name a field of the same form or
+editor; a field that may legitimately hold the character (an IPv6 literal) cannot split
+on it.
 
 Inside a form or an item editor a **`section:` / `caption:` text templates too**, over the
 same local buffer (`section: "SSID: {ssid}"`), and tracks the field as it is edited. That is

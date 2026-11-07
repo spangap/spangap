@@ -875,6 +875,24 @@
             "placeholder_key": {
               "description": "A storage key holding the placeholder text, for a hint only the device knows \u2014 the MAC it would use, the port it would pick. Read when the field is built; wins over a literal `placeholder`.",
               "type": "string"
+            },
+            "split": {
+              "description": "Form fields only. A field that ends at a character: typing `at` (or pasting text that holds it) keeps what is before it in this field and carries the rest into the sibling field `to`, which takes the caret \u2014 \"host:port\" typed into a host field lands in host and port. The character itself is never stored.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "at",
+                "to"
+              ],
+              "properties": {
+                "at": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "to": {
+                  "type": "string"
+                }
+              }
             }
           }
         },

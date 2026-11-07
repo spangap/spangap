@@ -1846,6 +1846,9 @@ def _web_row(row: dict, cfgvals: dict[str, str]) -> dict:
             out["placeholder"] = spec["placeholder"]
         if "placeholder_key" in spec:
             out["placeholderKey"] = spec["placeholder_key"]
+        if "split" in spec:
+            out["splitAt"] = spec["split"]["at"]
+            out["splitTo"] = spec["split"]["to"]
     elif kind == "dropdown":
         out = {"kind": "dropdown", "label": spec["label"],
                "options": [{"value": str(o["v"]), "label": o["l"]} for o in spec["options"]]}
@@ -2073,6 +2076,13 @@ class _LcdSettingsEmitter:
         (symbol, count). Unlike a pane's rows these are DATA — the runtime
         builds them against a local field buffer, not against storage."""
         live = self._flatten_rows(rows)
+        names = {s.get("field") for r in live
+                 for _k, s in [_row_kind(r)] if isinstance(s, dict)}
+        for r in live:
+            _k, s = _row_kind(r)
+            if isinstance(s, dict) and "split" in s and s["split"]["to"] not in names:
+                die(f"settings: text {s.get('field')}: split.to "
+                    f"'{s['split']['to']}' names no field of the same form")
         inner = [self.row_struct(r) for r in live]   # emit nested descriptors first
         sym = self._sym("Rows")
         lines = [f"static const lcd_row_t {sym}[] = {{"]
@@ -2141,6 +2151,9 @@ class _LcdSettingsEmitter:
             f["unit"] = _cstr(spec["unit"])
         if isinstance(spec, dict) and spec.get("short"):
             f["short_"] = "true"
+        if kind in ("text", "ipv4") and "split" in spec:
+            f["split_at"] = _cstr(spec["split"]["at"])
+            f["split_to"] = _cstr(spec["split"]["to"])
         if isinstance(spec, dict) and "default" in spec and spec.get("field"):
             dv = spec["default"]
             f["dflt"] = _cstr("1" if dv is True else "0" if dv is False else str(dv))
